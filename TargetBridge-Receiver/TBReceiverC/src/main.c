@@ -65,8 +65,18 @@ struct app {
     uint64_t frames;
     uint64_t last_fps_tick_ms;
     uint64_t last_fps_count;
+    uint64_t received_bytes;
+    uint64_t last_debug_bytes;
+    uint64_t packets_received;
+    uint64_t bc7_frames;
+    uint64_t bc7_bytes;
+    uint64_t bc7_invalid_frames;
+    uint64_t bc7_render_failures;
+    uint64_t bc7_ack_requests;
+    uint64_t bc7_acks_sent;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
+    int      debug_enabled;
     int      close_requested;
     int      have_video_frame;
     int      bc7_render_ack_sent;
@@ -89,6 +99,7 @@ struct app {
     char     permissions_text[160];
     char     sender_ui_language[8];
     char     input_control_mode[32];
+    char     active_transport[16];
     int      last_input_monitoring_trusted;
     int      last_accessibility_trusted;
     uint64_t last_permissions_poll_ms;
@@ -946,7 +957,14 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
  *          [BC7 blocks: bytesPerRow*(h/4)] */
 static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
     struct tb_bc7_frame frame;
-    if (tb_bc7_frame_parse(p, len, &frame) != 0) return;
+    if (tb_bc7_frame_parse(p, len, &frame) != 0) {
+        a->bc7_invalid_frames++;
+        if (a->debug_enabled) {
+            fprintf(stderr, "[diag] event=bc7-invalid payloadBytes=%zu count=%llu\n",
+                    len, (unsigned long long)a->bc7_invalid_frames);
+        }
+        return;
+    }
 
     if (tb_disp_render_bc7(a->disp,
                            frame.blocks,
@@ -955,6 +973,7 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
                            frame.height,
                            frame.bytes_per_row,
                            !a->bc7_render_ack_sent) != 0) {
+        a->bc7_render_failures++;
         fprintf(stderr, "[bc7] unable to render %ux%u frame\n",
                 frame.width, frame.height);
         return;
@@ -974,6 +993,9 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
     }
     a->frames++;
+    a->bc7_frames++;
+    a->bc7_bytes += frame.blocks_len;
+    snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7");
 
     if (!a->bc7_render_ack_sent && a->client_fd >= 0) {
         uint8_t packet[17];
@@ -996,6 +1018,12 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         packet[16] = (uint8_t)frame.height;
         if (send_all(a->client_fd, packet, sizeof(packet)) == 0) {
             a->bc7_render_ack_sent = 1;
+            a->bc7_acks_sent++;
+            if (a->debug_enabled) {
+                fprintf(stderr,
+                        "[diag] event=bc7-render-ack generation=%u width=%u height=%u\n",
+                        a->bc7_render_generation, frame.width, frame.height);
+            }
         }
     }
 }
@@ -1074,6 +1102,7 @@ static void tb_set_system_volume(double level) {
 
 static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud) {
     struct app *a = (struct app *)ud;
+    a->packets_received++;
     switch (type) {
     case TB_PKT_UI_LANGUAGE:
         {
@@ -1141,10 +1170,12 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_FRAME:
         a->session_active = 1;
+        snprintf(a->active_transport, sizeof(a->active_transport), "%s", "encoded");
         tb_dec_feed_frame(a->dec, payload, len);
         break;
     case TB_PKT_RAW_FRAME:
         a->session_active = 1;
+        snprintf(a->active_transport, sizeof(a->active_transport), "%s", "rawNV12");
         handle_raw_frame(a, payload, len);
         break;
     case TB_PKT_BC7_FRAME:
@@ -1159,6 +1190,11 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
                 ((uint32_t)payload[2] << 8) |
                 (uint32_t)payload[3];
             a->bc7_render_ack_sent = 0;
+            a->bc7_ack_requests++;
+            if (a->debug_enabled) {
+                fprintf(stderr, "[diag] event=bc7-ack-request generation=%u\n",
+                        a->bc7_render_generation);
+            }
         }
         break;
     case TB_PKT_CURSOR:
@@ -1259,6 +1295,7 @@ static int drain_socket(struct app *a) {
         ssize_t n = read(a->client_fd, buf, sizeof(buf));
         if (n > 0) {
             saw_data = 1;
+            a->received_bytes += (uint64_t)n;
             if (tb_parser_feed(&a->parser, buf, (size_t)n) < 0) return -1;
         } else if (n == 0) {
             return -1;  /* peer closed */
@@ -1764,6 +1801,21 @@ static void send_receiver_info(struct app *a) {
 }
 
 static void close_client(struct app *a) {
+    if (a->debug_enabled && a->client_fd >= 0) {
+        fprintf(stderr,
+                "[diag] event=disconnect transport=%s frames=%llu packets=%llu "
+                "bytes=%llu bc7Frames=%llu bc7Invalid=%llu renderFailures=%llu "
+                "ackRequests=%llu acksSent=%llu\n",
+                a->active_transport,
+                (unsigned long long)a->frames,
+                (unsigned long long)a->packets_received,
+                (unsigned long long)a->received_bytes,
+                (unsigned long long)a->bc7_frames,
+                (unsigned long long)a->bc7_invalid_frames,
+                (unsigned long long)a->bc7_render_failures,
+                (unsigned long long)a->bc7_ack_requests,
+                (unsigned long long)a->bc7_acks_sent);
+    }
     if (a->client_fd >= 0) close(a->client_fd);
     a->client_fd = -1;
     a->session_active = 0;
@@ -1823,9 +1875,21 @@ static void build_display_host(char *buf, size_t bufsz, const char *ip_fallback,
 int main(int argc, char **argv) {
     int fullscreen = 1;
     int print_capabilities = 0;
+    int debug_enabled = 0;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--windowed") == 0) fullscreen = 0;
-        if (strcmp(argv[i], "--capabilities") == 0) print_capabilities = 1;
+        if (strcmp(argv[i], "--windowed") == 0) {
+            fullscreen = 0;
+        } else if (strcmp(argv[i], "--capabilities") == 0) {
+            print_capabilities = 1;
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            debug_enabled = 1;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [--windowed] [--debug] [--capabilities]\n", argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            return 64;
+        }
     }
 
     if (print_capabilities) {
@@ -1836,15 +1900,24 @@ int main(int argc, char **argv) {
 #else
         const char *architecture = "unknown";
 #endif
+        char metal_device[256] = {0};
+        (void)tb_bc7_renderer_copy_device_name(metal_device, sizeof(metal_device));
         printf(
             "{\"version\":\"%s\",\"build\":\"%s\",\"architecture\":\"%s\","
-            "\"supportsBC7Mode6\":%s,\"supportsRawNV12\":true}\n",
+            "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
+            "\"supportsRawNV12\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
             architecture,
+            metal_device,
             tb_bc7_renderer_supported() ? "true" : "false"
         );
         return 0;
+    }
+
+    if (debug_enabled) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        setvbuf(stderr, NULL, _IOLBF, 0);
     }
 
     char startup_language_pref[8];
@@ -1876,6 +1949,8 @@ int main(int argc, char **argv) {
     memset(&a, 0, sizeof(a));
     a.server_fd = -1;
     a.client_fd = -1;
+    a.debug_enabled = debug_enabled;
+    snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
     {
         char host[96] = {0};
         if (gethostname(host, sizeof(host)) != 0 || host[0] == '\0') {
@@ -1936,6 +2011,18 @@ int main(int argc, char **argv) {
 
     a.last_fps_tick_ms = now_ms();
     a.last_ip_check_ms = 0;
+    if (a.debug_enabled && a.client_fd >= 0) {
+        char metal_device[256] = {0};
+        (void)tb_bc7_renderer_copy_device_name(metal_device, sizeof(metal_device));
+        fprintf(stderr,
+                "[diag] event=startup version=%s build=%s metalDevice=\"%s\" "
+                "supportsBC7=%s supportsRawNV12=true port=%d\n",
+                TB_RECEIVER_VERSION,
+                TB_RECEIVER_BUILD,
+                metal_device,
+                tb_disp_supports_bc7(a.disp) ? "true" : "false",
+                TB_PORT);
+    }
 
     while (!g_term) {
         unsigned int disp_actions = tb_disp_poll_actions(a.disp);
@@ -1985,6 +2072,18 @@ int main(int argc, char **argv) {
                 a.session_active = 0;
                 a.bc7_render_ack_sent = 0;
                 a.bc7_render_generation = 0;
+                a.frames = 0;
+                a.last_fps_count = 0;
+                a.received_bytes = 0;
+                a.last_debug_bytes = 0;
+                a.packets_received = 0;
+                a.bc7_frames = 0;
+                a.bc7_bytes = 0;
+                a.bc7_invalid_frames = 0;
+                a.bc7_render_failures = 0;
+                a.bc7_ack_requests = 0;
+                a.bc7_acks_sent = 0;
+                snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
@@ -2102,9 +2201,37 @@ int main(int argc, char **argv) {
         /* FPS log */
         if (t - a.last_fps_tick_ms >= 1000) {
             uint64_t df = a.frames - a.last_fps_count;
+            uint64_t db = a.received_bytes - a.last_debug_bytes;
+            uint64_t elapsed_ms = t - a.last_fps_tick_ms;
             a.last_fps_count   = a.frames;
+            a.last_debug_bytes = a.received_bytes;
             a.last_fps_tick_ms = t;
-            if (df > 0) fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
+            if (a.debug_enabled) {
+                double fps = elapsed_ms > 0 ? ((double)df * 1000.0 / (double)elapsed_ms) : 0.0;
+                double gbps = elapsed_ms > 0 ? ((double)db * 8.0 / ((double)elapsed_ms * 1000000.0)) : 0.0;
+                fprintf(stderr,
+                        "[diag] event=metrics connected=%s sessionActive=%s "
+                        "transport=%s fps=%.2f networkGbps=%.3f packets=%llu "
+                        "bc7Frames=%llu bc7PayloadBytes=%llu bc7Invalid=%llu "
+                        "renderFailures=%llu generation=%u ackPending=%s "
+                        "ackRequests=%llu acksSent=%llu\n",
+                        a.client_fd >= 0 ? "true" : "false",
+                        a.session_active ? "true" : "false",
+                        a.active_transport,
+                        fps,
+                        gbps,
+                        (unsigned long long)a.packets_received,
+                        (unsigned long long)a.bc7_frames,
+                        (unsigned long long)a.bc7_bytes,
+                        (unsigned long long)a.bc7_invalid_frames,
+                        (unsigned long long)a.bc7_render_failures,
+                        a.bc7_render_generation,
+                        (a.bc7_render_generation != 0 && !a.bc7_render_ack_sent) ? "true" : "false",
+                        (unsigned long long)a.bc7_ack_requests,
+                        (unsigned long long)a.bc7_acks_sent);
+            } else if (df > 0) {
+                fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
+            }
         }
 
         /* Yield when idle or when a nonblocking active socket had no data,

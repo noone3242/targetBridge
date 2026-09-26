@@ -178,6 +178,12 @@ runtime log:
 TargetBridge-Receiver/scripts/intel_bc7_validation.sh --launch
 ```
 
+The launch mode passes `--debug` to the Receiver. `receiver.log` then contains
+one-second `[diag] event=metrics` records with the active transport, rendered
+FPS, measured network Gbit/s, packet/frame totals, invalid BC7 payloads, Metal
+render failures, requested generation, ACK pending state, and ACK counts.
+Separate events record the Metal device at startup and each BC7 render ACK.
+
 On the Apple Silicon Sender, select the discovered Intel Receiver, choose the
 Thunderbolt Bridge interface, and click **Diagnostics > Start BC7 Test**. Save
 the Sender's selected/actual transport, FPS, Gbit/s, pending, in-flight, and

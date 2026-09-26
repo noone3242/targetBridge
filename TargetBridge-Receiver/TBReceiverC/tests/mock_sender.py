@@ -9,6 +9,8 @@ Modes (--mode):
     handshake   connect, HELLO, heartbeat for --duration, TEARDOWN, close.
     stream      handshake + generate H.264 with the ffmpeg CLI (testsrc2)
                 and stream it as PARAM_SETS + AVCC FRAMEs at ~30 fps.
+    bc7         send a valid 4 x 4 BC7 Mode 6 frame and verify the
+                generation-scoped Metal render acknowledgment.
     hang        connect, HELLO, then go silent (no heartbeats) while keeping
                 the socket open — exercises the receiver's idle watchdog,
                 which should reap the session after ~10s.
@@ -34,6 +36,9 @@ import time
 PKT_HELLO_RECEIVER = 0x10
 PKT_PARAM_SETS = 0x20
 PKT_FRAME = 0x21
+PKT_BC7_FRAME = 0x24
+PKT_BC7_RENDER_ACK = 0x25
+PKT_BC7_ACK_REQUEST = 0x26
 PKT_HEARTBEAT = 0x30
 PKT_TEARDOWN = 0x31
 
@@ -46,7 +51,7 @@ def json_packet(ptype: int, obj) -> bytes:
     return packet(ptype, json.dumps(obj).encode("utf-8"))
 
 
-def hello_packet(name: str) -> bytes:
+def hello_packet(name: str, codec: str = "h264") -> bytes:
     return json_packet(PKT_HELLO_RECEIVER, {
         "senderName": name,
         "uiLanguage": "en",
@@ -54,7 +59,7 @@ def hello_packet(name: str) -> bytes:
         "captureSource": "desktopMirror",
         "captureWidth": 1280,
         "captureHeight": 720,
-        "codec": "h264",
+        "codec": codec,
     })
 
 
@@ -153,6 +158,54 @@ def stream_video(sock: socket.socket, duration_s: int) -> None:
     print(f"[mock] streamed {frames_sent} frames")
 
 
+def recv_packet(sock: socket.socket, timeout: float):
+    sock.settimeout(timeout)
+
+    def read_exact(length: int) -> bytes:
+        chunks = []
+        remaining = length
+        while remaining:
+            chunk = sock.recv(remaining)
+            if not chunk:
+                raise ConnectionError("receiver closed the connection")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    (length,) = struct.unpack(">I", read_exact(4))
+    body = read_exact(length)
+    return body[0], body[1:]
+
+
+def stream_bc7_test(sock: socket.socket) -> None:
+    generation = 1
+    sock.sendall(packet(PKT_BC7_ACK_REQUEST, struct.pack(">I", generation)))
+
+    # BC7 is little-endian at the bit level. Mode 6 starts with six zero mode
+    # bits followed by one; the remaining all-zero fields form a valid black
+    # 4 x 4 block.
+    block = bytes([0x40]) + bytes(15)
+    payload = bytes([1]) + struct.pack(">III", 4, 4, 16) + block
+    sock.sendall(packet(PKT_BC7_FRAME, payload))
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        ptype, response = recv_packet(sock, max(0.1, deadline - time.monotonic()))
+        print(f"[mock] receiver sent type=0x{ptype:02x} len={1 + len(response)}")
+        if ptype != PKT_BC7_RENDER_ACK:
+            continue
+        if len(response) != 12:
+            raise ValueError(f"bad BC7 ACK payload length: {len(response)}")
+        ack_generation, width, height = struct.unpack(">III", response)
+        if (ack_generation, width, height) != (generation, 4, 4):
+            raise ValueError(
+                f"bad BC7 ACK: generation={ack_generation} size={width}x{height}"
+            )
+        print("[mock] BC7 render ACK verified")
+        return
+    raise TimeoutError("receiver did not return a BC7 render ACK")
+
+
 # ---- modes ------------------------------------------------------------------
 
 def run(args) -> int:
@@ -162,7 +215,7 @@ def run(args) -> int:
     time.sleep(0.2)
     drain_receiver(sock)
 
-    sock.sendall(hello_packet(args.name))
+    sock.sendall(hello_packet(args.name, "bc7-mode6" if args.mode == "bc7" else "h264"))
     print("[mock] sent HELLO")
 
     try:
@@ -180,6 +233,10 @@ def run(args) -> int:
         elif args.mode == "stream":
             stream_video(sock, args.duration)
             sock.sendall(json_packet(PKT_TEARDOWN, {"reason": "mock stream done"}))
+
+        elif args.mode == "bc7":
+            stream_bc7_test(sock)
+            sock.sendall(json_packet(PKT_TEARDOWN, {"reason": "mock bc7 done"}))
 
         elif args.mode == "hang":
             print(f"[mock] going silent for {args.duration}s (socket stays open, no heartbeats)")
@@ -220,7 +277,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=54321)
-    ap.add_argument("--mode", choices=["handshake", "stream", "hang", "badlen", "drop"], default="handshake")
+    ap.add_argument(
+        "--mode",
+        choices=["handshake", "stream", "bc7", "hang", "badlen", "drop"],
+        default="handshake",
+    )
     ap.add_argument("--duration", type=int, default=5, help="seconds (mode-specific)")
     ap.add_argument("--name", default="MockSender")
     return run(ap.parse_args())

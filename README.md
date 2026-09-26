@@ -146,6 +146,7 @@ If you build from source, app outputs go into `build/` folder.
 - Addon manifests and capability model: [docs/Addons.md](docs/Addons.md)
 - Audio transport internals: [docs/audio.md](docs/audio.md)
 - Hardware, cables, adapters, and Thunderbolt Bridge networking: [docs/Hardware.md](docs/Hardware.md)
+- Intel Mac BC7 build, hardware capability, debug mode, and pass/fail criteria: [docs/Intel-BC7-Validation-ZH.md](docs/Intel-BC7-Validation-ZH.md)
 - Translation workflow: [docs/Translations.md](docs/Translations.md)
 - Testing without hardware (unit tests, mock sender, loopback smoke): [docs/Testing.md](docs/Testing.md)
 - Binary verification: [docs/verify-binaries.md](docs/verify-binaries.md)

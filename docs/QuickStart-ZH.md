@@ -50,6 +50,9 @@ TargetBridge-Receiver/scripts/intel_bc7_validation.sh --launch
 - 结果保存在 `build/intel-validation/<时间戳>/`。如果
   `supportsBC7Mode6` 为 `false`，该 Intel Mac 的当前 Metal GPU 不支持
   BC7 texture 路径，Sender 会明确拒绝 BC7，而不会静默回退。
+- `--launch` 会自动启用 Receiver 的 `--debug` 模式。`receiver.log`
+  每秒记录实际 transport、FPS、网络 Gbit/s、BC7 帧数、无效 payload、
+  Metal render failure、generation 和 render ACK 状态，方便双机对照。
 
 ## 启动
 

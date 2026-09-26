@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 int tb_bc7_renderer_supported(void);
+int tb_bc7_renderer_copy_device_name(char *buffer, size_t buffer_size);
 
 struct tb_bc7_renderer *tb_bc7_renderer_create(struct SDL_Window *window);
 void tb_bc7_renderer_destroy(struct tb_bc7_renderer *renderer);

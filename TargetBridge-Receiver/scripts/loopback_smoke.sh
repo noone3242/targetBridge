@@ -3,12 +3,13 @@
 # Thunderbolt hardware and no real sender.
 #
 # Builds the receiver, runs it windowed, then drives it over 127.0.0.1 with
-# tests/mock_sender.py through four phases:
+# tests/mock_sender.py through five phases:
 #   1. handshake     -> receiver logs the sender hello
 #   2. badlen        -> parser rejects a corrupt length and disconnects
 #   3. hang          -> idle watchdog reaps a silent sender (~10s)
 #   4. stream        -> real H.264 decode (skipped without ffmpeg CLI or
 #                       with --no-stream)
+#   5. bc7           -> native Metal BC7 upload/render and generation ACK
 #
 # Needs a GUI session (SDL window) and the receiver build deps
 # (brew install ffmpeg sdl2 pkgconf). Exits non-zero on any failed phase.
@@ -53,7 +54,7 @@ fi
 pass "build"
 
 phase "Launch receiver (windowed, log -> $LOG)"
-TB_LANG=en "$SRC/tbreceiver" --windowed 2>"$LOG" &
+TB_LANG=en "$SRC/tbreceiver" --windowed --debug 2>"$LOG" &
 RECEIVER_PID=$!
 sleep 2
 if ! kill -0 "$RECEIVER_PID" 2>/dev/null; then
@@ -85,6 +86,15 @@ else
     python3 "$MOCK" --mode stream --duration 4 || fail "mock stream exited non-zero"
     expect_log "param sets changed, opening decoder" "decoder accepted param sets"
     expect_log "[disp] texture " "receiver rendered decoded video"
+fi
+
+phase "Phase 5: BC7 render acknowledgment"
+if "$SRC/tbreceiver" --capabilities | grep -q '"supportsBC7Mode6":true'; then
+    python3 "$MOCK" --mode bc7 || fail "mock BC7 test exited non-zero"
+    expect_log "[diag] event=bc7-ack-request generation=1" "receiver accepted BC7 ACK request"
+    expect_log "[diag] event=bc7-render-ack generation=1 width=4 height=4" "receiver completed Metal BC7 render"
+else
+    print "skipped (default Metal device does not support BC7)"
 fi
 
 print ""

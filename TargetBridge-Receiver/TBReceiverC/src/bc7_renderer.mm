@@ -8,6 +8,7 @@
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+#include <stdio.h>
 
 typedef struct {
     vector_float2 cursor_position;
@@ -368,6 +369,18 @@ fragment float4 tb_bc7_fragment(
 int tb_bc7_renderer_supported(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return device && [device supportsBCTextureCompression] ? 1 : 0;
+}
+
+int tb_bc7_renderer_copy_device_name(char *buffer, size_t buffer_size) {
+    if (!buffer || buffer_size == 0) return -1;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    const char *name = device.name.UTF8String;
+    if (!device || !name) {
+        buffer[0] = '\0';
+        return -1;
+    }
+    snprintf(buffer, buffer_size, "%s", name);
+    return 0;
 }
 
 struct tb_bc7_renderer *tb_bc7_renderer_create(SDL_Window *window) {
