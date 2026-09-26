@@ -41,6 +41,15 @@ cd TargetBridge-Receiver
 注意：
 
 - 在 Intel iMac 上请直接在该 iMac 上构建接收端，这样产出的二进制才是 `x86_64`。
+- 可用以下脚本完成 Intel 架构、依赖、GPU BC7 capability、构建和证据采集：
+
+```bash
+TargetBridge-Receiver/scripts/intel_bc7_validation.sh --launch
+```
+
+- 结果保存在 `build/intel-validation/<时间戳>/`。如果
+  `supportsBC7Mode6` 为 `false`，该 Intel Mac 的当前 Metal GPU 不支持
+  BC7 texture 路径，Sender 会明确拒绝 BC7，而不会静默回退。
 
 ## 启动
 
@@ -70,6 +79,11 @@ cd TargetBridge-Receiver
 4. 选择 `Extended display`（扩展显示，把 iMac 当作独立桌面）或 `Mirror MacBook`（镜像 MacBook 屏幕）
 5. 在 `Receiver IP` 字段中输入上述 IP
 6. 点击 `Connect`
+
+测试 BC7 时，在发送端把 `Video transport` 设为
+`BC7 Mode 6 (Experimental)`，或在 Diagnostics 点击
+`开始 BC7 联合测试`。联合测试固定使用 1440p，只有 Receiver 完成
+Metal texture 上传和 render command 后才显示通过。
 
 当第一帧画面到达时，接收端会自动切换为全屏。
 

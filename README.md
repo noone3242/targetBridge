@@ -67,6 +67,29 @@ keeping the established multi-Mac workspace features:
 - Receiver discovery is automatic over Bonjour. Extended-display arrangement is remembered per receiver when possible. See [Display Modes](docs/Features.md#display-modes).
 - Thunderbolt Bridge remains the primary low-latency path, with `Network Link` available as an experimental addon-gated transport. See [Network Link](docs/Features.md#network-link-experimental).
 
+### Experimental BC7 Mode 6 transport
+
+Source builds include an opt-in full-frame BC7 Mode 6 path. The Sender captures
+BGRA frames, encodes each 4 x 4 block with a Metal compute kernel, and sends the
+compressed blocks directly to a compatible Receiver. The Receiver advertises
+BC7 support during capability negotiation and uploads the blocks to a native
+Metal BC7 texture, so it does not decode the image on the CPU.
+
+Choose **BC7 Mode 6 (Experimental)** from the Sender's **Video transport**
+setting. The selection is stored per session. Diagnostics also provides a
+**Start BC7 Test** action that selects the conservative 1440p profile and runs
+the real capture → BC7 → network → Receiver Metal path. The Sender refuses to
+start an explicitly selected BC7 session when the Receiver does not advertise
+BC7 capability; it does not silently fall back to HEVC.
+
+This first implementation always transmits the complete frame. At 5120 x 2880
+and 60 FPS, the BC7 image payload is approximately 7.08 Gbit/s
+(14,745,600 bytes per frame), before protocol and network overhead. It requires
+an Apple Silicon Sender and a Receiver GPU that reports Metal BC texture
+compression support. There is currently no unchanged-tile skipping, delta
+encoding, secondary compression, or production performance guarantee. The
+default **Automatic** transport preserves the existing H.264/HEVC behavior.
+
 ## Official Addons
 
 TargetBridge now has a conservative manifest-based addon system. Official manifests ship with the app, and user manifests can be imported from the settings UI.

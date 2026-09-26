@@ -1,3 +1,4 @@
+import CoreVideo
 import XCTest
 @testable import TargetBridge
 
@@ -39,8 +40,11 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual([UInt8](packet), [0x00, 0x00, 0x00, 0x04, 0x30, 0xAA, 0xBB, 0xCC])
     }
 
-    func testRawNV12PacketTypeAndOlderDisplayProfilesRemainCompatible() throws {
+    func testExperimentalPacketTypesAndOlderDisplayProfilesRemainCompatible() throws {
         XCTAssertEqual(TBMonitorPacketType.rawFrame.rawValue, 0x22)
+        XCTAssertEqual(TBMonitorPacketType.bc7Frame.rawValue, 0x24)
+        XCTAssertEqual(TBMonitorPacketType.bc7RenderAck.rawValue, 0x25)
+        XCTAssertEqual(TBMonitorPacketType.bc7RenderAckRequest.rawValue, 0x26)
 
         let olderProfile = Data("""
         {
@@ -57,6 +61,265 @@ final class TBMonitorProtocolTests: XCTestCase {
         """.utf8)
         let profile = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: olderProfile)
         XCTAssertNil(profile.supportsRawNV12)
+        XCTAssertNil(profile.supportsBC7Mode6)
+    }
+
+    func testBC7RenderAckCarriesRenderedDimensions() throws {
+        var payload = Data()
+        TBMonitorProtocol.appendBE32(&payload, 7)
+        TBMonitorProtocol.appendBE32(&payload, 2560)
+        TBMonitorProtocol.appendBE32(&payload, 1440)
+        var stream = TBMonitorProtocol.makePacket(type: .bc7RenderAck, payload: payload)
+
+        let (type, decodedPayload) = try XCTUnwrap(TBMonitorProtocol.drainPacket(from: &stream))
+        XCTAssertEqual(type, .bc7RenderAck)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(decodedPayload, offset: 0), 7)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(decodedPayload, offset: 4), 2560)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(decodedPayload, offset: 8), 1440)
+        XCTAssertTrue(stream.isEmpty)
+    }
+
+    func testExplicitVideoTransportRequiresMatchingReceiverCapability() throws {
+        let unsupported = try JSONDecoder().decode(
+            TBMonitorDisplayProfile.self,
+            from: Data("""
+            {
+              "receiverName": "Older Receiver",
+              "panelWidth": 5120,
+              "panelHeight": 2880,
+              "modeWidth": 2560,
+              "modeHeight": 1440,
+              "refreshRate": 60,
+              "hiDPI": true,
+              "captureWidth": 5120,
+              "captureHeight": 2880
+            }
+            """.utf8)
+        )
+        XCTAssertTrue(TBVideoTransportMode.automatic.isSupported(by: unsupported))
+        XCTAssertFalse(TBVideoTransportMode.bc7Mode6.isSupported(by: unsupported))
+        XCTAssertFalse(TBVideoTransportMode.rawNV12.isSupported(by: unsupported))
+
+        var supported = unsupported
+        supported.supportsBC7Mode6 = true
+        supported.supportsRawNV12 = true
+        XCTAssertTrue(TBVideoTransportMode.bc7Mode6.isSupported(by: supported))
+        XCTAssertTrue(TBVideoTransportMode.rawNV12.isSupported(by: supported))
+    }
+
+    func testMetalBC7Mode6EncoderProducesDecodableBlock() throws {
+        let pixelBuffer = try makeBGRAPixelBuffer(width: 4, height: 4) { x, y in
+            let value = UInt8((y * 4 + x) * 17)
+            return (value, value, value, 255)
+        }
+
+        let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+        let encoded = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+        XCTAssertEqual(encoded.bytesPerRow, 16)
+        XCTAssertEqual(encoded.data.count, 16)
+
+        let decoded = try decodeBC7Mode6Block(encoded.data)
+        for index in 0..<16 {
+            let expected = index * 17
+            XCTAssertLessThanOrEqual(abs(decoded[index][0] - expected), 10)
+            XCTAssertLessThanOrEqual(abs(decoded[index][1] - expected), 10)
+            XCTAssertLessThanOrEqual(abs(decoded[index][2] - expected), 10)
+            XCTAssertLessThanOrEqual(abs(decoded[index][3] - 255), 1)
+        }
+    }
+
+    func testMetalBC7Mode6EncoderPreservesMultiBlockOrdering() throws {
+        let colors: [(UInt8, UInt8, UInt8, UInt8)] = [
+            (255, 0, 0, 255),
+            (0, 255, 0, 255),
+            (0, 0, 255, 255),
+            (255, 255, 255, 255)
+        ]
+        let pixelBuffer = try makeBGRAPixelBuffer(width: 8, height: 8) { x, y in
+            colors[(y / 4) * 2 + (x / 4)]
+        }
+
+        let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+        let encoded = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+        XCTAssertEqual(encoded.bytesPerRow, 32)
+        XCTAssertEqual(encoded.data.count, 64)
+
+        for blockIndex in 0..<4 {
+            let start = blockIndex * 16
+            let decoded = try decodeBC7Mode6Block(encoded.data.subdata(in: start..<(start + 16)))
+            let expected = colors[blockIndex]
+            for pixel in decoded {
+                XCTAssertLessThanOrEqual(abs(pixel[0] - Int(expected.0)), 1)
+                XCTAssertLessThanOrEqual(abs(pixel[1] - Int(expected.1)), 1)
+                XCTAssertLessThanOrEqual(abs(pixel[2] - Int(expected.2)), 1)
+                XCTAssertLessThanOrEqual(abs(pixel[3] - Int(expected.3)), 1)
+            }
+        }
+    }
+
+    func testMetalBC7Mode6EncoderIsDeterministicAcrossBufferReuse() throws {
+        let pixelBuffer = try makeBGRAPixelBuffer(width: 8, height: 8) { x, y in
+            let value = UInt8(truncatingIfNeeded: x &* 73 &+ y &* 151 &+ x &* y &* 19)
+            return (value, value, value, 255)
+        }
+        let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+        let first = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+        let second = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+        XCTAssertEqual(first.bytesPerRow, 32)
+        XCTAssertEqual(first.data, second.data)
+
+        for blockIndex in 0..<4 {
+            let start = blockIndex * 16
+            let decoded = try decodeBC7Mode6Block(first.data.subdata(in: start..<(start + 16)))
+            for localIndex in 0..<16 {
+                let blockX = blockIndex % 2
+                let blockY = blockIndex / 2
+                let x = blockX * 4 + localIndex % 4
+                let y = blockY * 4 + localIndex / 4
+                let expected = Int(UInt8(truncatingIfNeeded: x &* 73 &+ y &* 151 &+ x &* y &* 19))
+                XCTAssertLessThanOrEqual(abs(decoded[localIndex][0] - expected), 10)
+                XCTAssertLessThanOrEqual(abs(decoded[localIndex][1] - expected), 10)
+                XCTAssertLessThanOrEqual(abs(decoded[localIndex][2] - expected), 10)
+            }
+        }
+    }
+
+    func testMetalBC7Mode6EncoderRejectsUnsupportedPixelBuffers() throws {
+        let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+        let unaligned = try makeBGRAPixelBuffer(width: 5, height: 4) { _, _ in
+            (0, 0, 0, 255)
+        }
+        XCTAssertNil(encoder.encode(pixelBuffer: unaligned))
+
+        var nv12: CVPixelBuffer?
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                4,
+                4,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                nil,
+                &nv12
+            ),
+            kCVReturnSuccess
+        )
+        XCTAssertNil(encoder.encode(pixelBuffer: try XCTUnwrap(nv12)))
+    }
+
+    func testMetalBC7Mode6FiveKBenchmarkWhenEnabled() throws {
+        guard ProcessInfo.processInfo.environment["RUN_BC7_BENCHMARK"] == "1" else {
+            throw XCTSkip("Set RUN_BC7_BENCHMARK=1 to run the 5K Metal benchmark")
+        }
+
+        let width = 5120
+        let height = 2880
+        let pixelBuffer = try makeBGRAPixelBuffer(width: width, height: height) { x, y in
+            let value = UInt8(truncatingIfNeeded: x &+ y)
+            return (value, value, value, 255)
+        }
+        let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+        _ = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+
+        let iterations = 10
+        let start = DispatchTime.now().uptimeNanoseconds
+        var encodedBytes = 0
+        for _ in 0..<iterations {
+            encodedBytes += try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer)).data.count
+        }
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000
+        let averageMilliseconds = elapsedSeconds * 1_000 / Double(iterations)
+        let effectiveGigabitsPerSecond = Double(encodedBytes * 8) / elapsedSeconds / 1_000_000_000
+        print(
+            String(
+                format: "BC7 5K benchmark: %.3f ms/frame, %.3f Gbit/s encoded output",
+                averageMilliseconds,
+                effectiveGigabitsPerSecond
+            )
+        )
+        XCTAssertEqual(encodedBytes, 14_745_600 * iterations)
+    }
+
+    private func makeBGRAPixelBuffer(
+        width: Int,
+        height: Int,
+        pixel: (_ x: Int, _ y: Int) -> (UInt8, UInt8, UInt8, UInt8)
+    ) throws -> CVPixelBuffer {
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+        var optionalPixelBuffer: CVPixelBuffer?
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                kCVPixelFormatType_32BGRA,
+                attributes as CFDictionary,
+                &optionalPixelBuffer
+            ),
+            kCVReturnSuccess
+        )
+        let pixelBuffer = try XCTUnwrap(optionalPixelBuffer)
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixelBuffer))
+        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        for y in 0..<height {
+            let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self)
+            for x in 0..<width {
+                let value = pixel(x, y)
+                row[x * 4 + 0] = value.2
+                row[x * 4 + 1] = value.1
+                row[x * 4 + 2] = value.0
+                row[x * 4 + 3] = value.3
+            }
+        }
+        return pixelBuffer
+    }
+
+    private func decodeBC7Mode6Block(_ data: Data) throws -> [[Int]] {
+        XCTAssertEqual(data.count, 16)
+        let bytes = [UInt8](data)
+        var bitPosition = 0
+
+        func readBits(_ count: Int) -> Int {
+            var value = 0
+            for bit in 0..<count {
+                let source = bitPosition + bit
+                value |= Int((bytes[source / 8] >> UInt8(source % 8)) & 1) << bit
+            }
+            bitPosition += count
+            return value
+        }
+
+        XCTAssertEqual(readBits(7), 1 << 6)
+        var endpoint0 = [Int](repeating: 0, count: 4)
+        var endpoint1 = [Int](repeating: 0, count: 4)
+        for channel in 0..<4 {
+            endpoint0[channel] = readBits(7)
+            endpoint1[channel] = readBits(7)
+        }
+        let pbit0 = readBits(1)
+        let pbit1 = readBits(1)
+        for channel in 0..<4 {
+            endpoint0[channel] = endpoint0[channel] * 2 + pbit0
+            endpoint1[channel] = endpoint1[channel] * 2 + pbit1
+        }
+
+        var indices = [readBits(3)]
+        for _ in 1..<16 {
+            indices.append(readBits(4))
+        }
+        XCTAssertEqual(bitPosition, 128)
+
+        let weights = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64]
+        return indices.map { index in
+            let weight = weights[index]
+            return (0..<4).map { channel in
+                (endpoint0[channel] * (64 - weight) + endpoint1[channel] * weight + 32) >> 6
+            }
+        }
     }
 
     func testDrainPacketRoundTrip() throws {

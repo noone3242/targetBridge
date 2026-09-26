@@ -7,6 +7,8 @@
 
 #include "../src/net.h"
 #include "../src/proto.h"
+#include "../src/bc7_frame.h"
+#include "../src/bc7_cursor.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -212,6 +214,102 @@ static void test_large_payload_roundtrip(void) {
     tb_parser_free(&p);
 }
 
+static void test_bc7_packet_type(void) {
+    struct tb_parser p;
+    tb_parser_init(&p, capture_cb, NULL);
+    reset_capture();
+
+    uint8_t payload[13] = {
+        1,
+        0, 0, 0, 4,
+        0, 0, 0, 4,
+        0, 0, 0, 16
+    };
+    uint8_t packet[4 + 1 + sizeof(payload)];
+    size_t n = build_packet(packet, TB_PKT_BC7_FRAME, payload, sizeof(payload));
+
+    CHECK(tb_parser_feed(&p, packet, n) == 0, "BC7 packet parses");
+    CHECK(g_captured_count == 1, "BC7 packet callback count");
+    CHECK(g_captured[0].type == TB_PKT_BC7_FRAME, "BC7 packet type preserved");
+    CHECK(g_captured[0].len == sizeof(payload), "BC7 payload length preserved");
+
+    tb_parser_free(&p);
+}
+
+static void make_bc7_payload(uint8_t *payload,
+                             uint8_t format,
+                             uint32_t width,
+                             uint32_t height,
+                             uint32_t bytes_per_row) {
+    payload[0] = format;
+    put_be32(payload + 1, width);
+    put_be32(payload + 5, height);
+    put_be32(payload + 9, bytes_per_row);
+}
+
+static void test_bc7_payload_validation(void) {
+    uint8_t payload[29] = {0};
+    struct tb_bc7_frame frame;
+    make_bc7_payload(payload, 1, 4, 4, 16);
+
+    CHECK(tb_bc7_frame_parse(payload, sizeof(payload), &frame) == 0,
+          "valid 4x4 BC7 payload accepted");
+    CHECK(frame.blocks == payload + 13, "BC7 block pointer skips header");
+    CHECK(frame.blocks_len == 16, "BC7 block length parsed");
+    CHECK(frame.width == 4 && frame.height == 4, "BC7 dimensions parsed");
+    CHECK(frame.bytes_per_row == 16, "BC7 row bytes parsed");
+
+    payload[0] = 2;
+    CHECK(tb_bc7_frame_parse(payload, sizeof(payload), &frame) == -1,
+          "unknown BC7 format rejected");
+
+    make_bc7_payload(payload, 1, 5, 4, 16);
+    CHECK(tb_bc7_frame_parse(payload, sizeof(payload), &frame) == -1,
+          "non-block-aligned width rejected");
+
+    make_bc7_payload(payload, 1, 4, 0, 16);
+    CHECK(tb_bc7_frame_parse(payload, sizeof(payload), &frame) == -1,
+          "zero height rejected");
+
+    make_bc7_payload(payload, 1, 8196, 4, 32784);
+    CHECK(tb_bc7_frame_parse(payload, sizeof(payload), &frame) == -1,
+          "oversized dimensions rejected");
+
+    make_bc7_payload(payload, 1, 4, 4, 32);
+    CHECK(tb_bc7_frame_parse(payload, sizeof(payload), &frame) == -1,
+          "incorrect BC7 row bytes rejected");
+
+    make_bc7_payload(payload, 1, 4, 4, 16);
+    CHECK(tb_bc7_frame_parse(payload, sizeof(payload) - 1, &frame) == -1,
+          "truncated BC7 block payload rejected");
+    CHECK(tb_bc7_frame_parse(payload, sizeof(payload) + 1, &frame) == -1,
+          "trailing BC7 payload bytes rejected");
+}
+
+static void test_bc7_cursor_policy(void) {
+    CHECK(tb_bc7_cursor_normalize_type(0) == 0, "arrow cursor preserved");
+    CHECK(tb_bc7_cursor_normalize_type(1) == 1, "I-beam cursor preserved");
+    CHECK(tb_bc7_cursor_normalize_type(2) == 2, "hand cursor preserved");
+    CHECK(tb_bc7_cursor_normalize_type(3) == 3, "horizontal resize cursor preserved");
+    CHECK(tb_bc7_cursor_normalize_type(4) == 4, "vertical resize cursor preserved");
+    CHECK(tb_bc7_cursor_normalize_type(6) == 6, "crosshair cursor preserved");
+    CHECK(tb_bc7_cursor_normalize_type(7) == 7, "NWSE cursor preserved");
+    CHECK(tb_bc7_cursor_normalize_type(8) == 8, "NESW cursor preserved");
+    CHECK(tb_bc7_cursor_normalize_type(99) == 0, "unknown cursor falls back to arrow");
+
+    CHECK(tb_bc7_cursor_size_for_drawable_width(4999.0f) == 44.0f,
+          "normal drawable uses 44-pixel cursor");
+    CHECK(tb_bc7_cursor_size_for_drawable_width(5000.0f) == 58.0f,
+          "5K drawable uses 58-pixel cursor");
+
+    CHECK(!tb_bc7_cursor_should_redraw(1040u, 1000u),
+          "cursor update at 40ms waits for next video frame");
+    CHECK(tb_bc7_cursor_should_redraw(1041u, 1000u),
+          "stale video redraws cursor after 40ms");
+    CHECK(tb_bc7_cursor_should_redraw(5u, UINT32_MAX - 40u),
+          "redraw throttle handles tick wraparound");
+}
+
 int main(void) {
     test_single_packet_whole_feed();
     test_byte_by_byte_feed();
@@ -220,6 +318,9 @@ int main(void) {
     test_zero_length_is_fatal();
     test_oversized_length_is_fatal();
     test_large_payload_roundtrip();
+    test_bc7_packet_type();
+    test_bc7_payload_validation();
+    test_bc7_cursor_policy();
 
     if (g_failures == 0) {
         printf("net parser tests: %d checks passed\n", g_checks);

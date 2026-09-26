@@ -14,6 +14,8 @@
  */
 
 #include "net.h"
+#include "bc7_frame.h"
+#include "bc7_renderer.h"
 #include "decoder.h"
 #include "display.h"
 #include "proto.h"
@@ -67,6 +69,8 @@ struct app {
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      close_requested;
     int      have_video_frame;
+    int      bc7_render_ack_sent;
+    uint32_t bc7_render_generation;
     /* A real streaming session has begun (the sender sent a session packet, not
      * just a transient probe like a UI-language push). Gates the fullscreen
      * "connecting" splash so a bare/short-lived connection doesn't flash it. */
@@ -116,6 +120,8 @@ struct app {
     uint64_t last_clipboard_poll_ms;
     char     last_clipboard_text[4096];
 };
+
+static int send_all(int fd, const uint8_t *buf, size_t len);
 
 static int tb_should_log_input_event(uint64_t count) {
     return count <= 20 || (count % 100) == 0;
@@ -595,6 +601,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "version", (uint8_t)strlen(TB_RECEIVER_VERSION), TB_RECEIVER_VERSION);
     TXTRecordSetValue(&txt, "supportsHEVCDecode", 1, tb_dec_supports_hevc_hwdecode() ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsRawNV12", 1, "1");
+    TXTRecordSetValue(&txt, "supportsBC7Mode6", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
 
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) == 0) {
@@ -934,6 +941,65 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     a->frames++;
 }
 
+/* Full-frame BC7 Mode 6 texture.
+ * Payload: [1: format=1][BE32 w][BE32 h][BE32 bytesPerRow]
+ *          [BC7 blocks: bytesPerRow*(h/4)] */
+static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
+    struct tb_bc7_frame frame;
+    if (tb_bc7_frame_parse(p, len, &frame) != 0) return;
+
+    if (tb_disp_render_bc7(a->disp,
+                           frame.blocks,
+                           frame.blocks_len,
+                           frame.width,
+                           frame.height,
+                           frame.bytes_per_row,
+                           !a->bc7_render_ack_sent) != 0) {
+        fprintf(stderr, "[bc7] unable to render %ux%u frame\n",
+                frame.width, frame.height);
+        return;
+    }
+
+    a->have_video_frame = 1;
+    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
+    {
+        char width_text[16];
+        char height_text[16];
+        struct tb_i18n_pair pairs[] = {
+            { "width", width_text },
+            { "height", height_text }
+        };
+        snprintf(width_text, sizeof(width_text), "%u", frame.width);
+        snprintf(height_text, sizeof(height_text), "%u", frame.height);
+        tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
+    }
+    a->frames++;
+
+    if (!a->bc7_render_ack_sent && a->client_fd >= 0) {
+        uint8_t packet[17];
+        packet[0] = 0;
+        packet[1] = 0;
+        packet[2] = 0;
+        packet[3] = 13;
+        packet[4] = TB_PKT_BC7_RENDER_ACK;
+        packet[5] = (uint8_t)(a->bc7_render_generation >> 24);
+        packet[6] = (uint8_t)(a->bc7_render_generation >> 16);
+        packet[7] = (uint8_t)(a->bc7_render_generation >> 8);
+        packet[8] = (uint8_t)a->bc7_render_generation;
+        packet[9] = (uint8_t)(frame.width >> 24);
+        packet[10] = (uint8_t)(frame.width >> 16);
+        packet[11] = (uint8_t)(frame.width >> 8);
+        packet[12] = (uint8_t)frame.width;
+        packet[13] = (uint8_t)(frame.height >> 24);
+        packet[14] = (uint8_t)(frame.height >> 16);
+        packet[15] = (uint8_t)(frame.height >> 8);
+        packet[16] = (uint8_t)frame.height;
+        if (send_all(a->client_fd, packet, sizeof(packet)) == 0) {
+            a->bc7_render_ack_sent = 1;
+        }
+    }
+}
+
 static void ring_read(struct app *a, Uint8 *dst, int len) {
     int first = AUDIO_BUF_CAP - a->audio_buf_tail;
     if (first >= len) {
@@ -1080,6 +1146,20 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
     case TB_PKT_RAW_FRAME:
         a->session_active = 1;
         handle_raw_frame(a, payload, len);
+        break;
+    case TB_PKT_BC7_FRAME:
+        a->session_active = 1;
+        handle_bc7_frame(a, payload, len);
+        break;
+    case TB_PKT_BC7_ACK_REQUEST:
+        if (len == 4) {
+            a->bc7_render_generation =
+                ((uint32_t)payload[0] << 24) |
+                ((uint32_t)payload[1] << 16) |
+                ((uint32_t)payload[2] << 8) |
+                (uint32_t)payload[3];
+            a->bc7_render_ack_sent = 0;
+        }
         break;
     case TB_PKT_CURSOR:
         {
@@ -1651,7 +1731,8 @@ static void send_receiver_info(struct app *a) {
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsBC7Mode6\":%s,"
+        "\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
         escaped_name,
         panel_w,
         panel_h,
@@ -1660,6 +1741,7 @@ static void send_receiver_info(struct app *a) {
         capture_w,
         capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
+        tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
         tb_receiver_accessibility_trusted() ? "true" : "false"
     );
@@ -1687,6 +1769,8 @@ static void close_client(struct app *a) {
     a->session_active = 0;
     a->close_requested = 0;
     a->have_video_frame = 0;
+    a->bc7_render_ack_sent = 0;
+    a->bc7_render_generation = 0;
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
     SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
@@ -1738,8 +1822,29 @@ static void build_display_host(char *buf, size_t bufsz, const char *ip_fallback,
 
 int main(int argc, char **argv) {
     int fullscreen = 1;
+    int print_capabilities = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--windowed") == 0) fullscreen = 0;
+        if (strcmp(argv[i], "--capabilities") == 0) print_capabilities = 1;
+    }
+
+    if (print_capabilities) {
+#if defined(__x86_64__)
+        const char *architecture = "x86_64";
+#elif defined(__arm64__) || defined(__aarch64__)
+        const char *architecture = "arm64";
+#else
+        const char *architecture = "unknown";
+#endif
+        printf(
+            "{\"version\":\"%s\",\"build\":\"%s\",\"architecture\":\"%s\","
+            "\"supportsBC7Mode6\":%s,\"supportsRawNV12\":true}\n",
+            TB_RECEIVER_VERSION,
+            TB_RECEIVER_BUILD,
+            architecture,
+            tb_bc7_renderer_supported() ? "true" : "false"
+        );
+        return 0;
     }
 
     char startup_language_pref[8];
@@ -1878,6 +1983,8 @@ int main(int argc, char **argv) {
                 a.client_fd = c;
                 a.have_video_frame = 0;
                 a.session_active = 0;
+                a.bc7_render_ack_sent = 0;
+                a.bc7_render_generation = 0;
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");

@@ -6,9 +6,50 @@ import Darwin
 import Foundation
 import AVFoundation
 import IOSurface
+import Metal
 import Network
 @preconcurrency import ScreenCaptureKit
 import VideoToolbox
+
+enum TBVideoTransportMode: String, CaseIterable, Identifiable {
+    case automatic
+    case bc7Mode6
+    case rawNV12
+
+    var id: String { rawValue }
+
+    func title(_ language: TBDisplaySenderLanguage) -> String {
+        switch (self, language) {
+        case (.automatic, .italian): return "Automatico (H.264 / HEVC)"
+        case (.automatic, .english): return "Automatic (H.264 / HEVC)"
+        case (.automatic, .german): return "Automatisch (H.264 / HEVC)"
+        case (.automatic, .french): return "Automatique (H.264 / HEVC)"
+        case (.automatic, .chinese): return "自动（H.264 / HEVC）"
+        case (.bc7Mode6, _): return "BC7 Mode 6 (Experimental)"
+        case (.rawNV12, .italian): return "NV12 raw (diagnostica)"
+        case (.rawNV12, .english): return "Raw NV12 (diagnostic)"
+        case (.rawNV12, .german): return "Raw NV12 (Diagnose)"
+        case (.rawNV12, .french): return "NV12 brut (diagnostic)"
+        case (.rawNV12, .chinese): return "Raw NV12（诊断）"
+        }
+    }
+
+    func codecName(for preset: TBDisplayCapturePreset) -> String {
+        switch self {
+        case .automatic: return preset.codecName
+        case .bc7Mode6: return "BC7 Mode 6"
+        case .rawNV12: return "NV12 RAW"
+        }
+    }
+
+    func isSupported(by profile: TBMonitorDisplayProfile) -> Bool {
+        switch self {
+        case .automatic: return true
+        case .bc7Mode6: return profile.supportsBC7Mode6 == true
+        case .rawNV12: return profile.supportsRawNV12 == true
+        }
+    }
+}
 
 enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case standard1440p
@@ -367,6 +408,250 @@ private final class TBDirectDisplayStreamCapture {
 /// state is confined to `queue`; the two values the main thread polls
 /// (`sentFrames`, `lastCaptureFrameAt`) are guarded by a small lock instead of
 /// a per-frame hop back to main.
+final class TBBC7Mode6Encoder {
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let pipeline: MTLComputePipelineState
+    private var textureCache: CVMetalTextureCache?
+    private var outputBuffer: MTLBuffer?
+    private var outputBufferLength = 0
+
+    private static let source = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    constant uint kWeights[16] = {
+        0, 4, 9, 13, 17, 21, 26, 30,
+        34, 38, 43, 47, 51, 55, 60, 64
+    };
+
+    inline void write_bits(thread uint4 &words, thread uint &bit_pos, uint value, uint count) {
+        for (uint bit = 0; bit < count; ++bit) {
+            uint dst = bit_pos + bit;
+            uint word = dst >> 5;
+            uint shift = dst & 31;
+            words[word] |= ((value >> bit) & 1u) << shift;
+        }
+        bit_pos += count;
+    }
+
+    inline uint quantize_component(uint value, uint pbit) {
+        int quantized = int(round((float(value) - float(pbit)) * 0.5f));
+        return uint(clamp(quantized, 0, 127));
+    }
+
+    inline uint endpoint_error(uint4 value, uint pbit, thread uint4 &quantized) {
+        uint error = 0;
+        for (uint channel = 0; channel < 4; ++channel) {
+            uint q = quantize_component(value[channel], pbit);
+            uint reconstructed = q * 2u + pbit;
+            int delta = int(value[channel]) - int(reconstructed);
+            error += uint(delta * delta);
+            quantized[channel] = q;
+        }
+        return error;
+    }
+
+    inline uint4 choose_quantized_endpoint(uint4 value, thread uint &pbit) {
+        uint4 even_quantized;
+        uint4 odd_quantized;
+        uint even_error = endpoint_error(value, 0u, even_quantized);
+        uint odd_error = endpoint_error(value, 1u, odd_quantized);
+        if (odd_error < even_error) {
+            pbit = 1u;
+            return odd_quantized;
+        }
+        pbit = 0u;
+        return even_quantized;
+    }
+
+    inline uint4 reconstruct_endpoint(uint4 quantized, uint pbit) {
+        return quantized * 2u + pbit;
+    }
+
+    inline uint squared_error(uint4 lhs, uint4 rhs) {
+        int4 delta = int4(lhs) - int4(rhs);
+        return uint(delta.x * delta.x + delta.y * delta.y +
+                    delta.z * delta.z + delta.w * delta.w);
+    }
+
+    kernel void bc7_mode6_encode(
+        texture2d<float, access::read> source [[texture(0)]],
+        device uint4 *blocks [[buffer(0)]],
+        constant uint2 &image_size [[buffer(1)]],
+        uint2 block_position [[thread_position_in_grid]]
+    ) {
+        uint blocks_wide = (image_size.x + 3u) / 4u;
+        uint blocks_high = (image_size.y + 3u) / 4u;
+        if (block_position.x >= blocks_wide || block_position.y >= blocks_high) {
+            return;
+        }
+
+        uint4 pixels[16];
+        uint4 endpoint0 = uint4(255u);
+        uint4 endpoint1 = uint4(0u);
+
+        for (uint local_y = 0; local_y < 4; ++local_y) {
+            for (uint local_x = 0; local_x < 4; ++local_x) {
+                uint x = min(block_position.x * 4u + local_x, image_size.x - 1u);
+                uint y = min(block_position.y * 4u + local_y, image_size.y - 1u);
+                float4 sample = source.read(uint2(x, y));
+                uint4 pixel = uint4(clamp(round(sample * 255.0f), 0.0f, 255.0f));
+                uint index = local_y * 4u + local_x;
+                pixels[index] = pixel;
+                endpoint0 = min(endpoint0, pixel);
+                endpoint1 = max(endpoint1, pixel);
+            }
+        }
+
+        uint pbit0 = 0u;
+        uint pbit1 = 0u;
+        uint4 quantized0 = choose_quantized_endpoint(endpoint0, pbit0);
+        uint4 quantized1 = choose_quantized_endpoint(endpoint1, pbit1);
+        uint4 reconstructed0 = reconstruct_endpoint(quantized0, pbit0);
+        uint4 reconstructed1 = reconstruct_endpoint(quantized1, pbit1);
+
+        uint indices[16];
+        for (uint pixel_index = 0; pixel_index < 16; ++pixel_index) {
+            uint best_index = 0u;
+            uint best_error = 0xffffffffu;
+            for (uint candidate = 0; candidate < 16; ++candidate) {
+                uint weight = kWeights[candidate];
+                uint4 interpolated = (reconstructed0 * (64u - weight) +
+                                      reconstructed1 * weight + 32u) >> 6;
+                uint error = squared_error(pixels[pixel_index], interpolated);
+                if (error < best_error) {
+                    best_error = error;
+                    best_index = candidate;
+                }
+            }
+            indices[pixel_index] = best_index;
+        }
+
+        if (indices[0] >= 8u) {
+            uint4 tmp_endpoint = quantized0;
+            quantized0 = quantized1;
+            quantized1 = tmp_endpoint;
+            uint tmp_pbit = pbit0;
+            pbit0 = pbit1;
+            pbit1 = tmp_pbit;
+            for (uint pixel_index = 0; pixel_index < 16; ++pixel_index) {
+                indices[pixel_index] = 15u - indices[pixel_index];
+            }
+        }
+
+        uint4 encoded = uint4(0u);
+        uint bit_position = 0u;
+        write_bits(encoded, bit_position, 1u << 6, 7u);
+        for (uint channel = 0; channel < 4; ++channel) {
+            write_bits(encoded, bit_position, quantized0[channel], 7u);
+            write_bits(encoded, bit_position, quantized1[channel], 7u);
+        }
+        write_bits(encoded, bit_position, pbit0, 1u);
+        write_bits(encoded, bit_position, pbit1, 1u);
+        write_bits(encoded, bit_position, indices[0], 3u);
+        for (uint pixel_index = 1; pixel_index < 16; ++pixel_index) {
+            write_bits(encoded, bit_position, indices[pixel_index], 4u);
+        }
+
+        blocks[block_position.y * blocks_wide + block_position.x] = encoded;
+    }
+    """
+
+    init?() {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let commandQueue = device.makeCommandQueue()
+        else {
+            return nil
+        }
+
+        do {
+            let library = try device.makeLibrary(source: Self.source, options: nil)
+            guard let function = library.makeFunction(name: "bc7_mode6_encode") else {
+                return nil
+            }
+            pipeline = try device.makeComputePipelineState(function: function)
+        } catch {
+            NSLog("TargetBridge: unable to compile BC7 Mode 6 Metal encoder: %@", error.localizedDescription)
+            return nil
+        }
+
+        self.device = device
+        self.commandQueue = commandQueue
+        var cache: CVMetalTextureCache?
+        guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess else {
+            return nil
+        }
+        textureCache = cache
+    }
+
+    func encode(pixelBuffer: CVPixelBuffer) -> (data: Data, bytesPerRow: Int)? {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0, width % 4 == 0, height % 4 == 0,
+              CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
+              let textureCache
+        else {
+            return nil
+        }
+
+        var cvTexture: CVMetalTexture?
+        guard CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            textureCache,
+            pixelBuffer,
+            nil,
+            .bgra8Unorm,
+            width,
+            height,
+            0,
+            &cvTexture
+        ) == kCVReturnSuccess,
+        let cvTexture,
+        let sourceTexture = CVMetalTextureGetTexture(cvTexture)
+        else {
+            return nil
+        }
+
+        let blocksWide = width / 4
+        let blocksHigh = height / 4
+        let bytesPerRow = blocksWide * 16
+        let requiredLength = bytesPerRow * blocksHigh
+        if outputBuffer == nil || outputBufferLength != requiredLength {
+            outputBuffer = device.makeBuffer(length: requiredLength, options: .storageModeShared)
+            outputBufferLength = requiredLength
+        }
+        guard let outputBuffer,
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            return nil
+        }
+
+        var imageSize = SIMD2<UInt32>(UInt32(width), UInt32(height))
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(sourceTexture, index: 0)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 0)
+        encoder.setBytes(&imageSize, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 1)
+        let threadsPerGroup = MTLSize(width: 8, height: 8, depth: 1)
+        encoder.dispatchThreads(
+            MTLSize(width: blocksWide, height: blocksHigh, depth: 1),
+            threadsPerThreadgroup: threadsPerGroup
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else {
+            if let error = commandBuffer.error {
+                NSLog("TargetBridge: BC7 Mode 6 command failed: %@", error.localizedDescription)
+            }
+            return nil
+        }
+
+        return (Data(bytes: outputBuffer.contents(), count: requiredLength), bytesPerRow)
+    }
+}
+
 private final class TBVideoPipeline: @unchecked Sendable {
     let queue = DispatchQueue(label: "fd.tbmonitor.sender.pipeline", qos: .userInteractive)
 
@@ -376,21 +661,26 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let displayName: String
     private let displayID: CGDirectDisplayID
     private let usesRawNV12: Bool
+    private let usesBC7Mode6: Bool
     private let onFirstFrame: @Sendable () -> Void
 
     // Confined to `queue`.
     private var vtEncoder: VTCompressionSession?
     private var vtEncoderRef: Unmanaged<TBVideoPipeline>?
+    private var bc7Encoder: TBBC7Mode6Encoder?
     private var pendingVideoPackets = 0
     private var inFlightEncodeFrames = 0
+    private var droppedVideoFrames = 0
     private var displayStreamFrameSequence: CMTimeValue = 0
     private var lastEncodedDisplayPTS: CMTime?
     private var ackSent: Bool
+    private var firstFrameNotified = false
     private var running = false
 
     // Read from the main thread (fps timer / watchdog); guarded by `lock`.
     private let lock = NSLock()
     private var _sentFrames = 0
+    private var _sentBytes = 0
     private var _lastCaptureFrameAt = Date()
 
     init(preset: TBDisplayCapturePreset,
@@ -399,6 +689,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          displayName: String,
          displayID: CGDirectDisplayID,
          usesRawNV12: Bool,
+         usesBC7Mode6: Bool,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable () -> Void) {
         self.preset = preset
@@ -407,6 +698,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayName = displayName
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
+        self.usesBC7Mode6 = usesBC7Mode6
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
     }
@@ -417,6 +709,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// could not be created.
     func start() -> Bool {
         queue.sync {
+            if usesBC7Mode6 {
+                bc7Encoder = TBBC7Mode6Encoder()
+                running = bc7Encoder != nil
+                return running
+            }
             if usesRawNV12 {
                 running = true
                 return true
@@ -435,6 +732,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
             running = false
             if let encoder = vtEncoder { VTCompressionSessionInvalidate(encoder) }
             vtEncoder = nil
+            bc7Encoder = nil
             vtEncoderRef?.release()
             vtEncoderRef = nil
         }
@@ -452,8 +750,20 @@ private final class TBVideoPipeline: @unchecked Sendable {
         return _lastCaptureFrameAt
     }
 
-    func diagnosticsSnapshot() -> (pending: Int, inFlight: Int, ptsSeq: CMTimeValue) {
-        queue.sync { (pending: pendingVideoPackets, inFlight: inFlightEncodeFrames, ptsSeq: displayStreamFrameSequence) }
+    var sentBytesSnapshot: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _sentBytes
+    }
+
+    func diagnosticsSnapshot() -> (pending: Int, inFlight: Int, dropped: Int, ptsSeq: CMTimeValue) {
+        queue.sync {
+            (
+                pending: pendingVideoPackets,
+                inFlight: inFlightEncodeFrames,
+                dropped: droppedVideoFrames,
+                ptsSeq: displayStreamFrameSequence
+            )
+        }
     }
 
     private func markCaptureFrame() {
@@ -533,6 +843,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// SCStream capture path. Must be dispatched onto `queue` by the caller.
     func encode(_ sampleBuffer: CMSampleBuffer) {
         markCaptureFrame()
+        if usesBC7Mode6 {
+            sendBC7Frame(sampleBuffer)
+            return
+        }
         if usesRawNV12 {
             sendRawFrame(sampleBuffer)
             return
@@ -613,24 +927,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private func handleEncoded(_ sampleBuffer: CMSampleBuffer) {
         guard running else { return }
 
-        if !ackSent {
-            ackSent = true
-            let ack = TBMonitorCreateSessionAck(
-                accepted: true,
-                displayName: displayName,
-                displayID: displayID
-            )
-            if let packet = TBMonitorProtocol.makeJSONPacket(type: .createSessionAck, value: ack) {
-                connection.send(content: packet, completion: .contentProcessed({ _ in }))
-            }
-            onFirstFrame()
-        }
+        notifyFirstFrameIfNeeded()
 
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
         let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
         let isKeyframe = !notSync
 
         if !isKeyframe, pendingVideoPackets >= preset.maxPendingVideoPackets {
+            droppedVideoFrames += 1
             return
         }
 
@@ -648,7 +952,25 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
                 }
             }))
-            lock.lock(); _sentFrames += 1; lock.unlock()
+            lock.lock(); _sentFrames += 1; _sentBytes += packet.count; lock.unlock()
+        }
+    }
+
+    private func notifyFirstFrameIfNeeded() {
+        if !ackSent {
+            ackSent = true
+            let ack = TBMonitorCreateSessionAck(
+                accepted: true,
+                displayName: displayName,
+                displayID: displayID
+            )
+            if let packet = TBMonitorProtocol.makeJSONPacket(type: .createSessionAck, value: ack) {
+                connection.send(content: packet, completion: .contentProcessed({ _ in }))
+            }
+        }
+        if !firstFrameNotified {
+            firstFrameNotified = true
+            onFirstFrame()
         }
     }
 
@@ -661,7 +983,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
         // Backpressure: never pile frames on top of a network that can't keep up.
-        if pendingVideoPackets >= preset.maxPendingVideoPackets { return }
+        if pendingVideoPackets >= preset.maxPendingVideoPackets {
+            droppedVideoFrames += 1
+            return
+        }
         guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return }
 
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
@@ -679,18 +1004,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let uvSize = uvStride * uvHeight
 
         // Send the session ack on the first frame, mirroring the encoded path.
-        if !ackSent {
-            ackSent = true
-            let ack = TBMonitorCreateSessionAck(
-                accepted: true,
-                displayName: displayName,
-                displayID: displayID
-            )
-            if let packet = TBMonitorProtocol.makeJSONPacket(type: .createSessionAck, value: ack) {
-                connection.send(content: packet, completion: .contentProcessed({ _ in }))
-            }
-            onFirstFrame()
-        }
+        notifyFirstFrameIfNeeded()
 
         var payload = Data(capacity: 17 + ySize + uvSize)
         payload.append(1) // format: NV12
@@ -709,7 +1023,45 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
             }
         }))
-        lock.lock(); _sentFrames += 1; lock.unlock()
+        lock.lock(); _sentFrames += 1; _sentBytes += packet.count; lock.unlock()
+    }
+
+    private func sendBC7Frame(_ sampleBuffer: CMSampleBuffer) {
+        guard running else { return }
+        guard pendingVideoPackets < preset.maxPendingVideoPackets else {
+            droppedVideoFrames += 1
+            return
+        }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+              let encoded = bc7Encoder?.encode(pixelBuffer: pixelBuffer)
+        else {
+            return
+        }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        notifyFirstFrameIfNeeded()
+
+        var payload = Data(capacity: 13 + encoded.data.count)
+        payload.append(1)
+        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(encoded.bytesPerRow))
+        payload.append(encoded.data)
+
+        let packet = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+        pendingVideoPackets += 1
+        connection.send(content: packet, completion: .contentProcessed({ [weak self] error in
+            guard let self else { return }
+            self.queue.async {
+                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                if let error {
+                    TBLog.connection.error("BC7 frame send failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        }))
+        lock.lock(); _sentFrames += 1; _sentBytes += packet.count; lock.unlock()
     }
 
     private func buildParamSetsPacket(from format: CMVideoFormatDescription, codecType: CMVideoCodecType) -> Data? {
@@ -946,6 +1298,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         didSet {
             if selectedReceiverID.isEmpty {
                 receiverSupportsHEVCDecodeHint = nil
+                receiverSupportsRawNV12Hint = nil
+                receiverSupportsBC7Mode6Hint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
             }
@@ -959,6 +1313,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             UserDefaults.standard.set(receiverIP, forKey: Self.receiverIPDefaultsKey)
             if receiverIP != oldValue {
                 receiverSupportsHEVCDecodeHint = nil
+                receiverSupportsRawNV12Hint = nil
+                receiverSupportsBC7Mode6Hint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
             }
@@ -1008,6 +1364,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
     var audioAddonAvailable = true
     var receiverSupportsHEVCDecodeHint: Bool?
+    var receiverSupportsRawNV12Hint: Bool?
+    var receiverSupportsBC7Mode6Hint: Bool?
     var receiverInputMonitoringTrustedHint: Bool?
     var receiverAccessibilityTrustedHint: Bool?
     @Published var senderFPS = 0
@@ -1041,21 +1399,31 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// downsample and the GPU cost of rendering pixels that get thrown away.
     @Published var matchRenderToStream: Bool = false
 
+    @Published var videoTransportMode: TBVideoTransportMode = .automatic {
+        didSet {
+            if !isStreaming {
+                refreshConfiguredStreamSummary()
+            }
+        }
+    }
     @Published var capturePreset: TBDisplayCapturePreset = .standard1440p {
         didSet {
             if !isStreaming {
-                streamResolutionText = TBDisplaySenderL10n.streamSummary(preset: capturePreset, source: captureSource, language: language)
+                refreshConfiguredStreamSummary()
             }
         }
     }
     @Published var captureSource: TBDisplayCaptureSource = .desktopMirror {
         didSet {
             if !isStreaming {
-                streamResolutionText = TBDisplaySenderL10n.streamSummary(preset: capturePreset, source: captureSource, language: language)
+                refreshConfiguredStreamSummary()
             }
         }
     }
     @Published var streamResolutionText: String
+    @Published var actualStreamText = "Not active"
+    @Published var bc7TestStatusText = ""
+    @Published var transportDiagnosticsText = "pending=0 · in-flight=0 · dropped=0 · 0.00 Gbit/s"
     var inputRelayActive = false {
         didSet {
             guard inputRelayActive != oldValue else { return }
@@ -1095,7 +1463,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var pipeline: TBVideoPipeline?
 
     private var sentSnapshot = 0
+    private var sentBytesSnapshot = 0
     private var sessionAckSent = false
+    private var pipelineHasFirstFrame = false
+    private var captureGeneration: UInt64 = 0
+    private var bc7RenderConfirmed = false
+    private var bc7RenderGeneration: UInt32 = 0
     private var fpsTimer: Timer?
     private var heartbeatTimer: Timer?
     private var firstFrameTimer: Timer?
@@ -1244,13 +1617,22 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         codecType == kCMVideoCodecType_HEVC ? "HEVC" : "H.264"
     }
 
+    private func refreshConfiguredStreamSummary() {
+        streamResolutionText = TBDisplaySenderL10n.streamSummary(
+            preset: capturePreset,
+            source: captureSource,
+            language: language,
+            codecName: videoTransportMode.codecName(for: capturePreset)
+        )
+    }
+
     private func refreshLocalizedText() {
         statusText = statusState.text(language)
         streamResolutionText = TBDisplaySenderL10n.streamSummary(
             preset: capturePreset,
             source: captureSource,
             language: language,
-            codecName: activeCodecName
+            codecName: isStreaming ? activeCodecName : videoTransportMode.codecName(for: capturePreset)
         )
 
         if let profile = activeProfile {
@@ -1316,6 +1698,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         activeProfile = nil
         activeCodecType = nil
         activeCodecName = nil
+        captureGeneration &+= 1
+        actualStreamText = "Not active"
         lastConnectionStateDetail = nil
         setStatus(.connecting(receiverDisplayName))
 
@@ -1407,6 +1791,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         isCableTesting = true
         cableTestResult = nil
         isCableTestConnection = true
+        connect()
+    }
+
+    func startBC7Test() {
+        guard !isConnected, !isStreaming, !receiverIP.isEmpty, !localInterfaceIP.isEmpty else { return }
+        guard TBBC7Mode6Encoder() != nil else {
+            bc7TestStatusText = "Sender Metal BC7 encoder is unavailable."
+            return
+        }
+        if receiverSupportsBC7Mode6Hint == false {
+            bc7TestStatusText = "Selected Receiver does not advertise BC7 support."
+            return
+        }
+
+        videoTransportMode = .bc7Mode6
+        capturePreset = .standard1440p
+        bc7TestStatusText = receiverSupportsBC7Mode6Hint == true
+            ? "Starting 1440p BC7 end-to-end test."
+            : "Connecting to verify Receiver BC7 capability."
         connect()
     }
 
@@ -1577,6 +1980,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         activeProfile = nil
         activeCodecType = nil
         activeCodecName = nil
+        actualStreamText = "Not active"
         isConnected = false
         isStreaming = false
         isCableTesting = false
@@ -1587,7 +1991,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         refreshLocalizedText()
         liveMetrics.senderFPS = 0
         sentSnapshot = 0
+        sentBytesSnapshot = 0
+        transportDiagnosticsText = "pending=0 · in-flight=0 · dropped=0 · 0.00 Gbit/s"
         sessionAckSent = false
+        pipelineHasFirstFrame = false
+        bc7RenderConfirmed = false
         baselineDisplayIDs = []
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
@@ -1669,6 +2077,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let name = Host.current().localizedName ?? "MacBook"
         let preset = capturePreset
         let helloCodecType = resolvedCodecType(for: preset, profile: activeProfile)
+        let helloCodecName: String
+        if let profile = activeProfile, bc7Mode6Enabled(for: profile) {
+            helloCodecName = "BC7 Mode 6"
+        } else if let profile = activeProfile, rawNV12Enabled(for: profile) {
+            helloCodecName = "NV12 RAW"
+        } else {
+            helloCodecName = codecName(for: helloCodecType)
+        }
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .helloReceiver,
             value: TBMonitorHelloReceiver(
@@ -1678,7 +2094,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 captureSource: captureSource.title(language),
                 captureWidth: preset.width,
                 captureHeight: preset.height,
-                codec: codecName(for: helloCodecType)
+                codec: helloCodecName
             )
         ) else { return }
         send(packet)
@@ -1776,6 +2192,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             switch type {
             case .displayProfile:
                 handleDisplayProfile(payload)
+            case .bc7RenderAck:
+                guard !bc7RenderConfirmed, payload.count == 12 else { break }
+                let generation = TBMonitorProtocol.readBE32(payload, offset: 0)
+                guard generation == bc7RenderGeneration else { break }
+                let width = TBMonitorProtocol.readBE32(payload, offset: 4)
+                let height = TBMonitorProtocol.readBE32(payload, offset: 8)
+                bc7RenderConfirmed = true
+                bc7TestStatusText = "BC7 end-to-end test passed: Receiver rendered \(width)×\(height)."
             case .inputEvent:
                 if inputControlRole == .receiverMaster,
                    let event = TBMonitorProtocol.decodeJSON(TBMonitorInputEvent.self, from: payload) {
@@ -2163,6 +2587,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         if let supportsHEVCDecode = profile.supportsHEVCDecode {
             receiverSupportsHEVCDecodeHint = supportsHEVCDecode
         }
+        receiverSupportsRawNV12Hint = profile.supportsRawNV12
+        receiverSupportsBC7Mode6Hint = profile.supportsBC7Mode6
         if let inputMonitoringTrusted = profile.inputMonitoringTrusted {
             receiverInputMonitoringTrustedHint = inputMonitoringTrusted
         }
@@ -2262,12 +2688,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func startCapture(for profile: TBMonitorDisplayProfile) async -> Bool {
         do {
             let preset = capturePreset
-            let usesRawNV12 = rawNV12Enabled(for: profile)
+            if videoTransportMode == .bc7Mode6, !videoTransportMode.isSupported(by: profile) {
+                bc7TestStatusText = "Receiver does not support BC7 Mode 6."
+                setStatus(.connectionFailed(bc7TestStatusText))
+                return false
+            }
+            if videoTransportMode == .rawNV12, !videoTransportMode.isSupported(by: profile) {
+                setStatus(.connectionFailed("Receiver does not support raw NV12."))
+                return false
+            }
+            let usesBC7Mode6 = bc7Mode6Enabled(for: profile)
+            let usesRawNV12 = !usesBC7Mode6 && rawNV12Enabled(for: profile)
             let codecType = resolvedCodecType(for: preset, profile: profile)
-            let codecName = usesRawNV12 ? "NV12 RAW" : codecName(for: codecType)
-            activeCodecType = usesRawNV12 ? nil : codecType
+            let codecName = usesBC7Mode6 ? "BC7 Mode 6" : (usesRawNV12 ? "NV12 RAW" : codecName(for: codecType))
+            activeCodecType = (usesRawNV12 || usesBC7Mode6) ? nil : codecType
             activeCodecName = codecName
             guard let connection else { return false }
+            captureGeneration &+= 1
+            let generation = captureGeneration
+            pipelineHasFirstFrame = false
 
             // The encode/send pipeline runs entirely on its own serial queue,
             // off the main thread, so SwiftUI layout can never stall frame
@@ -2280,13 +2719,37 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 displayName: session.displayName,
                 displayID: session.displayID,
                 usesRawNV12: usesRawNV12,
+                usesBC7Mode6: usesBC7Mode6,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] in
-                    Task { @MainActor in self?.handleFirstEncodedFrame() }
+                    Task { @MainActor in self?.handleFirstEncodedFrame(generation: generation) }
                 }
             )
-            guard pipeline.start() else { return false }
+            if usesBC7Mode6 {
+                bc7RenderConfirmed = false
+                bc7RenderGeneration &+= 1
+                var requestPayload = Data()
+                TBMonitorProtocol.appendBE32(&requestPayload, bc7RenderGeneration)
+                connection.send(
+                    content: TBMonitorProtocol.makePacket(type: .bc7RenderAckRequest, payload: requestPayload),
+                    completion: .contentProcessed({ error in
+                        if let error {
+                            TBLog.connection.error("BC7 render acknowledgment request failed: \(error.localizedDescription, privacy: .public)")
+                        }
+                    })
+                )
+            }
+            guard pipeline.start() else {
+                if usesBC7Mode6 {
+                    bc7TestStatusText = "Sender Metal BC7 encoder initialization failed."
+                    setStatus(.captureError(bc7TestStatusText))
+                }
+                return false
+            }
             self.pipeline = pipeline
+            if usesBC7Mode6 {
+                bc7TestStatusText = "BC7 Sender active; waiting for Receiver render confirmation."
+            }
             TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public) rawNV12=\(usesRawNV12, privacy: .public)")
 
             let display: SCDisplay
@@ -2311,7 +2774,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             configuration.height = preset.height
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(preset.expectedFrameRate))
             configuration.queueDepth = preset.queueDepth
-            configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            configuration.pixelFormat = usesBC7Mode6
+                ? kCVPixelFormatType_32BGRA
+                : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             configuration.showsCursor = !largeCursor
             configuration.scalesToFit = true
             configuration.captureResolution = preset.captureResolution
@@ -2487,14 +2952,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return onlineDisplayIDs().contains(displayID)
     }
 
-    /// RAW remains an explicit diagnostic-only transport until a selectable
-    /// profile and sustained hardware tests prove it safe for normal sessions.
-    /// A Receiver must explicitly advertise support before the environment
-    /// override can enable it, so older builds never receive unknown frames.
     private func rawNV12Enabled(for profile: TBMonitorDisplayProfile) -> Bool {
-        guard profile.supportsRawNV12 == true else { return false }
-        guard let value = ProcessInfo.processInfo.environment["RAW"]?.lowercased() else { return false }
-        return value == "1" || value == "true"
+        videoTransportMode == .rawNV12 && profile.supportsRawNV12 == true
+    }
+
+    private func bc7Mode6Enabled(for profile: TBMonitorDisplayProfile) -> Bool {
+        videoTransportMode == .bc7Mode6 && profile.supportsBC7Mode6 == true
     }
 
     private func configureDesktopMirror(for virtualDisplayID: CGDirectDisplayID) -> Bool {
@@ -2947,15 +3410,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         guard verboseDisplayLogging else { return }
         let online = onlineDisplayIDs()
         let virtualOnline = online.contains(session.displayID)
-        let diag = pipeline?.diagnosticsSnapshot() ?? (pending: 0, inFlight: 0, ptsSeq: 0)
+        let diag = pipeline?.diagnosticsSnapshot() ?? (pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0)
         NSLog(
-            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d ptsSeq=%lld",
+            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d dropped=%d ptsSeq=%lld",
             isStreaming ? "yes" : "no",
             liveMetrics.senderFPS,
             session.displayID,
             virtualOnline ? "yes" : "no",
             diag.pending,
             diag.inFlight,
+            diag.dropped,
             diag.ptsSeq
         )
     }
@@ -3020,9 +3484,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         pipeline?.stop()
         pipeline = nil
         isStreaming = false
+        actualStreamText = "Not active"
+        bc7RenderConfirmed = false
         liveMetrics.senderFPS = 0
         senderFPS = 0
         sentSnapshot = 0
+        sentBytesSnapshot = 0
+        transportDiagnosticsText = "pending=0 · in-flight=0 · dropped=0 · 0.00 Gbit/s"
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
 
@@ -3030,29 +3498,46 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         if !started {
             NSLog("TargetBridge: soft restart after wake failed — falling back to full stop")
             stop(resetStatusTo: .captureError("capture restart after wake failed"))
+        } else {
+            setStatus(.captureStartedWaitingFirstFrame)
+            startFirstFrameWatchdog()
         }
     }
 
-    private func handleFirstEncodedFrame() {
-        guard !sessionAckSent else { return }
+    private func handleFirstEncodedFrame(generation: UInt64) {
+        guard generation == captureGeneration else { return }
         sessionAckSent = true
+        pipelineHasFirstFrame = true
         firstFrameTimer?.invalidate()
         firstFrameTimer = nil
         TBLog.connection.info("capture: first encoded frame received")
+        actualStreamText = streamResolutionText
         setStatus(.captureActive(capturePreset.description, activeCodecName ?? capturePreset.codecName, captureSource))
     }
 
     private func startFPSTimer() {
         fpsTimer?.invalidate()
         sentSnapshot = pipeline?.sentFramesSnapshot ?? 0
+        sentBytesSnapshot = pipeline?.sentBytesSnapshot ?? 0
         fpsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
             MainActor.assumeIsolated {
                 let total = pipeline?.sentFramesSnapshot ?? 0
                 let fps = total - sentSnapshot
+                let totalBytes = pipeline?.sentBytesSnapshot ?? 0
+                let bytesPerSecond = max(0, totalBytes - sentBytesSnapshot)
+                let diagnostics = pipeline?.diagnosticsSnapshot() ?? (pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0)
                 liveMetrics.senderFPS = fps
                 senderFPS = fps
                 sentSnapshot = total
+                sentBytesSnapshot = totalBytes
+                transportDiagnosticsText = String(
+                    format: "pending=%d · in-flight=%d · dropped=%d · %.2f Gbit/s",
+                    diagnostics.pending,
+                    diagnostics.inFlight,
+                    diagnostics.dropped,
+                    Double(bytesPerSecond) * 8.0 / 1_000_000_000.0
+                )
             }
         }
     }
@@ -3070,12 +3555,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // If the first encoded frame already arrived (handleFirstEncodedFrame ran
         // while startCapture was still suspended), there is nothing to watch for —
         // arming would only leave a no-op timer dangling for 4s.
-        guard !sessionAckSent else { return }
+        guard !pipelineHasFirstFrame else { return }
         firstFrameTimer?.invalidate()
         firstFrameTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in
             guard let self else { return }
             MainActor.assumeIsolated {
-                guard isStreaming, !sessionAckSent else { return }
+                guard isStreaming, !pipelineHasFirstFrame else { return }
                 let sentFrames = self.pipeline?.sentFramesSnapshot ?? 0
                 TBLog.connection.error("capture: first-frame timeout preset=\(self.capturePreset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) connected=\(self.isConnected, privacy: .public) sentFrames=\(sentFrames, privacy: .public)")
                 if self.capturePreset == .native5k || self.capturePreset == .native5k60Experimental {

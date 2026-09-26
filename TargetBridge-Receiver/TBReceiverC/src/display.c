@@ -7,6 +7,8 @@
  */
 
 #include "display.h"
+#include "bc7_cursor.h"
+#include "bc7_renderer.h"
 #include "tb_i18n.h"
 #include "tb_gesture_bridge.h"
 
@@ -33,6 +35,7 @@ struct tb_display {
     SDL_Renderer *ren;
     SDL_Texture  *tex;
     SDL_Texture  *status_tex;
+    struct tb_bc7_renderer *bc7;
     int           tex_w, tex_h;
     int           quit;
     int           preferred_fullscreen;
@@ -585,6 +588,7 @@ struct tb_display *tb_disp_create(int fullscreen) {
         fprintf(stderr, "[disp] CreateRenderer: %s\n", SDL_GetError());
         SDL_DestroyWindow(d->win); free(d); return NULL;
     }
+    d->bc7 = tb_bc7_renderer_create(d->win);
     SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
     SDL_RenderSetLogicalSize(d->ren, 0, 0);
 
@@ -632,6 +636,7 @@ void tb_disp_destroy(struct tb_display *d) {
         d->system_cursor_hidden = 0;
     }
     tb_disp_destroy_status_texture(d);
+    tb_bc7_renderer_destroy(d->bc7);
     if (d->tex) SDL_DestroyTexture(d->tex);
     if (d->ren) SDL_DestroyRenderer(d->ren);
     if (d->win) SDL_DestroyWindow(d->win);
@@ -1128,6 +1133,7 @@ void tb_disp_render_nv12(struct tb_display *d,
                          int w, int h) {
     if (tb_disp_ensure_texture(d, w, h) < 0) return;
     tb_disp_set_connection_state(d, 1);
+    tb_bc7_renderer_set_visible(d->bc7, 0);
 
     if (SDL_UpdateNVTexture(d->tex, NULL,
                             y,  y_stride,
@@ -1137,6 +1143,31 @@ void tb_disp_render_nv12(struct tb_display *d,
     }
     d->last_video_frame_time = SDL_GetTicks();
     tb_disp_render_current(d);
+}
+
+int tb_disp_supports_bc7(struct tb_display *d) {
+    return d && d->bc7 && tb_bc7_renderer_supported();
+}
+
+int tb_disp_render_bc7(struct tb_display *d,
+                       const uint8_t *blocks,
+                       size_t length,
+                       uint32_t width,
+                       uint32_t height,
+                       uint32_t bytes_per_row,
+                       int wait_for_completion) {
+    if (!d || !d->bc7) return -1;
+    tb_disp_set_connection_state(d, 1);
+    d->last_video_frame_time = SDL_GetTicks();
+    return tb_bc7_renderer_render(
+        d->bc7,
+        blocks,
+        length,
+        width,
+        height,
+        bytes_per_row,
+        wait_for_completion
+    );
 }
 
 void tb_disp_set_cursor(struct tb_display *d,
@@ -1151,9 +1182,11 @@ void tb_disp_set_cursor(struct tb_display *d,
     d->cursor_source_h = source_h > 0 ? source_h : 1;
     d->cursor_visible = visible;
     d->cursor_type = type;
+    tb_bc7_renderer_set_cursor(d->bc7, x, y, source_w, source_h, visible, type);
 
     uint32_t now = SDL_GetTicks();
-    if (now - d->last_video_frame_time > 40) {
+    if (tb_bc7_cursor_should_redraw(now, d->last_video_frame_time)) {
+        tb_bc7_renderer_redraw(d->bc7);
         if (d->is_connected && d->tex) {
             tb_disp_render_current(d);
         }
@@ -1406,6 +1439,7 @@ void tb_disp_render_status(struct tb_display *d,
     if (!d || !d->ren || !d->win) return;
 
     tb_disp_set_connection_state(d, 0);
+    tb_bc7_renderer_set_visible(d->bc7, 0);
 
     if (!ip) ip = tb_i18n_get("receiver.network.not_detected");
     if (!status) status = tb_i18n_get("receiver.status.waiting_for_sender");
@@ -1460,6 +1494,7 @@ void tb_disp_render_connecting(struct tb_display *d) {
     if (!d || !d->ren || !d->win) return;
 
     tb_disp_set_connecting_state(d, 1);
+    tb_bc7_renderer_set_visible(d->bc7, 0);
 
     int drawable_w = 0;
     int drawable_h = 0;

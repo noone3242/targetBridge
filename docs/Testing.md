@@ -22,9 +22,10 @@ Test sources live in `TargetBridge-Sender/TBDisplaySenderTests/`.
 
 ## 2. Receiver parser tests (C)
 
-Unit tests for the streaming packet parser in `net.c` — fragmented and
-contiguous feeds, the NUL-sentinel guarantee, corrupt/oversized length
-rejection, and multi-megabyte payloads fed in socket-sized chunks.
+Unit tests for the streaming packet parser in `net.c` and the BC7 frame payload
+validator — fragmented and contiguous feeds, the NUL-sentinel guarantee,
+corrupt/oversized length rejection, multi-megabyte payloads fed in socket-sized
+chunks, and malformed BC7 dimensions, row strides, and payload lengths.
 Pure POSIX: needs **no ffmpeg, SDL, or pkgconf**.
 
 ```bash
@@ -118,3 +119,66 @@ the session card, whether input remains responsive, and any capture or decoder
 errors. For a two-receiver experiment, start one session per receiver and
 record the FPS for each session separately. Include the sender model, macOS
 version, receiver model, cable type, and selected transport with the report.
+
+## Experimental BC7 Mode 6
+
+The Sender test suite includes a Metal test that encodes a 4 x 4 BGRA block and
+checks the resulting 128-bit Mode 6 layout with an independent Swift decoder.
+Additional tests cover 8 x 8 multi-block ordering, deterministic output-buffer
+reuse, and unsupported input formats. These tests require an Apple Silicon Mac
+with Metal support.
+
+An opt-in 5K benchmark measures the current synchronous Metal encode plus
+`MTLBuffer`-to-`Data` copy. It is skipped during normal test runs:
+
+```bash
+cd TargetBridge-Sender
+RUN_BC7_BENCHMARK=1 \
+  xcodebuild test \
+  -project TargetBridge.xcodeproj \
+  -scheme TBDisplaySender \
+  -destination 'platform=macOS,arch=arm64' \
+  -only-testing:TBDisplaySenderTests/TBMonitorProtocolTests/testMetalBC7Mode6FiveKBenchmarkWhenEnabled
+```
+
+The output reports milliseconds per frame and effective BC7 output Gbit/s.
+This is a local component benchmark, not proof of end-to-end 5K60.
+
+For an end-to-end local test, start the Receiver normally, then select
+**BC7 Mode 6 (Experimental)** in the Sender's **Video transport** picker:
+
+```bash
+cd TargetBridge-Receiver/TBReceiverC
+./tbreceiver --windowed
+```
+
+BC7 activates only when the Receiver advertises `supportsBC7Mode6=true`.
+The Diagnostics **Start BC7 Test** action runs a real 1440p BC7 session and
+reports success only after the Receiver completes a Metal render command and
+returns the matching generation acknowledgment.
+
+## Intel Mac BC7 hardware validation
+
+Run the validation script on the Intel Mac itself:
+
+```bash
+TargetBridge-Receiver/scripts/intel_bc7_validation.sh
+```
+
+It records the Intel Mac model, GPU, macOS version, network interfaces, build
+log, binary architecture, and Receiver capability JSON under
+`build/intel-validation/<timestamp>/`. It stops with a non-zero exit status if
+the machine is not Intel, dependencies are missing, the binary is not x86_64,
+or Metal does not report BC7 texture support.
+
+To launch the packaged Receiver after a successful preflight and retain its
+runtime log:
+
+```bash
+TargetBridge-Receiver/scripts/intel_bc7_validation.sh --launch
+```
+
+On the Apple Silicon Sender, select the discovered Intel Receiver, choose the
+Thunderbolt Bridge interface, and click **Diagnostics > Start BC7 Test**. Save
+the Sender's selected/actual transport, FPS, Gbit/s, pending, in-flight, and
+dropped values together with the Intel evidence directory.

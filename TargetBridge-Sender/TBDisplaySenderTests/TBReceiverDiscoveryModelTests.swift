@@ -16,6 +16,8 @@ final class TBReceiverDiscoveryModelTests: XCTestCase {
         panelSummary: String = "",
         version: String = "3.1.0",
         supportsHEVCDecode: Bool = true,
+        supportsRawNV12: Bool = false,
+        supportsBC7Mode6: Bool = false,
         hostName: String? = nil
     ) -> TBDiscoveredReceiver {
         TBDiscoveredReceiver(
@@ -27,6 +29,8 @@ final class TBReceiverDiscoveryModelTests: XCTestCase {
             panelSummary: panelSummary,
             version: version,
             supportsHEVCDecode: supportsHEVCDecode,
+            supportsRawNV12: supportsRawNV12,
+            supportsBC7Mode6: supportsBC7Mode6,
             hostName: hostName
         )
     }
@@ -58,6 +62,12 @@ final class TBReceiverDiscoveryModelTests: XCTestCase {
     func testIDCombinesServiceNameAndPreferredIP() {
         let receiver = makeReceiver(serviceName: "TargetBridge Jonathans-iMac", preferredIP: "192.168.1.64")
         XCTAssertEqual(receiver.id, "TargetBridge Jonathans-iMac|192.168.1.64")
+    }
+
+    func testExperimentalCapabilityFlagsArePreserved() {
+        let receiver = makeReceiver(supportsRawNV12: true, supportsBC7Mode6: true)
+        XCTAssertTrue(receiver.supportsRawNV12)
+        XCTAssertTrue(receiver.supportsBC7Mode6)
     }
 
     // MARK: - shortHostName

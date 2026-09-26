@@ -75,6 +75,18 @@ void tb_disp_render_nv12(struct tb_display *d,
                          const uint8_t *uv, int uv_stride,
                          int w, int h);
 
+/* Report whether the active Metal device can sample BC7 textures. */
+int tb_disp_supports_bc7(struct tb_display *d);
+
+/* Upload a complete BC7 texture and render it directly on the GPU. */
+int tb_disp_render_bc7(struct tb_display *d,
+                       const uint8_t *blocks,
+                       size_t length,
+                       uint32_t width,
+                       uint32_t height,
+                       uint32_t bytes_per_row,
+                       int wait_for_completion);
+
 /* Update low-latency local cursor overlay in source-frame coordinates. */
 void tb_disp_set_cursor(struct tb_display *d,
                         int x, int y,

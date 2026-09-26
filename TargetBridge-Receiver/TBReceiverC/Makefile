@@ -22,7 +22,7 @@ APP_BUILD   ?= dev
 MACOSX_DEPLOYMENT_TARGET ?= 11.0
 export MACOSX_DEPLOYMENT_TARGET
 
-CFLAGS   += -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
+CFLAGS   += -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -MMD -MP
 CFLAGS   += $(shell $(PKG) --cflags libavcodec libavutil sdl2)
 CFLAGS   += -DTB_RECEIVER_VERSION=\"$(APP_VERSION)\" -DTB_RECEIVER_BUILD=\"$(APP_BUILD)\"
 CFLAGS   += -DTB_LANGUAGE_SOURCE_DIR=\"$(abspath ../../TargetBridge-Shared/Languages)\"
@@ -31,18 +31,20 @@ LDFLAGS  += $(shell $(PKG) --libs libavcodec libavutil sdl2)
 
 UNAME_S  := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework CoreServices -framework CoreAudio
+LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework CoreServices -framework CoreAudio -framework Metal -framework QuartzCore
 endif
 
-C_SRC = src/main.c src/net.c src/decoder.c src/display.c src/tb_i18n.c
+C_SRC = src/main.c src/net.c src/bc7_frame.c src/bc7_cursor.c src/decoder.c src/display.c src/tb_i18n.c
 OBJC_SRC = src/tb_gesture_bridge.m
-OBJ = $(C_SRC:.c=.o) $(OBJC_SRC:.m=.o)
+OBJCXX_SRC = src/bc7_renderer.mm
+OBJ = $(C_SRC:.c=.o) $(OBJC_SRC:.m=.o) $(OBJCXX_SRC:.mm=.o)
+DEP = $(OBJ:.o=.d)
 BIN = tbreceiver
 
 all: $(BIN)
 
 $(BIN): $(OBJ)
-	$(CC) -o $@ $(OBJ) $(LDFLAGS)
+	$(CXX) -o $@ $(OBJ) $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -50,18 +52,23 @@ $(BIN): $(OBJ)
 %.o: %.m
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
+%.o: %.mm
+	$(CXX) $(CFLAGS) -std=c++17 -fobjc-arc -c -o $@ $<
+
 clean:
-	rm -f $(OBJ) $(BIN) $(TEST_BIN)
+	rm -f $(OBJ) $(DEP) $(BIN) $(TEST_BIN)
 
 # Unit tests for the packet parser. net.c is pure POSIX, so this needs no
 # ffmpeg/SDL/pkgconf — it runs anywhere, including CI, with no hardware.
 TEST_CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
 TEST_BIN = test_net_parser
 
-$(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h
-	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c -o $@
+$(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h src/bc7_frame.c src/bc7_frame.h src/bc7_cursor.c src/bc7_cursor.h
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c src/bc7_frame.c src/bc7_cursor.c -o $@
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)
+
+-include $(DEP)
 
 .PHONY: all clean test

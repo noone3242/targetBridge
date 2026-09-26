@@ -9,9 +9,37 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
     let panelSummary: String
     let version: String
     let supportsHEVCDecode: Bool
+    let supportsRawNV12: Bool
+    let supportsBC7Mode6: Bool
     let hostName: String?
 
     var id: String { "\(serviceName)|\(preferredIP)" }
+
+    init(
+        serviceName: String,
+        receiverName: String,
+        preferredIP: String,
+        thunderboltIP: String,
+        networkIP: String,
+        panelSummary: String,
+        version: String,
+        supportsHEVCDecode: Bool,
+        supportsRawNV12: Bool = false,
+        supportsBC7Mode6: Bool = false,
+        hostName: String?
+    ) {
+        self.serviceName = serviceName
+        self.receiverName = receiverName
+        self.preferredIP = preferredIP
+        self.thunderboltIP = thunderboltIP
+        self.networkIP = networkIP
+        self.panelSummary = panelSummary
+        self.version = version
+        self.supportsHEVCDecode = supportsHEVCDecode
+        self.supportsRawNV12 = supportsRawNV12
+        self.supportsBC7Mode6 = supportsBC7Mode6
+        self.hostName = hostName
+    }
 
     var shortHostName: String? {
         guard let host = hostName, !host.isEmpty else { return nil }
@@ -117,6 +145,8 @@ final class TBReceiverDiscovery: NSObject, ObservableObject {
         let panelHeight = stringValue("panelHeight")
         let version = stringValue("version")
         let supportsHEVCDecode = stringValue("supportsHEVCDecode") == "1"
+        let supportsRawNV12 = stringValue("supportsRawNV12") == "1"
+        let supportsBC7Mode6 = stringValue("supportsBC7Mode6") == "1"
 
         let panelSummary: String
         if !panelWidth.isEmpty, !panelHeight.isEmpty, !panelName.isEmpty {
@@ -138,6 +168,8 @@ final class TBReceiverDiscovery: NSObject, ObservableObject {
             panelSummary: panelSummary,
             version: version,
             supportsHEVCDecode: supportsHEVCDecode,
+            supportsRawNV12: supportsRawNV12,
+            supportsBC7Mode6: supportsBC7Mode6,
             hostName: service.hostName
         )
 

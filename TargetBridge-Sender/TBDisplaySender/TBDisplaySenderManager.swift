@@ -116,6 +116,7 @@ final class TBDisplaySenderService: ObservableObject {
         discoveryCancellable = receiverDiscovery.$receivers.sink { [weak self] receivers in
             guard let self else { return }
             discoveredReceivers = receivers
+            refreshDiscoveredReceiverHints()
             pushLanguageUpdateToDiscoveredReceivers()
             objectWillChange.send()
         }
@@ -128,6 +129,7 @@ final class TBDisplaySenderService: ObservableObject {
         refreshLocalInterfaces()
         addonStore.refresh()
         restorePersistedSessions()
+        refreshDiscoveredReceiverHints()
         startClipboardMonitoring()
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
@@ -246,6 +248,7 @@ final class TBDisplaySenderService: ObservableObject {
         if let previous = sessions.last {
             session.capturePreset = previous.capturePreset
             session.captureSource = previous.captureSource
+            session.videoTransportMode = previous.videoTransportMode
             session.transportKind = previous.transportKind
             session.audioEnabled = audioRelayAvailable && previous.audioEnabled
             session.inputGestureMode = previous.inputGestureMode
@@ -294,6 +297,7 @@ final class TBDisplaySenderService: ObservableObject {
         var selectedReceiverID: String
         var capturePreset: String
         var captureSource: String
+        var videoTransportMode: String?
         var audioEnabled: Bool
         var brightness: Double
         var inputGestureMode: String
@@ -329,6 +333,7 @@ final class TBDisplaySenderService: ObservableObject {
                 selectedReceiverID: session.selectedReceiverID,
                 capturePreset: session.capturePreset.rawValue,
                 captureSource: session.captureSource.rawValue,
+                videoTransportMode: session.videoTransportMode.rawValue,
                 audioEnabled: session.audioEnabled,
                 brightness: session.brightness,
                 inputGestureMode: session.inputGestureMode.rawValue,
@@ -394,6 +399,10 @@ final class TBDisplaySenderService: ObservableObject {
         if let source = TBDisplayCaptureSource(rawValue: config.captureSource) {
             session.captureSource = source
         }
+        if let modeRaw = config.videoTransportMode,
+           let mode = TBVideoTransportMode(rawValue: modeRaw) {
+            session.videoTransportMode = mode
+        }
         if let gesture = TBInputGestureMode(rawValue: config.inputGestureMode) {
             session.inputGestureMode = gesture
         }
@@ -423,6 +432,8 @@ final class TBDisplaySenderService: ObservableObject {
     func applyDiscoveredReceiver(_ receiver: TBDiscoveredReceiver, to session: TBDisplaySenderSession) {
         session.receiverIP = receiver.ip(for: session.transportKind)
         session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
+        session.receiverSupportsRawNV12Hint = receiver.supportsRawNV12
+        session.receiverSupportsBC7Mode6Hint = receiver.supportsBC7Mode6
         if session.localInterfaceIP.isEmpty {
             session.localInterfaceIP = suggestedInterfaceForNewSession(transportKind: session.transportKind)?.ip
                 ?? availableInterfaces(for: session.transportKind).first?.ip
@@ -430,6 +441,18 @@ final class TBDisplaySenderService: ObservableObject {
         }
         restoreDisplayProfile(for: session)
         objectWillChange.send()
+    }
+
+    private func refreshDiscoveredReceiverHints() {
+        for session in sessions where !session.selectedReceiverID.isEmpty {
+            guard let receiver = discoveredReceivers.first(where: { $0.id == session.selectedReceiverID }) else {
+                continue
+            }
+            session.receiverIP = receiver.ip(for: session.transportKind)
+            session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
+            session.receiverSupportsRawNV12Hint = receiver.supportsRawNV12
+            session.receiverSupportsBC7Mode6Hint = receiver.supportsBC7Mode6
+        }
     }
 
     func applyDisplayProfile(_ profile: TBDisplayProfile, to session: TBDisplaySenderSession) {
@@ -493,7 +516,7 @@ final class TBDisplaySenderService: ObservableObject {
     func transportDidChange(for session: TBDisplaySenderSession) {
         session.localInterfaceIP = defaultLocalInterfaceIP(for: session.transportKind)
         if let receiver = discoveredReceivers.first(where: { $0.id == session.selectedReceiverID }) {
-            session.receiverIP = receiver.ip(for: session.transportKind)
+            applyDiscoveredReceiver(receiver, to: session)
         }
         objectWillChange.send()
     }

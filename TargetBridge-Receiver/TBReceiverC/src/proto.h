@@ -21,6 +21,15 @@
  *             [Y plane: yStride*height][CbCr plane: uvStride*(height/2)]
  *   (see handle_raw_frame in main.c; sender-side sendRawFrame)
  *
+ * type 0x24 = BC7 Mode 6 frame
+ *   payload = [1 byte format: 1=BC7 Mode 6][4 BE uint32 width]
+ *             [4 BE uint32 height][4 BE uint32 bytesPerRow]
+ *             [BC7 blocks: bytesPerRow*ceil(height/4)]
+ * type 0x25 = BC7 render acknowledgment
+ *   payload = [4 BE uint32 generation][4 BE uint32 width][4 BE uint32 height]
+ * type 0x26 = request acknowledgment for the next successfully rendered BC7 frame
+ *   payload = [4 BE uint32 generation]
+ *
  * type 0x30 = heartbeat (JSON)
  * type 0x31 = teardown (JSON)
  * type 0x32 = cursor position (JSON)
@@ -47,6 +56,9 @@
 #define TB_PKT_FRAME            0x21
 #define TB_PKT_RAW_FRAME        0x22  /* uncompressed NV12 planes (raw passthrough) */
 #define TB_PKT_AUDIO_FRAME      0x23
+#define TB_PKT_BC7_FRAME        0x24  /* full-frame BC7 Mode 6 blocks */
+#define TB_PKT_BC7_RENDER_ACK   0x25  /* first frame successfully uploaded/rendered */
+#define TB_PKT_BC7_ACK_REQUEST  0x26
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31
 #define TB_PKT_CURSOR           0x32

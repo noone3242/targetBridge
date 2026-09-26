@@ -9,6 +9,9 @@ enum TBMonitorPacketType: UInt8 {
     case frame = 0x21
     case rawFrame = 0x22   // Uncompressed NV12 planes (raw passthrough mode)
     case audioFrame = 0x23
+    case bc7Frame = 0x24   // Full-frame BC7 Mode 6 blocks
+    case bc7RenderAck = 0x25
+    case bc7RenderAckRequest = 0x26
     case heartbeat = 0x30
     case teardown = 0x31
     case cursor = 0x32
@@ -42,6 +45,7 @@ struct TBMonitorDisplayProfile: Codable {
     var captureHeight: Int
     var supportsHEVCDecode: Bool?
     var supportsRawNV12: Bool?
+    var supportsBC7Mode6: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
 }

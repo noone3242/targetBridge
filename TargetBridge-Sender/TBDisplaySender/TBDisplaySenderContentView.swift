@@ -615,6 +615,21 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         .disabled(session.isConnected || session.isStreaming)
                     }
 
+                    settingRow(
+                        service.language == .chinese ? "视频传输" : "Video transport",
+                        details: service.language == .chinese
+                            ? "选择网络帧格式。BC7 Mode 6 使用 Sender GPU 压缩并由 Receiver GPU 直接显示。"
+                            : "Select the wire format. BC7 Mode 6 compresses on the Sender GPU and renders directly on the Receiver GPU."
+                    ) {
+                        Picker("Video transport", selection: $session.videoTransportMode) {
+                            ForEach(TBVideoTransportMode.allCases) { mode in
+                                Text(mode.title(service.language)).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .disabled(session.isConnected || session.isStreaming)
+                    }
+
                     if session.captureSource == .extendedDesktop {
                         settingRow(renderMatchingTitle, details: renderMatchingDetails) {
                             Toggle("", isOn: $session.matchRenderToStream)
@@ -793,7 +808,41 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
 
                             Divider().overlay(Color.white.opacity(0.08))
 
+                            HStack(spacing: 12) {
+                                Button(service.language == .chinese ? "开始 BC7 联合测试" : "Start BC7 Test") {
+                                    session.startBC7Test()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(session.isConnected || session.isStreaming || trimmedReceiverIP.isEmpty || session.localInterfaceIP.isEmpty)
+
+                                Text(session.bc7TestStatusText.isEmpty
+                                    ? (service.language == .chinese ? "使用真实 Receiver 运行 1440p capture → BC7 → Metal 测试。" : "Run a real 1440p capture → BC7 → Metal Receiver test.")
+                                    : session.bc7TestStatusText)
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+
+                                Spacer()
+                            }
+
+                            Divider().overlay(Color.white.opacity(0.08))
+
                             VStack(alignment: .leading, spacing: 8) {
+                                infoRow(
+                                    service.language == .chinese ? "选择的传输" : "Selected transport",
+                                    session.videoTransportMode.title(service.language)
+                                )
+                                infoRow(
+                                    service.language == .chinese ? "Receiver BC7" : "Receiver BC7",
+                                    session.receiverSupportsBC7Mode6Hint.map { $0 ? "supported" : "unsupported" } ?? "unknown"
+                                )
+                                infoRow(
+                                    service.language == .chinese ? "实际码流" : "Actual stream",
+                                    session.actualStreamText
+                                )
+                                infoRow(
+                                    service.language == .chinese ? "传输详情" : "Transport details",
+                                    session.transportDiagnosticsText
+                                )
                                 infoRow("Capture", session.captureDisplayText)
                                 infoRow("State", session.displayStateText)
                             }
