@@ -18,12 +18,54 @@ final class TBMonitorProtocolTests: XCTestCase {
     func testNative5KRenderMatchingUsesAReal5KFramebuffer() {
         let mode = TBDisplayCapturePreset.native5k60Experimental.renderMatchedDisplayMode
 
-        XCTAssertEqual(mode.width, 5120)
-        XCTAssertEqual(mode.height, 2880)
+        XCTAssertEqual(mode.width, 2560)
+        XCTAssertEqual(mode.height, 1440)
         XCTAssertEqual(mode.backingWidth, 5120)
         XCTAssertEqual(mode.backingHeight, 2880)
-        XCTAssertEqual(mode.logicalWidth, 2560)
-        XCTAssertEqual(mode.logicalHeight, 1440)
+        XCTAssertTrue(
+            tbVirtualDisplayModeMatches(
+                logicalWidth: 2560,
+                logicalHeight: 1440,
+                pixelWidth: 5120,
+                pixelHeight: 2880,
+                target: mode,
+                hiDPI: true
+            )
+        )
+        XCTAssertFalse(
+            tbVirtualDisplayModeMatches(
+                logicalWidth: 2560,
+                logicalHeight: 1440,
+                pixelWidth: 2560,
+                pixelHeight: 1440,
+                target: mode,
+                hiDPI: true
+            )
+        )
+    }
+
+    func testSessionLogIsBoundedAndSuppressesAdjacentDuplicates() {
+        var entries: [TBSessionLogEntry] = []
+        for index in 0..<85 {
+            entries = tbAppendingSessionLogEntry(
+                to: entries,
+                message: "event-\(index)",
+                timestamp: "12:00:\(index)",
+                capacity: 80
+            )
+        }
+
+        XCTAssertEqual(entries.count, 80)
+        XCTAssertEqual(entries.first?.message, "event-5")
+        XCTAssertEqual(entries.last?.message, "event-84")
+
+        let duplicate = tbAppendingSessionLogEntry(
+            to: entries,
+            message: "event-84",
+            timestamp: "12:01:00",
+            capacity: 80
+        )
+        XCTAssertEqual(duplicate, entries)
     }
 
     // MARK: - BE32 primitives

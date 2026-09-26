@@ -5,16 +5,28 @@ extension CGVirtualDisplayDescriptor: @unchecked @retroactive Sendable {}
 extension CGVirtualDisplay: @unchecked @retroactive Sendable {}
 extension CGVirtualDisplaySettings: @unchecked @retroactive Sendable {}
 
-/// Framebuffer pixel size handed to CGVirtualDisplay. With `settings.hiDPI = true`,
-/// macOS exposes a logical desktop at half this size.
+/// Logical size handed to CGVirtualDisplay. With `settings.hiDPI = true`, the
+/// selected display mode must expose a framebuffer exactly twice this size.
 struct TBVirtualDisplayModeSize: Equatable {
     let width: Int
     let height: Int
 
-    var backingWidth: Int { width }
-    var backingHeight: Int { height }
-    var logicalWidth: Int { width / 2 }
-    var logicalHeight: Int { height / 2 }
+    var backingWidth: Int { width * 2 }
+    var backingHeight: Int { height * 2 }
+}
+
+func tbVirtualDisplayModeMatches(
+    logicalWidth: Int,
+    logicalHeight: Int,
+    pixelWidth: Int,
+    pixelHeight: Int,
+    target: TBVirtualDisplayModeSize,
+    hiDPI: Bool
+) -> Bool {
+    logicalWidth == target.width &&
+        logicalHeight == target.height &&
+        pixelWidth == (hiDPI ? target.backingWidth : target.width) &&
+        pixelHeight == (hiDPI ? target.backingHeight : target.height)
 }
 
 struct TBVirtualDisplayIdentity {
@@ -78,19 +90,18 @@ final class ReceiverBackedVirtualDisplaySession {
         let preferredRefreshRate = refreshRate ?? profile.refreshRate
 
         // The receiver advertises a 2560x1440 logical HiDPI mode on a 5120x2880
-        // panel. CGVirtualDisplayMode takes framebuffer pixels, so the default must
-        // use the panel dimensions rather than the logical mode dimensions. Any preset
+        // panel. Any preset
         // below 5K therefore makes ScreenCaptureKit resample 5120x2880 down to the
         // stream size, and the receiver resample back up to the panel: two non-integer
         // passes. `modeOverride` lets the sender size the backing store to match the
         // stream exactly, so capture is 1:1 and only the panel-side scale remains.
         let defaultMode = TBVirtualDisplayModeSize(
-            width: profile.hiDPI ? profile.panelWidth : profile.modeWidth,
-            height: profile.hiDPI ? profile.panelHeight : profile.modeHeight
+            width: profile.modeWidth,
+            height: profile.modeHeight
         )
         var resolvedMode = modeOverride ?? defaultMode
 
-        // macOS refuses a mode whose framebuffer exceeds the advertised panel.
+        // macOS refuses a HiDPI mode whose backing store exceeds the advertised panel.
         if resolvedMode.backingWidth > profile.panelWidth || resolvedMode.backingHeight > profile.panelHeight {
             NSLog(
                 "TargetBridge: mode override %dx%d needs a %dx%d backing store, exceeds panel %dx%d; falling back to receiver profile",
@@ -146,11 +157,15 @@ final class ReceiverBackedVirtualDisplaySession {
         let savedChoice = modeOverride == nil
             ? TBVirtualDisplayModeMemory.shared.load(forKey: preferenceKey)
             : nil
-        activatePreferredMode(for: display.displayID,
-                              mode: resolvedMode,
-                              refreshRate: preferredRefreshRate,
-                              hiDPI: profile.hiDPI,
-                              savedChoice: savedChoice)
+        guard activatePreferredMode(
+            for: display.displayID,
+            mode: resolvedMode,
+            refreshRate: preferredRefreshRate,
+            hiDPI: profile.hiDPI,
+            savedChoice: savedChoice
+        ) else {
+            return false
+        }
 
         virtualDisplay = display
         displayID = display.displayID
@@ -236,15 +251,15 @@ final class ReceiverBackedVirtualDisplaySession {
         let modes = modesCF as? [CGDisplayMode] ?? []
 
         let matchingModes = modes.filter { candidate in
-            candidate.pixelWidth == mode.width && candidate.pixelHeight == mode.height
-        }.sorted {
-            let lhsHiDPI = $0.width * 2 == $0.pixelWidth && $0.height * 2 == $0.pixelHeight
-            let rhsHiDPI = $1.width * 2 == $1.pixelWidth && $1.height * 2 == $1.pixelHeight
-            if lhsHiDPI != rhsHiDPI {
-                return hiDPI ? lhsHiDPI : !lhsHiDPI
-            }
-            return $0.refreshRate > $1.refreshRate
-        }
+            tbVirtualDisplayModeMatches(
+                logicalWidth: candidate.width,
+                logicalHeight: candidate.height,
+                pixelWidth: candidate.pixelWidth,
+                pixelHeight: candidate.pixelHeight,
+                target: mode,
+                hiDPI: hiDPI
+            )
+        }.sorted { $0.refreshRate > $1.refreshRate }
 
         if let exactMatch = matchingModes.first(where: { abs($0.refreshRate - refreshRate) < 0.5 }) {
             return exactMatch

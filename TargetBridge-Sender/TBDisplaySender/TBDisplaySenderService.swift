@@ -24,6 +24,25 @@ enum TBReceiverStateUpdate: Equatable {
     ]
 }
 
+struct TBSessionLogEntry: Identifiable, Equatable {
+    let id: UUID
+    let timestamp: String
+    let message: String
+}
+
+func tbAppendingSessionLogEntry(
+    to entries: [TBSessionLogEntry],
+    message: String,
+    timestamp: String,
+    capacity: Int = 80
+) -> [TBSessionLogEntry] {
+    guard entries.last?.message != message else { return entries }
+    let appended = entries + [
+        TBSessionLogEntry(id: UUID(), timestamp: timestamp, message: message)
+    ]
+    return Array(appended.suffix(max(1, capacity)))
+}
+
 enum TBVideoTransportMode: String, CaseIterable, Identifiable {
     case automatic
     case bc7Mode6
@@ -288,14 +307,13 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Virtual display framebuffer that matches the stream resolution.
-    /// CGVirtualDisplayMode takes pixel dimensions; HiDPI exposes a logical desktop
-    /// at half this size while ScreenCaptureKit receives the full framebuffer.
+    /// Virtual display mode that makes the HiDPI backing framebuffer equal the
+    /// stream resolution.
     ///
     /// Costs screen real estate: the desktop reports "looks like w/2 x h/2" rather
     /// than the receiver's default 2560 x 1440.
     var renderMatchedDisplayMode: TBVirtualDisplayModeSize {
-        TBVirtualDisplayModeSize(width: width, height: height)
+        TBVirtualDisplayModeSize(width: width / 2, height: height / 2)
     }
 
     /// Logical desktop size the user ends up with under render matching.
@@ -1738,6 +1756,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var virtualDisplayText: String
     @Published var captureDisplayText: String
     @Published var displayStateText: String
+    @Published var displayModeDiagnosticsText = "Not active"
+    @Published private(set) var sessionLogEntries: [TBSessionLogEntry] = []
     @Published var language: TBDisplaySenderLanguage {
         didSet {
             refreshLocalizedText()
@@ -1925,8 +1945,57 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func setStatus(_ state: TBDisplaySenderStatusState) {
+        let nextText = state.text(language)
         statusState = state
-        statusText = state.text(language)
+        statusText = nextText
+        recordSessionEvent(nextText)
+    }
+
+    func clearSessionLog() {
+        sessionLogEntries.removeAll(keepingCapacity: true)
+    }
+
+    func recordSessionEvent(_ message: String, at date: Date = Date()) {
+        let components = Calendar.current.dateComponents([.hour, .minute, .second], from: date)
+        let timestamp = String(
+            format: "%02d:%02d:%02d",
+            components.hour ?? 0,
+            components.minute ?? 0,
+            components.second ?? 0
+        )
+        sessionLogEntries = tbAppendingSessionLogEntry(
+            to: sessionLogEntries,
+            message: message,
+            timestamp: timestamp
+        )
+    }
+
+    var connectionPathText: String {
+        let interface = connectInterfaceName ?? transportKind.rawValue
+        return "\(localInterfaceIP) → \(receiverIP):\(TBMonitorProtocol.port) · \(interface)"
+    }
+
+    var generationDiagnosticsText: String {
+        "capture=\(captureGeneration) · renderAck=\(bc7RenderConfirmed ? "yes" : "no")"
+    }
+
+    private func refreshDisplayModeDiagnostics() {
+        guard session.displayID != kCGNullDirectDisplay,
+              let mode = CGDisplayCopyDisplayMode(session.displayID)
+        else {
+            displayModeDiagnosticsText = "Not active"
+            return
+        }
+        let scale = mode.width > 0 ? Double(mode.pixelWidth) / Double(mode.width) : 0
+        displayModeDiagnosticsText = String(
+            format: "logical %d×%d · pixels %d×%d · %.1fx · %.0f Hz",
+            mode.width,
+            mode.height,
+            mode.pixelWidth,
+            mode.pixelHeight,
+            scale,
+            mode.refreshRate
+        )
     }
 
     private static func probeHEVCHardwareEncoderSupport() -> Bool {
@@ -2108,6 +2177,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.connectTimeoutWorkItem = nil
                     self.isConnected = true
                     TBLog.connection.info("connect: ready — \(self.receiverIP, privacy: .public) via \(self.connectInterfaceName ?? "?", privacy: .public)")
+                    self.recordSessionEvent("Connected: \(self.connectionPathText)")
                     self.setStatus(.waitingDisplayProfile)
                     self.startHeartbeat()
                     self.sendAutomaticReceiverStateUpdates()
@@ -2342,6 +2412,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         activeCodecType = nil
         activeCodecName = nil
         actualStreamText = "Not active"
+        displayModeDiagnosticsText = "Not active"
         isConnected = false
         isStreaming = false
         isCableTesting = false
@@ -2965,6 +3036,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         else { return }
 
         activeProfile = profile
+        recordSessionEvent(
+            "Receiver profile: \(profile.panelWidth)×\(profile.panelHeight), mode \(profile.modeWidth)×\(profile.modeHeight), \(Int(profile.refreshRate.rounded())) Hz"
+        )
         if let supportsHEVCDecode = profile.supportsHEVCDecode {
             receiverSupportsHEVCDecodeHint = supportsHEVCDecode
         }
@@ -3005,9 +3079,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 : nil
             if let modeOverride {
                 NSLog(
-                    "TargetBridge: render matching on, virtual display framebuffer %dx%d (logical %dx%d) for %dx%d stream",
+                    "TargetBridge: render matching on, virtual display mode %dx%d (backing %dx%d) for %dx%d stream",
                     modeOverride.width, modeOverride.height,
-                    modeOverride.logicalWidth, modeOverride.logicalHeight,
+                    modeOverride.backingWidth, modeOverride.backingHeight,
                     self.capturePreset.width, self.capturePreset.height
                 )
             }
@@ -3038,6 +3112,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 language: self.language
             )
             self.displayStateText = self.describeDisplayState(for: self.session.displayID)
+            self.refreshDisplayModeDiagnostics()
+            self.recordSessionEvent("Virtual display: \(self.displayModeDiagnosticsText)")
 
             // Reset the first-frame flag BEFORE capture starts. startCapture() is
             // async and frames can begin flowing (firing handleFirstEncodedFrame,
@@ -3922,6 +3998,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         firstFrameTimer = nil
         TBLog.connection.info("capture: first encoded frame received")
         actualStreamText = "\(width) × \(height) · \(activeCodecName ?? capturePreset.codecName)"
+        recordSessionEvent("First encoded frame: \(actualStreamText)")
         if capturePreset == .native5k || capturePreset == .native5k60Experimental,
            (width != capturePreset.width || height != capturePreset.height) {
             let message =

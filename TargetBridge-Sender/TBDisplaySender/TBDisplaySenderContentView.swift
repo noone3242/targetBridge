@@ -287,11 +287,55 @@ private struct TBDisplaySenderSessionCard: View {
                 sectionHeading(sessionMonitorTitle)
 
                 VStack(alignment: .leading, spacing: 8) {
+                    infoRow(statusLabel, session.statusText)
+                    infoRow(connectionPathLabel, session.connectionPathText)
                     infoRow(TBDisplaySenderL10n.receiverLabel(service.language), session.receiverPanelText)
                     infoRow(TBDisplaySenderL10n.virtualDisplayLabel(service.language), session.virtualDisplayText)
-                    infoRow(TBDisplaySenderL10n.streamLabel(service.language), session.streamResolutionText)
+                    infoRow(displayModeLabel, session.displayModeDiagnosticsText)
+                    infoRow(configuredStreamLabel, session.streamResolutionText)
+                    infoRow(actualStreamLabel, session.actualStreamText)
+                    infoRow(transportDetailsLabel, session.transportDiagnosticsText)
+                    infoRow(generationLabel, session.generationDiagnosticsText)
+                    infoRow(captureLabel, session.captureDisplayText)
+                    infoRow(displayStateLabel, session.displayStateText)
                     infoRow(TBDisplaySenderL10n.fpsLabel(service.language), "\(session.senderFPS)")
                 }
+
+                Divider().overlay(Color.white.opacity(0.08))
+
+                HStack {
+                    sectionHeading(sessionLogTitle)
+                    Spacer()
+                    Button(clearLogTitle) {
+                        session.clearSessionLog()
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(session.sessionLogEntries.isEmpty)
+                }
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 5) {
+                        if session.sessionLogEntries.isEmpty {
+                            Text(emptyLogText)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(session.sessionLogEntries.reversed()) { entry in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text(entry.timestamp)
+                                        .foregroundStyle(.secondary)
+                                    Text(entry.message)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(minHeight: 90, maxHeight: 180)
+                .padding(10)
+                .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 8))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -495,6 +539,54 @@ private struct TBDisplaySenderSessionCard: View {
         case .french: return "Moniteur de session"
         case .chinese: return "显示会话"
         }
+    }
+
+    private var statusLabel: String {
+        service.language == .chinese ? "状态" : "Status"
+    }
+
+    private var connectionPathLabel: String {
+        service.language == .chinese ? "连接路径" : "Connection"
+    }
+
+    private var displayModeLabel: String {
+        service.language == .chinese ? "显示模式" : "Display mode"
+    }
+
+    private var configuredStreamLabel: String {
+        service.language == .chinese ? "配置码流" : "Configured stream"
+    }
+
+    private var actualStreamLabel: String {
+        service.language == .chinese ? "实际码流" : "Actual stream"
+    }
+
+    private var transportDetailsLabel: String {
+        service.language == .chinese ? "传输详情" : "Transport details"
+    }
+
+    private var generationLabel: String {
+        service.language == .chinese ? "帧代次" : "Generation"
+    }
+
+    private var captureLabel: String {
+        service.language == .chinese ? "捕获源" : "Capture"
+    }
+
+    private var displayStateLabel: String {
+        service.language == .chinese ? "显示状态" : "Display state"
+    }
+
+    private var sessionLogTitle: String {
+        service.language == .chinese ? "会话日志" : "Session log"
+    }
+
+    private var clearLogTitle: String {
+        service.language == .chinese ? "清空" : "Clear"
+    }
+
+    private var emptyLogText: String {
+        service.language == .chinese ? "尚无会话事件" : "No session events yet"
     }
 
     private var liveTitle: String {
