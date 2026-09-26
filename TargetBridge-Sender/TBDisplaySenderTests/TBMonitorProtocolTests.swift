@@ -7,6 +7,14 @@ import XCTest
 /// `[4B BE length][1B type][payload]` where length counts type + payload.
 final class TBMonitorProtocolTests: XCTestCase {
 
+    func testAutomaticConnectionStateDoesNotChangeReceiverVolume() {
+        XCTAssertEqual(
+            TBReceiverStateUpdate.automaticOnConnect,
+            [.hello, .inputControlMode, .brightness]
+        )
+        XCTAssertFalse(TBReceiverStateUpdate.automaticOnConnect.contains(.volume))
+    }
+
     // MARK: - BE32 primitives
 
     func testBE32RoundTrip() {

@@ -11,6 +11,19 @@ import Network
 @preconcurrency import ScreenCaptureKit
 import VideoToolbox
 
+enum TBReceiverStateUpdate: Equatable {
+    case hello
+    case inputControlMode
+    case brightness
+    case volume
+
+    static let automaticOnConnect: [Self] = [
+        .hello,
+        .inputControlMode,
+        .brightness
+    ]
+}
+
 enum TBVideoTransportMode: String, CaseIterable, Identifiable {
     case automatic
     case bc7Mode6
@@ -2097,10 +2110,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     TBLog.connection.info("connect: ready — \(self.receiverIP, privacy: .public) via \(self.connectInterfaceName ?? "?", privacy: .public)")
                     self.setStatus(.waitingDisplayProfile)
                     self.startHeartbeat()
-                    self.sendHello()
-                    self.sendInputControlModeUpdate()
-                    self.sendBrightnessUpdate()
-                    self.sendVolumeUpdate()
+                    self.sendAutomaticReceiverStateUpdates()
                     self.receiveLoop(on: conn)
                 case .waiting(let error):
                     // The dial cannot proceed yet (no route, host down, cable
@@ -2474,6 +2484,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             value: TBMonitorVolume(level: volume)
         ) else { return }
         send(packet)
+    }
+
+    private func sendAutomaticReceiverStateUpdates() {
+        for update in TBReceiverStateUpdate.automaticOnConnect {
+            switch update {
+            case .hello:
+                sendHello()
+            case .inputControlMode:
+                sendInputControlModeUpdate()
+            case .brightness:
+                sendBrightnessUpdate()
+            case .volume:
+                sendVolumeUpdate()
+            }
+        }
     }
 
     func sendClipboardText(_ text: String) {
@@ -2953,10 +2978,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             receiverAccessibilityTrustedHint = accessibilityTrusted
         }
         receiverPanelText = TBDisplaySenderL10n.receiverSummary(profile, language: language)
-        sendHello()
-        sendInputControlModeUpdate()
-        sendBrightnessUpdate()
-        sendVolumeUpdate()
+        sendAutomaticReceiverStateUpdates()
 
         Task { @MainActor in
             if self.isCableTestConnection {
