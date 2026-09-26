@@ -1107,6 +1107,56 @@ final class TBBC7DeltaPlanner {
     }
 }
 
+final class TBLatestFrameSlot<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pendingValue: Value?
+    private var drainScheduled = false
+    private var dropped = 0
+
+    func submit(_ value: Value) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if pendingValue != nil {
+            dropped += 1
+        }
+        pendingValue = value
+        guard !drainScheduled else { return false }
+        drainScheduled = true
+        return true
+    }
+
+    func take() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = pendingValue
+        pendingValue = nil
+        return value
+    }
+
+    func finishProcessing() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if pendingValue != nil {
+            return true
+        }
+        drainScheduled = false
+        return false
+    }
+
+    func cancel() {
+        lock.lock()
+        pendingValue = nil
+        drainScheduled = false
+        lock.unlock()
+    }
+
+    var droppedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return dropped
+    }
+}
+
 private final class TBVideoPipeline: @unchecked Sendable {
     let queue = DispatchQueue(label: "fd.tbmonitor.sender.pipeline", qos: .userInteractive)
 
@@ -1137,11 +1187,16 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var ackSent: Bool
     private var firstFrameNotified = false
     private var running = false
+    private let latestBC7Frame = TBLatestFrameSlot<CMSampleBuffer>()
 
     // Read from the main thread (fps timer / watchdog); guarded by `lock`.
     private let lock = NSLock()
     private var _sentFrames = 0
     private var _sentBytes = 0
+    private var _capturedFrames = 0
+    private var _bc7ProcessedFrames = 0
+    private var _bc7EncodeNanoseconds: UInt64 = 0
+    private var _bc7PlanNanoseconds: UInt64 = 0
     private var _lastCaptureFrameAt = Date()
 
     init(preset: TBDisplayCapturePreset,
@@ -1198,6 +1253,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     func stop() {
         queue.sync {
             running = false
+            latestBC7Frame.cancel()
             if let encoder = vtEncoder { VTCompressionSessionInvalidate(encoder) }
             vtEncoder = nil
             bc7Encoder = nil
@@ -1224,6 +1280,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
         return _sentBytes
     }
 
+    var capturedFramesSnapshot: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _capturedFrames
+    }
+
     func diagnosticsSnapshot() -> (
         pending: Int,
         inFlight: Int,
@@ -1232,24 +1293,46 @@ private final class TBVideoPipeline: @unchecked Sendable {
         bc7Keyframes: Int,
         bc7DeltaFrames: Int,
         bc7DirtyTiles: Int,
-        bc7FullEncodeFallbacks: Int
+        bc7FullEncodeFallbacks: Int,
+        bc7ProcessedFrames: Int,
+        bc7EncodeNanoseconds: UInt64,
+        bc7PlanNanoseconds: UInt64
     ) {
         queue.sync {
-            (
+            lock.lock()
+            let processedFrames = _bc7ProcessedFrames
+            let encodeNanoseconds = _bc7EncodeNanoseconds
+            let planNanoseconds = _bc7PlanNanoseconds
+            lock.unlock()
+            return (
                 pending: pendingVideoPackets,
                 inFlight: inFlightEncodeFrames,
-                dropped: droppedVideoFrames,
+                dropped: droppedVideoFrames + latestBC7Frame.droppedCount,
                 ptsSeq: displayStreamFrameSequence,
                 bc7Keyframes: bc7Keyframes,
                 bc7DeltaFrames: bc7DeltaFrames,
                 bc7DirtyTiles: bc7DirtyTiles,
-                bc7FullEncodeFallbacks: bc7FullEncodeFallbacks
+                bc7FullEncodeFallbacks: bc7FullEncodeFallbacks,
+                bc7ProcessedFrames: processedFrames,
+                bc7EncodeNanoseconds: encodeNanoseconds,
+                bc7PlanNanoseconds: planNanoseconds
             )
         }
     }
 
     private func markCaptureFrame() {
-        lock.lock(); _lastCaptureFrameAt = Date(); lock.unlock()
+        lock.lock()
+        _capturedFrames += 1
+        _lastCaptureFrameAt = Date()
+        lock.unlock()
+    }
+
+    private func recordBC7Timing(encodeNanoseconds: UInt64, planNanoseconds: UInt64) {
+        lock.lock()
+        _bc7ProcessedFrames += 1
+        _bc7EncodeNanoseconds &+= encodeNanoseconds
+        _bc7PlanNanoseconds &+= planNanoseconds
+        lock.unlock()
     }
 
     // MARK: - Encoder setup (on `queue`)
@@ -1316,6 +1399,38 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
     // MARK: - Encode paths (on `queue`)
 
+    func submitCapturedFrame(_ sampleBuffer: CMSampleBuffer) {
+        markCaptureFrame()
+        guard usesBC7Mode6 else {
+            queue.async { [weak self] in
+                self?.encode(sampleBuffer)
+            }
+            return
+        }
+        if latestBC7Frame.submit(sampleBuffer) {
+            queue.async { [weak self] in
+                self?.drainLatestBC7Frame()
+            }
+        }
+    }
+
+    private func drainLatestBC7Frame() {
+        guard let sampleBuffer = latestBC7Frame.take() else {
+            if latestBC7Frame.finishProcessing() {
+                queue.async { [weak self] in
+                    self?.drainLatestBC7Frame()
+                }
+            }
+            return
+        }
+        encode(sampleBuffer)
+        if latestBC7Frame.finishProcessing() {
+            queue.async { [weak self] in
+                self?.drainLatestBC7Frame()
+            }
+        }
+    }
+
     /// Opt-in raw passthrough: ScreenCaptureKit already captures NV12,
     /// so we can forward the planes uncompressed and skip the encoder entirely.
     /// This removes all decode cost on the receiver — useful when the receiver is
@@ -1324,7 +1439,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// direct Thunderbolt Bridge link comfortably sustains.
     /// SCStream capture path. Must be dispatched onto `queue` by the caller.
     func encode(_ sampleBuffer: CMSampleBuffer) {
-        markCaptureFrame()
         if usesBC7Mode6 {
             sendBC7Frame(sampleBuffer)
             return
@@ -1533,6 +1647,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         if usesBC7TileDelta && !requiresFullFrame && dirtyRects == nil {
             bc7FullEncodeFallbacks += 1
         }
+        let encodeStarted = DispatchTime.now().uptimeNanoseconds
         guard
               let encoded = bc7Encoder?.encode(
                   pixelBuffer: pixelBuffer,
@@ -1541,12 +1656,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
         else {
             return
         }
+        let encodeFinished = DispatchTime.now().uptimeNanoseconds
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
         notifyFirstFrameIfNeeded(width: width, height: height)
 
+        let planStarted = DispatchTime.now().uptimeNanoseconds
         let packet: Data
         if let planner = bc7DeltaPlanner,
            let plan = planner.plan(
@@ -1600,6 +1717,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
             payload.append(encoded.data)
             packet = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
         }
+        let planFinished = DispatchTime.now().uptimeNanoseconds
+        recordBC7Timing(
+            encodeNanoseconds: encodeFinished - encodeStarted,
+            planNanoseconds: planFinished - planStarted
+        )
         pendingVideoPackets += 1
         connection.send(content: packet, completion: .contentProcessed({ [weak self] error in
             guard let self else { return }
@@ -1957,6 +2079,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var captureDisplayText: String
     @Published var displayStateText: String
     @Published var displayModeDiagnosticsText = "Not active"
+    @Published var receiverMetricsText = "Not available"
     @Published private(set) var sessionLogEntries: [TBSessionLogEntry] = []
     @Published var language: TBDisplaySenderLanguage {
         didSet {
@@ -2045,6 +2168,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private var sentSnapshot = 0
     private var sentBytesSnapshot = 0
+    private var capturedSnapshot = 0
+    private var bc7ProcessedSnapshot = 0
+    private var bc7EncodeNanosecondsSnapshot: UInt64 = 0
+    private var bc7PlanNanosecondsSnapshot: UInt64 = 0
     private var sessionAckSent = false
     private var pipelineHasFirstFrame = false
     private var captureGeneration: UInt64 = 0
@@ -2624,7 +2751,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         liveMetrics.senderFPS = 0
         sentSnapshot = 0
         sentBytesSnapshot = 0
+        capturedSnapshot = 0
+        bc7ProcessedSnapshot = 0
+        bc7EncodeNanosecondsSnapshot = 0
+        bc7PlanNanosecondsSnapshot = 0
         transportDiagnosticsText = "pending=0 · in-flight=0 · dropped=0 · 0.00 Gbit/s"
+        receiverMetricsText = "Not available"
         sessionAckSent = false
         pipelineHasFirstFrame = false
         bc7RenderConfirmed = false
@@ -2839,6 +2971,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             switch type {
             case .displayProfile:
                 handleDisplayProfile(payload)
+            case .receiverMetrics:
+                handleReceiverMetrics(payload)
             case .bc7RenderAck:
                 guard !bc7RenderConfirmed, payload.count == 12 else { break }
                 let generation = TBMonitorProtocol.readBE32(payload, offset: 0)
@@ -3248,6 +3382,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         if let supportsHEVCDecode = profile.supportsHEVCDecode {
             receiverSupportsHEVCDecodeHint = supportsHEVCDecode
         }
+
         receiverSupportsRawNV12Hint = profile.supportsRawNV12
         receiverSupportsBC7Mode6Hint = profile.supportsBC7Mode6
         receiverSupportsBC7TileDeltaHint = profile.supportsBC7TileDelta
@@ -3344,6 +3479,29 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             self.setStatus(.captureStartedWaitingFirstFrame)
             self.startFirstFrameWatchdog()
         }
+    }
+
+    private func handleReceiverMetrics(_ payload: Data) {
+        guard let metrics = TBMonitorProtocol.decodeJSON(
+            TBMonitorReceiverMetrics.self,
+            from: payload
+        ) else {
+            TBLog.connection.error("Receiver metrics payload could not be decoded")
+            return
+        }
+        receiverMetricsText = String(
+            format: "fps=%.2f · %.3f Gbit/s · seq=%llu · frames=%llu · delta=%llu · invalid=%llu · render failures=%llu",
+            metrics.fps,
+            metrics.networkGbps,
+            metrics.appliedSequence,
+            metrics.bc7Frames,
+            metrics.bc7Deltas,
+            metrics.bc7Invalid,
+            metrics.renderFailures
+        )
+        let event = "Receiver metrics: \(receiverMetricsText)"
+        TBLog.connection.info("\(event, privacy: .public)")
+        recordSessionEvent(event)
     }
 
     private func startCapture(for profile: TBMonitorDisplayProfile) async -> Bool {
@@ -3480,7 +3638,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
             let delegate = CaptureDelegate()
             delegate.onFrame = { sampleBuffer in
-                pipeline.queue.async { pipeline.encode(sampleBuffer) }
+                pipeline.submitCapturedFrame(sampleBuffer)
             }
             delegate.onAudio = { [weak self] sampleBuffer in
                 self?.processAudio(sampleBuffer)
@@ -4099,7 +4257,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let diag = pipeline?.diagnosticsSnapshot() ?? (
             pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
             bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0,
-            bc7FullEncodeFallbacks: 0
+            bc7FullEncodeFallbacks: 0, bc7ProcessedFrames: 0,
+            bc7EncodeNanoseconds: 0, bc7PlanNanoseconds: 0
         )
         NSLog(
             "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d dropped=%d ptsSeq=%lld bc7Keyframes=%d bc7Deltas=%d bc7DirtyTiles=%d bc7FullEncodeFallbacks=%d",
@@ -4184,7 +4343,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         senderFPS = 0
         sentSnapshot = 0
         sentBytesSnapshot = 0
+        capturedSnapshot = 0
+        bc7ProcessedSnapshot = 0
+        bc7EncodeNanosecondsSnapshot = 0
+        bc7PlanNanosecondsSnapshot = 0
         transportDiagnosticsText = "pending=0 · in-flight=0 · dropped=0 · 0.00 Gbit/s"
+        receiverMetricsText = "Not available"
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
 
@@ -4222,6 +4386,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         fpsTimer?.invalidate()
         sentSnapshot = pipeline?.sentFramesSnapshot ?? 0
         sentBytesSnapshot = pipeline?.sentBytesSnapshot ?? 0
+        capturedSnapshot = pipeline?.capturedFramesSnapshot ?? 0
+        let initialDiagnostics = pipeline?.diagnosticsSnapshot()
+        bc7ProcessedSnapshot = initialDiagnostics?.bc7ProcessedFrames ?? 0
+        bc7EncodeNanosecondsSnapshot = initialDiagnostics?.bc7EncodeNanoseconds ?? 0
+        bc7PlanNanosecondsSnapshot = initialDiagnostics?.bc7PlanNanoseconds ?? 0
         fpsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
             MainActor.assumeIsolated {
@@ -4229,17 +4398,40 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 let fps = total - sentSnapshot
                 let totalBytes = pipeline?.sentBytesSnapshot ?? 0
                 let bytesPerSecond = max(0, totalBytes - sentBytesSnapshot)
+                let capturedTotal = pipeline?.capturedFramesSnapshot ?? 0
+                let capturedFPS = max(0, capturedTotal - capturedSnapshot)
                 let diagnostics = pipeline?.diagnosticsSnapshot() ?? (
                     pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
                     bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0,
-                    bc7FullEncodeFallbacks: 0
+                    bc7FullEncodeFallbacks: 0, bc7ProcessedFrames: 0,
+                    bc7EncodeNanoseconds: 0, bc7PlanNanoseconds: 0
                 )
+                let processedFrames = max(
+                    0,
+                    diagnostics.bc7ProcessedFrames - bc7ProcessedSnapshot
+                )
+                let encodeNanoseconds =
+                    diagnostics.bc7EncodeNanoseconds - bc7EncodeNanosecondsSnapshot
+                let planNanoseconds =
+                    diagnostics.bc7PlanNanoseconds - bc7PlanNanosecondsSnapshot
+                let encodeMilliseconds = processedFrames > 0
+                    ? Double(encodeNanoseconds) / Double(processedFrames) / 1_000_000.0
+                    : 0
+                let planMilliseconds = processedFrames > 0
+                    ? Double(planNanoseconds) / Double(processedFrames) / 1_000_000.0
+                    : 0
                 liveMetrics.senderFPS = fps
                 senderFPS = fps
                 sentSnapshot = total
                 sentBytesSnapshot = totalBytes
+                capturedSnapshot = capturedTotal
+                bc7ProcessedSnapshot = diagnostics.bc7ProcessedFrames
+                bc7EncodeNanosecondsSnapshot = diagnostics.bc7EncodeNanoseconds
+                bc7PlanNanosecondsSnapshot = diagnostics.bc7PlanNanoseconds
                 transportDiagnosticsText = String(
-                    format: "pending=%d · in-flight=%d · dropped=%d · key=%d · delta=%d · dirty=%d · fallback=%d · %.2f Gbit/s",
+                    format: "capture=%d · sent=%d · pending=%d · in-flight=%d · dropped=%d · key=%d · delta=%d · dirty=%d · fallback=%d · encode=%.2f ms · plan=%.2f ms · %.2f Gbit/s",
+                    capturedFPS,
+                    fps,
                     diagnostics.pending,
                     diagnostics.inFlight,
                     diagnostics.dropped,
@@ -4247,7 +4439,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     diagnostics.bc7DeltaFrames,
                     diagnostics.bc7DirtyTiles,
                     diagnostics.bc7FullEncodeFallbacks,
+                    encodeMilliseconds,
+                    planMilliseconds,
                     Double(bytesPerSecond) * 8.0 / 1_000_000_000.0
+                )
+                TBLog.connection.info(
+                    "metrics captureFPS=\(capturedFPS, privacy: .public) sentFPS=\(fps, privacy: .public) pending=\(diagnostics.pending, privacy: .public) inFlight=\(diagnostics.inFlight, privacy: .public) dropped=\(diagnostics.dropped, privacy: .public) key=\(diagnostics.bc7Keyframes, privacy: .public) delta=\(diagnostics.bc7DeltaFrames, privacy: .public) dirty=\(diagnostics.bc7DirtyTiles, privacy: .public) fallback=\(diagnostics.bc7FullEncodeFallbacks, privacy: .public) encodeMs=\(encodeMilliseconds, format: .fixed(precision: 2), privacy: .public) planMs=\(planMilliseconds, format: .fixed(precision: 2), privacy: .public) networkGbps=\(Double(bytesPerSecond) * 8.0 / 1_000_000_000.0, format: .fixed(precision: 3), privacy: .public)"
                 )
             }
         }

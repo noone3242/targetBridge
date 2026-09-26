@@ -295,6 +295,7 @@ private struct TBDisplaySenderSessionCard: View {
                     infoRow(configuredStreamLabel, session.streamResolutionText)
                     infoRow(actualStreamLabel, session.actualStreamText)
                     infoRow(transportDetailsLabel, session.transportDiagnosticsText)
+                    infoRow(receiverMetricsLabel, session.receiverMetricsText)
                     infoRow(generationLabel, session.generationDiagnosticsText)
                     infoRow(captureLabel, session.captureDisplayText)
                     infoRow(displayStateLabel, session.displayStateText)
@@ -488,6 +489,16 @@ private struct TBDisplaySenderSessionCard: View {
         case .german: return "Telemetrie"
         case .french: return "Télémétrie"
         case .chinese: return "遥测"
+        }
+    }
+
+    private var receiverMetricsLabel: String {
+        switch service.language {
+        case .italian: return "Metriche Receiver"
+        case .english: return "Receiver metrics"
+        case .german: return "Receiver-Metriken"
+        case .french: return "Métriques Receiver"
+        case .chinese: return "接收端指标"
         }
     }
 

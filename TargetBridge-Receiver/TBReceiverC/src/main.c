@@ -2064,6 +2064,37 @@ static void send_receiver_info(struct app *a) {
     free(pkt);
 }
 
+static void send_receiver_metrics(struct app *a, double fps, double gbps) {
+    if (!a || a->client_fd < 0) return;
+    char json[640];
+    int json_len = snprintf(
+        json,
+        sizeof(json),
+        "{\"fps\":%.3f,\"networkGbps\":%.6f,\"packets\":%llu,"
+        "\"bc7Frames\":%llu,\"bc7PayloadBytes\":%llu,\"bc7Invalid\":%llu,"
+        "\"renderFailures\":%llu,\"bc7Deltas\":%llu,\"appliedSequence\":%llu,"
+        "\"keyframeRequests\":%llu}",
+        fps,
+        gbps,
+        (unsigned long long)a->packets_received,
+        (unsigned long long)a->bc7_frames,
+        (unsigned long long)a->bc7_bytes,
+        (unsigned long long)a->bc7_invalid_frames,
+        (unsigned long long)a->bc7_render_failures,
+        (unsigned long long)a->bc7_delta_frames,
+        (unsigned long long)a->bc7_applied_sequence,
+        (unsigned long long)a->bc7_keyframe_requests
+    );
+    if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
+
+    const size_t packet_len = 5u + (size_t)json_len;
+    uint8_t packet[5 + 640];
+    write_be32(packet, (uint32_t)(1 + json_len));
+    packet[4] = TB_PKT_RECEIVER_METRICS;
+    memcpy(packet + 5, json, (size_t)json_len);
+    (void)send_all(a->client_fd, packet, packet_len);
+}
+
 static void close_client(struct app *a) {
     if (a->debug_enabled && a->client_fd >= 0) {
         fprintf(stderr,
@@ -2485,9 +2516,14 @@ int main(int argc, char **argv) {
             a.last_fps_count   = a.frames;
             a.last_debug_bytes = a.received_bytes;
             a.last_fps_tick_ms = t;
+            double fps = elapsed_ms > 0
+                ? ((double)df * 1000.0 / (double)elapsed_ms)
+                : 0.0;
+            double gbps = elapsed_ms > 0
+                ? ((double)db * 8.0 / ((double)elapsed_ms * 1000000.0))
+                : 0.0;
+            send_receiver_metrics(&a, fps, gbps);
             if (a.debug_enabled) {
-                double fps = elapsed_ms > 0 ? ((double)df * 1000.0 / (double)elapsed_ms) : 0.0;
-                double gbps = elapsed_ms > 0 ? ((double)db * 8.0 / ((double)elapsed_ms * 1000000.0)) : 0.0;
                 fprintf(stderr,
                         "[diag] event=metrics connected=%s sessionActive=%s "
                         "transport=%s fps=%.2f networkGbps=%.3f packets=%llu "

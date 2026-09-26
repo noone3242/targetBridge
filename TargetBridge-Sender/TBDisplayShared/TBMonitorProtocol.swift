@@ -5,6 +5,7 @@ enum TBMonitorPacketType: UInt8 {
     case displayProfile = 0x11
     case createSessionAck = 0x12
     case uiLanguage = 0x13
+    case receiverMetrics = 0x14
     case paramSets = 0x20
     case frame = 0x21
     case rawFrame = 0x22   // Uncompressed NV12 planes (raw passthrough mode)
@@ -60,6 +61,19 @@ struct TBMonitorCreateSessionAck: Codable {
     var accepted: Bool
     var displayName: String
     var displayID: UInt32
+}
+
+struct TBMonitorReceiverMetrics: Codable {
+    var fps: Double
+    var networkGbps: Double
+    var packets: UInt64
+    var bc7Frames: UInt64
+    var bc7PayloadBytes: UInt64
+    var bc7Invalid: UInt64
+    var renderFailures: UInt64
+    var bc7Deltas: UInt64
+    var appliedSequence: UInt64
+    var keyframeRequests: UInt64
 }
 
 struct TBMonitorUILanguageUpdate: Codable {

@@ -119,6 +119,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(TBMonitorPacketType.bc7RenderAckRequest.rawValue, 0x26)
         XCTAssertEqual(TBMonitorPacketType.bc7TileDelta.rawValue, 0x27)
         XCTAssertEqual(TBMonitorPacketType.bc7KeyframeRequest.rawValue, 0x28)
+        XCTAssertEqual(TBMonitorPacketType.receiverMetrics.rawValue, 0x14)
 
         let olderProfile = Data("""
         {
@@ -161,6 +162,26 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(current.receiverVersion, "3.3.0")
         XCTAssertEqual(current.receiverBuild, "dev-20260926163000")
         XCTAssertEqual(current.receiverCommit, "9b6b092abcde")
+
+        let metrics = try JSONDecoder().decode(
+            TBMonitorReceiverMetrics.self,
+            from: Data("""
+            {
+              "fps": 59.94,
+              "networkGbps": 0.42,
+              "packets": 1200,
+              "bc7Frames": 1180,
+              "bc7PayloadBytes": 9000000,
+              "bc7Invalid": 0,
+              "renderFailures": 0,
+              "bc7Deltas": 1170,
+              "appliedSequence": 1180,
+              "keyframeRequests": 0
+            }
+            """.utf8)
+        )
+        XCTAssertEqual(metrics.fps, 59.94, accuracy: 0.001)
+        XCTAssertEqual(metrics.appliedSequence, 1180)
     }
 
     func testBC7DeltaPlannerKeyframeDeltaAndRecovery() throws {
@@ -633,6 +654,21 @@ final class TBMonitorProtocolTests: XCTestCase {
                 dirtySeconds * 1_000 / Double(dirtyIterations)
             )
         )
+    }
+
+    func testLatestFrameSlotCoalescesQueuedFrames() {
+        let slot = TBLatestFrameSlot<Int>()
+
+        XCTAssertTrue(slot.submit(1))
+        XCTAssertFalse(slot.submit(2))
+        XCTAssertFalse(slot.submit(3))
+        XCTAssertEqual(slot.droppedCount, 2)
+        XCTAssertEqual(slot.take(), 3)
+        XCTAssertFalse(slot.finishProcessing())
+
+        XCTAssertTrue(slot.submit(4))
+        XCTAssertEqual(slot.take(), 4)
+        XCTAssertFalse(slot.finishProcessing())
     }
 
     private func makeBGRAPixelBuffer(

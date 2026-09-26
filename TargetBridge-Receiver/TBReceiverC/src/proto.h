@@ -7,6 +7,7 @@
  * type 0x11 = display profile (JSON)
  * type 0x12 = create session ack (JSON)
  * type 0x13 = ui language update (JSON)
+ * type 0x14 = receiver metrics (JSON)
  * type 0x20 = parameter sets (H.264: SPS/PPS; HEVC: VPS/SPS/PPS)
  *   payload = [1 byte codec marker: 1=H.264, 2=HEVC][1 byte count]
  *             then for each set: [4 bytes BE uint32 size][size bytes]
@@ -52,6 +53,7 @@
 #define TB_PKT_DISPLAY_PROFILE  0x11
 #define TB_PKT_CREATE_SESSION_ACK 0x12
 #define TB_PKT_UI_LANGUAGE      0x13
+#define TB_PKT_RECEIVER_METRICS 0x14
 #define TB_PKT_PARAM_SETS       0x20
 #define TB_PKT_FRAME            0x21
 #define TB_PKT_RAW_FRAME        0x22  /* uncompressed NV12 planes (raw passthrough) */
