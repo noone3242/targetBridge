@@ -28,9 +28,10 @@ chmod +x "$APP_DIR/Contents/MacOS/$BIN_NAME"
 cp "$REPO_ROOT/TargetBridge-Shared/Languages/"*.json "$APP_DIR/Contents/Resources/Languages/"
 
 # Bundle dylib dependencies (ffmpeg and SDL) inside the .app.
-# Homebrew's SDL2 is currently sdl2-compat, which loads SDL3 at runtime via
-# dlopen. dylibbundler cannot discover that dynamic dependency, so copy it
-# explicitly to keep the released receiver self-contained.
+# Some Homebrew setups provide SDL2 through sdl2-compat, which loads SDL3 at
+# runtime via dlopen. dylibbundler cannot discover that dynamic dependency, so
+# copy SDL3 when the installed SDL2 binary actually references it. A native
+# SDL2 installation (such as SDL 2.32.x) does not need SDL3.
 mkdir -p "$APP_DIR/Contents/Frameworks"
 if ! command -v dylibbundler &>/dev/null; then
   echo "Installing dylibbundler..."
@@ -42,12 +43,26 @@ dylibbundler -od -b \
   -p @executable_path/../Frameworks/ \
   >/dev/null 2>&1
 
-SDL3_DYLIB="$(brew --prefix sdl3)/lib/libSDL3.dylib"
-if [[ ! -f "$SDL3_DYLIB" ]]; then
-  echo "SDL3 runtime library not found: $SDL3_DYLIB" >&2
-  exit 1
+SDL2_DYLIB="$(brew --prefix sdl2)/lib/libSDL2.dylib"
+SDL2_NEEDS_SDL3=0
+if [[ -f "$SDL2_DYLIB" ]]; then
+  if otool -L "$SDL2_DYLIB" 2>/dev/null | grep -q 'libSDL3' || \
+     strings "$SDL2_DYLIB" 2>/dev/null | grep -q 'libSDL3'; then
+    SDL2_NEEDS_SDL3=1
+  fi
 fi
-cp -L "$SDL3_DYLIB" "$APP_DIR/Contents/Frameworks/libSDL3.dylib"
+
+if (( SDL2_NEEDS_SDL3 == 1 )); then
+  SDL3_DYLIB="$(brew --prefix sdl3 2>/dev/null)/lib/libSDL3.dylib"
+  if [[ ! -f "$SDL3_DYLIB" ]]; then
+    echo "Installed SDL2 compatibility layer requires SDL3, but SDL3 was not found." >&2
+    echo "Install it with: brew install sdl3" >&2
+    exit 1
+  fi
+  cp -L "$SDL3_DYLIB" "$APP_DIR/Contents/Frameworks/libSDL3.dylib"
+else
+  echo "Native SDL2 detected; SDL3 runtime is not required."
+fi
 
 if [[ -f "$ICON_FILE" ]]; then
   mkdir -p "${ICONSET_DIR}/TargetBridgeReceiver.iconset"

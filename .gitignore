@@ -15,6 +15,7 @@ xcuserdata/
 
 # C build outputs
 *.o
+*.d
 tbreceiver
 
 # C test outputs
