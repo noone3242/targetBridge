@@ -288,14 +288,14 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Virtual display mode that makes the render resolution equal the stream
-    /// resolution. macOS HiDPI is strictly 2x, so a (w/2, h/2) mode backs onto a
-    /// (w, h) framebuffer, which ScreenCaptureKit then captures 1:1.
+    /// Virtual display framebuffer that matches the stream resolution.
+    /// CGVirtualDisplayMode takes pixel dimensions; HiDPI exposes a logical desktop
+    /// at half this size while ScreenCaptureKit receives the full framebuffer.
     ///
     /// Costs screen real estate: the desktop reports "looks like w/2 x h/2" rather
     /// than the receiver's default 2560 x 1440.
     var renderMatchedDisplayMode: TBVirtualDisplayModeSize {
-        TBVirtualDisplayModeSize(width: width / 2, height: height / 2)
+        TBVirtualDisplayModeSize(width: width, height: height)
     }
 
     /// Logical desktop size the user ends up with under render matching.
@@ -3005,9 +3005,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 : nil
             if let modeOverride {
                 NSLog(
-                    "TargetBridge: render matching on, virtual display mode %dx%d (backing %dx%d) for %dx%d stream",
+                    "TargetBridge: render matching on, virtual display framebuffer %dx%d (logical %dx%d) for %dx%d stream",
                     modeOverride.width, modeOverride.height,
-                    modeOverride.backingWidth, modeOverride.backingHeight,
+                    modeOverride.logicalWidth, modeOverride.logicalHeight,
                     self.capturePreset.width, self.capturePreset.height
                 )
             }

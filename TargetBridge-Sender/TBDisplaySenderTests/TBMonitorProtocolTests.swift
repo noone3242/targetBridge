@@ -15,6 +15,17 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertFalse(TBReceiverStateUpdate.automaticOnConnect.contains(.volume))
     }
 
+    func testNative5KRenderMatchingUsesAReal5KFramebuffer() {
+        let mode = TBDisplayCapturePreset.native5k60Experimental.renderMatchedDisplayMode
+
+        XCTAssertEqual(mode.width, 5120)
+        XCTAssertEqual(mode.height, 2880)
+        XCTAssertEqual(mode.backingWidth, 5120)
+        XCTAssertEqual(mode.backingHeight, 2880)
+        XCTAssertEqual(mode.logicalWidth, 2560)
+        XCTAssertEqual(mode.logicalHeight, 1440)
+    }
+
     // MARK: - BE32 primitives
 
     func testBE32RoundTrip() {
