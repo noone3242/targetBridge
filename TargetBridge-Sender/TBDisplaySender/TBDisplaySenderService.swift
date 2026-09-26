@@ -3236,8 +3236,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         else { return }
 
         activeProfile = profile
+        let receiverIdentity = [
+            profile.receiverVersion.map { "v\($0)" },
+            profile.receiverBuild.map { "build \($0)" },
+            profile.receiverCommit.map { "commit \($0)" }
+        ].compactMap { $0 }.joined(separator: ", ")
         recordSessionEvent(
-            "Receiver profile: \(profile.panelWidth)×\(profile.panelHeight), mode \(profile.modeWidth)×\(profile.modeHeight), \(Int(profile.refreshRate.rounded())) Hz"
+            "Receiver profile: \(profile.panelWidth)×\(profile.panelHeight), mode \(profile.modeWidth)×\(profile.modeHeight), \(Int(profile.refreshRate.rounded())) Hz" +
+            (receiverIdentity.isEmpty ? ", build unknown" : ", \(receiverIdentity)")
         )
         if let supportsHEVCDecode = profile.supportsHEVCDecode {
             receiverSupportsHEVCDecodeHint = supportsHEVCDecode

@@ -18,13 +18,14 @@ CC       ?= clang
 PKG      ?= pkgconf
 APP_VERSION ?= 3.2.0
 APP_BUILD   ?= dev
+APP_COMMIT  ?= unknown
 
 MACOSX_DEPLOYMENT_TARGET ?= 11.0
 export MACOSX_DEPLOYMENT_TARGET
 
 CFLAGS   += -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -MMD -MP
 CFLAGS   += $(shell $(PKG) --cflags libavcodec libavutil sdl2)
-CFLAGS   += -DTB_RECEIVER_VERSION=\"$(APP_VERSION)\" -DTB_RECEIVER_BUILD=\"$(APP_BUILD)\"
+CFLAGS   += -DTB_RECEIVER_VERSION=\"$(APP_VERSION)\" -DTB_RECEIVER_BUILD=\"$(APP_BUILD)\" -DTB_RECEIVER_COMMIT=\"$(APP_COMMIT)\"
 CFLAGS   += -DTB_LANGUAGE_SOURCE_DIR=\"$(abspath ../../TargetBridge-Shared/Languages)\"
 
 LDFLAGS  += $(shell $(PKG) --libs libavcodec libavutil sdl2)

@@ -137,6 +137,30 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertNil(profile.supportsRawNV12)
         XCTAssertNil(profile.supportsBC7Mode6)
         XCTAssertNil(profile.supportsBC7TileDelta)
+        XCTAssertNil(profile.receiverVersion)
+        XCTAssertNil(profile.receiverBuild)
+        XCTAssertNil(profile.receiverCommit)
+
+        let currentProfile = Data("""
+        {
+          "receiverName": "Intel iMac",
+          "panelWidth": 5120,
+          "panelHeight": 2880,
+          "modeWidth": 2560,
+          "modeHeight": 1440,
+          "refreshRate": 60,
+          "hiDPI": true,
+          "captureWidth": 5120,
+          "captureHeight": 2880,
+          "receiverVersion": "3.3.0",
+          "receiverBuild": "dev-20260926163000",
+          "receiverCommit": "9b6b092abcde"
+        }
+        """.utf8)
+        let current = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: currentProfile)
+        XCTAssertEqual(current.receiverVersion, "3.3.0")
+        XCTAssertEqual(current.receiverBuild, "dev-20260926163000")
+        XCTAssertEqual(current.receiverCommit, "9b6b092abcde")
     }
 
     func testBC7DeltaPlannerKeyframeDeltaAndRecovery() throws {

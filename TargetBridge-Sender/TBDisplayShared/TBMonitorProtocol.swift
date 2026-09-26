@@ -51,6 +51,9 @@ struct TBMonitorDisplayProfile: Codable {
     var supportsBC7TileDelta: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
+    var receiverVersion: String? = nil
+    var receiverBuild: String? = nil
+    var receiverCommit: String? = nil
 }
 
 struct TBMonitorCreateSessionAck: Codable {

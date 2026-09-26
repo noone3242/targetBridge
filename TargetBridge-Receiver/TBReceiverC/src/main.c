@@ -2017,13 +2017,14 @@ static void send_receiver_info(struct app *a) {
     }
     escaped_name[out] = '\0';
 
-    char json[768];
+    char json[1024];
     int json_len = snprintf(
         json,
         sizeof(json),
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
+        "\"receiverVersion\":\"%s\",\"receiverBuild\":\"%s\",\"receiverCommit\":\"%s\","
         "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsBC7Mode6\":%s,"
         "\"supportsBC7TileDelta\":%s,"
         "\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
@@ -2034,6 +2035,9 @@ static void send_receiver_info(struct app *a) {
         mode_h,
         capture_w,
         capture_h,
+        TB_RECEIVER_VERSION,
+        TB_RECEIVER_BUILD,
+        TB_RECEIVER_COMMIT,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
@@ -2052,8 +2056,10 @@ static void send_receiver_info(struct app *a) {
 
     if (send_all(a->client_fd, pkt, packet_len) == 0) {
         fprintf(stderr,
-                "[main] sent display profile: panel=%ux%u mode=%ux%u hidpi name=%s\n",
-                panel_w, panel_h, mode_w, mode_h, info.name);
+                "[main] sent display profile: panel=%ux%u mode=%ux%u hidpi "
+                "name=%s version=%s build=%s commit=%s\n",
+                panel_w, panel_h, mode_w, mode_h, info.name,
+                TB_RECEIVER_VERSION, TB_RECEIVER_BUILD, TB_RECEIVER_COMMIT);
     }
     free(pkt);
 }
@@ -2168,11 +2174,12 @@ int main(int argc, char **argv) {
         char metal_device[256] = {0};
         (void)tb_bc7_renderer_copy_device_name(metal_device, sizeof(metal_device));
         printf(
-            "{\"version\":\"%s\",\"build\":\"%s\",\"architecture\":\"%s\","
+            "{\"version\":\"%s\",\"build\":\"%s\",\"commit\":\"%s\",\"architecture\":\"%s\","
             "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
             "\"supportsBC7TileDelta\":%s,\"supportsRawNV12\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
+            TB_RECEIVER_COMMIT,
             architecture,
             metal_device,
             tb_bc7_renderer_supported() ? "true" : "false",
@@ -2277,14 +2284,15 @@ int main(int argc, char **argv) {
 
     a.last_fps_tick_ms = now_ms();
     a.last_ip_check_ms = 0;
-    if (a.debug_enabled && a.client_fd >= 0) {
+    if (a.debug_enabled) {
         char metal_device[256] = {0};
         (void)tb_bc7_renderer_copy_device_name(metal_device, sizeof(metal_device));
         fprintf(stderr,
-                "[diag] event=startup version=%s build=%s metalDevice=\"%s\" "
+                "[diag] event=startup version=%s build=%s commit=%s metalDevice=\"%s\" "
                 "supportsBC7=%s supportsRawNV12=true port=%d\n",
                 TB_RECEIVER_VERSION,
                 TB_RECEIVER_BUILD,
+                TB_RECEIVER_COMMIT,
                 metal_device,
                 tb_disp_supports_bc7(a.disp) ? "true" : "false",
                 TB_PORT);

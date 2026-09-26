@@ -463,13 +463,20 @@ enum TBDisplaySenderL10n {
     }
 
     static func receiverSummary(_ profile: TBMonitorDisplayProfile, language: TBDisplaySenderLanguage) -> String {
-        text("sender.receiver_summary", language, [
+        let display = text("sender.receiver_summary", language, [
             "name": profile.receiverName,
             "panelWidth": "\(profile.panelWidth)",
             "panelHeight": "\(profile.panelHeight)",
             "modeWidth": "\(profile.modeWidth)",
             "modeHeight": "\(profile.modeHeight)"
         ])
+        let identity = [
+            profile.receiverVersion.map { "v\($0)" },
+            profile.receiverBuild.map { "build \($0)" },
+            profile.receiverCommit.map { "commit \($0)" }
+        ].compactMap { $0 }
+        return identity.isEmpty ? "\(display) · build unknown" :
+            "\(display) · \(identity.joined(separator: " · "))"
     }
 
     static func virtualDisplaySummary(name: String, id: UInt32, language: TBDisplaySenderLanguage) -> String {

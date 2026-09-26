@@ -10,6 +10,7 @@ BIN_NAME="TargetBridgeReceiver"
 APP_NAME="TargetBridge Receiver"
 APP_VERSION="3.3.0"
 STAMP="$(date +%Y%m%d%H%M%S)"
+COMMIT="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || print unknown)"
 ARCH="$(uname -m)"
 ICONSET_DIR="$(mktemp -d)"
 ICON_FILE="${ROOT}/TargetBridgeAssets/Assets.xcassets/AppIcon.appiconset/icon_1024.png"
@@ -17,7 +18,7 @@ ICNS_PATH="${APP_DIR}/Contents/Resources/TargetBridgeReceiver.icns"
 
 cd "$ROOT/TBReceiverC"
 make clean
-make APP_VERSION="${APP_VERSION}" APP_BUILD="$STAMP"
+make APP_VERSION="${APP_VERSION}" APP_BUILD="$STAMP" APP_COMMIT="$COMMIT"
 
 mkdir -p "$BUILD_DIR"
 rm -rf "$APP_DIR"
