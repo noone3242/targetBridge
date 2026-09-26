@@ -30,6 +30,10 @@
 #define TB_RECEIVER_BUILD "dev"
 #endif
 
+#ifndef TB_RECEIVER_COMMIT
+#define TB_RECEIVER_COMMIT "unknown"
+#endif
+
 struct tb_display {
     SDL_Window   *win;
     SDL_Renderer *ren;
@@ -429,6 +433,9 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
         tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_font, 13.0 * scale,
                           center_x - 26.0 * scale, icon_y + icon_size + 310.0 * scale,
                           0.40, 0.45, 0.53);
+        tb_disp_draw_text(ctx, "commit " TB_RECEIVER_COMMIT, mono_font, 11.0 * scale,
+                          center_x - 48.0 * scale, icon_y + icon_size + 334.0 * scale,
+                          0.40, 0.45, 0.53);
     } else {
 
     tb_disp_fill_rect(ctx, 0, 0, (CGFloat)drawable_w, (CGFloat)drawable_h, 0.06, 0.07, 0.09, 1.0);
@@ -445,6 +452,7 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.subtitle"), body_font, 17, 72, (CGFloat)drawable_h - 118, 0.72, 0.76, 0.84);
     tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_bold_font, 17, (CGFloat)drawable_w - 220, (CGFloat)drawable_h - 82, 0.64, 0.69, 0.78);
     tb_disp_draw_text(ctx, TB_RECEIVER_BUILD, mono_font, 13, (CGFloat)drawable_w - 220, (CGFloat)drawable_h - 114, 0.53, 0.57, 0.66);
+    tb_disp_draw_text(ctx, "commit " TB_RECEIVER_COMMIT, mono_font, 13, (CGFloat)drawable_w - 220, (CGFloat)drawable_h - 138, 0.53, 0.57, 0.66);
 
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 15, outer_x, top_y, 0.54, 0.62, 0.76);
     tb_disp_draw_text(ctx, ip, mono_bold_font, 34, outer_x, top_y - 42.0, 0.43, 0.93, 0.60);
