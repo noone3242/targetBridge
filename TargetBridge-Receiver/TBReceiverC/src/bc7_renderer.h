@@ -25,6 +25,24 @@ int tb_bc7_renderer_render(struct tb_bc7_renderer *renderer,
                            uint32_t height,
                            uint32_t bytes_per_row,
                            int wait_for_completion);
+int tb_bc7_renderer_upload(struct tb_bc7_renderer *renderer,
+                           const uint8_t *blocks,
+                           size_t length,
+                           uint32_t width,
+                           uint32_t height,
+                           uint32_t bytes_per_row);
+int tb_bc7_renderer_upload_region(struct tb_bc7_renderer *renderer,
+                                  const uint8_t *blocks,
+                                  size_t length,
+                                  uint32_t texture_width,
+                                  uint32_t texture_height,
+                                  uint32_t x,
+                                  uint32_t y,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  uint32_t bytes_per_row);
+int tb_bc7_renderer_present(struct tb_bc7_renderer *renderer,
+                            int wait_for_completion);
 
 void tb_bc7_renderer_set_cursor(struct tb_bc7_renderer *renderer,
                                 int x,

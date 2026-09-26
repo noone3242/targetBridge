@@ -11,6 +11,8 @@ Modes (--mode):
                 and stream it as PARAM_SETS + AVCC FRAMEs at ~30 fps.
     bc7         send a valid 4 x 4 BC7 Mode 6 frame and verify the
                 generation-scoped Metal render acknowledgment.
+    bc7-delta   send a sequenced 128 x 64 keyframe, apply one changed tile,
+                then verify a stale-base delta triggers a keyframe request.
     hang        connect, HELLO, then go silent (no heartbeats) while keeping
                 the socket open — exercises the receiver's idle watchdog,
                 which should reap the session after ~10s.
@@ -39,6 +41,8 @@ PKT_FRAME = 0x21
 PKT_BC7_FRAME = 0x24
 PKT_BC7_RENDER_ACK = 0x25
 PKT_BC7_ACK_REQUEST = 0x26
+PKT_BC7_TILE_DELTA = 0x27
+PKT_BC7_KEYFRAME_REQUEST = 0x28
 PKT_HEARTBEAT = 0x30
 PKT_TEARDOWN = 0x31
 
@@ -205,6 +209,63 @@ def stream_bc7_test(sock: socket.socket) -> None:
         return
     raise TimeoutError("receiver did not return a BC7 render ACK")
 
+def tile_checksum(data: bytes, tile_index: int) -> int:
+    value = 14695981039346656037 ^ tile_index
+    for byte in data:
+        value ^= byte
+        value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def stream_bc7_delta_test(sock: socket.socket) -> None:
+    generation = 2
+    sock.sendall(packet(PKT_BC7_ACK_REQUEST, struct.pack(">I", generation)))
+
+    black_block = bytes([0x40]) + bytes(15)
+    changed_block = bytes([0x40]) + bytes(14) + bytes([1])
+    left_tile = black_block * 256
+    right_tile = black_block * 256
+    keyframe_rows = [
+        left_tile[row * 256:(row + 1) * 256] +
+        right_tile[row * 256:(row + 1) * 256]
+        for row in range(16)
+    ]
+    keyframe_blocks = b"".join(keyframe_rows)
+    checksum1 = tile_checksum(left_tile, 0) ^ tile_checksum(right_tile, 1)
+    keyframe = bytes([2]) + struct.pack(">QQIII", 1, checksum1, 128, 64, 512)
+    sock.sendall(packet(PKT_BC7_FRAME, keyframe + keyframe_blocks))
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        ptype, response = recv_packet(sock, max(0.1, deadline - time.monotonic()))
+        if ptype == PKT_BC7_RENDER_ACK:
+            ack_generation, width, height = struct.unpack(">III", response)
+            if (ack_generation, width, height) != (generation, 128, 64):
+                raise ValueError("bad sequenced BC7 render ACK")
+            break
+    else:
+        raise TimeoutError("receiver did not ACK sequenced BC7 keyframe")
+
+    changed_tile = changed_block * 256
+    checksum2 = tile_checksum(left_tile, 0) ^ tile_checksum(changed_tile, 1)
+    delta_header = bytes([1]) + struct.pack(">QQQIIHH", 2, 1, checksum2, 128, 64, 64, 1)
+    run_header = struct.pack(">HHHHI", 1, 0, 1, 64, len(changed_tile))
+    sock.sendall(packet(PKT_BC7_TILE_DELTA, delta_header + run_header + changed_tile))
+    time.sleep(0.2)
+
+    stale_delta = bytes([1]) + struct.pack(">QQQIIHH", 4, 1, checksum2, 128, 64, 64, 0)
+    sock.sendall(packet(PKT_BC7_TILE_DELTA, stale_delta))
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        ptype, response = recv_packet(sock, max(0.1, deadline - time.monotonic()))
+        if ptype == PKT_BC7_KEYFRAME_REQUEST:
+            (request_generation,) = struct.unpack(">I", response)
+            if request_generation != generation:
+                raise ValueError("keyframe request generation mismatch")
+            print("[mock] BC7 delta apply and stale-base recovery verified")
+            return
+    raise TimeoutError("receiver did not request a BC7 recovery keyframe")
+
 
 # ---- modes ------------------------------------------------------------------
 
@@ -215,7 +276,10 @@ def run(args) -> int:
     time.sleep(0.2)
     drain_receiver(sock)
 
-    sock.sendall(hello_packet(args.name, "bc7-mode6" if args.mode == "bc7" else "h264"))
+    sock.sendall(hello_packet(
+        args.name,
+        "bc7-mode6" if args.mode in ("bc7", "bc7-delta") else "h264"
+    ))
     print("[mock] sent HELLO")
 
     try:
@@ -237,6 +301,10 @@ def run(args) -> int:
         elif args.mode == "bc7":
             stream_bc7_test(sock)
             sock.sendall(json_packet(PKT_TEARDOWN, {"reason": "mock bc7 done"}))
+
+        elif args.mode == "bc7-delta":
+            stream_bc7_delta_test(sock)
+            sock.sendall(json_packet(PKT_TEARDOWN, {"reason": "mock bc7 delta done"}))
 
         elif args.mode == "hang":
             print(f"[mock] going silent for {args.duration}s (socket stays open, no heartbeats)")
@@ -279,7 +347,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=54321)
     ap.add_argument(
         "--mode",
-        choices=["handshake", "stream", "bc7", "hang", "badlen", "drop"],
+        choices=["handshake", "stream", "bc7", "bc7-delta", "hang", "badlen", "drop"],
         default="handshake",
     )
     ap.add_argument("--duration", type=int, default=5, help="seconds (mode-specific)")

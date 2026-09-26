@@ -34,7 +34,7 @@ ifeq ($(UNAME_S),Darwin)
 LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework CoreServices -framework CoreAudio -framework Metal -framework QuartzCore
 endif
 
-C_SRC = src/main.c src/net.c src/bc7_frame.c src/bc7_cursor.c src/decoder.c src/display.c src/tb_i18n.c
+C_SRC = src/main.c src/net.c src/bc7_frame.c src/bc7_delta.c src/bc7_cursor.c src/decoder.c src/display.c src/tb_i18n.c
 OBJC_SRC = src/tb_gesture_bridge.m
 OBJCXX_SRC = src/bc7_renderer.mm
 OBJ = $(C_SRC:.c=.o) $(OBJC_SRC:.m=.o) $(OBJCXX_SRC:.mm=.o)
@@ -63,8 +63,8 @@ clean:
 TEST_CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
 TEST_BIN = test_net_parser
 
-$(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h src/bc7_frame.c src/bc7_frame.h src/bc7_cursor.c src/bc7_cursor.h
-	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c src/bc7_frame.c src/bc7_cursor.c -o $@
+$(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h src/bc7_frame.c src/bc7_frame.h src/bc7_delta.c src/bc7_delta.h src/bc7_cursor.c src/bc7_cursor.h
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c src/bc7_frame.c src/bc7_delta.c src/bc7_cursor.c -o $@
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)

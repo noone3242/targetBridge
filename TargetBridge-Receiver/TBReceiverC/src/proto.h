@@ -59,6 +59,8 @@
 #define TB_PKT_BC7_FRAME        0x24  /* full-frame BC7 Mode 6 blocks */
 #define TB_PKT_BC7_RENDER_ACK   0x25  /* first frame successfully uploaded/rendered */
 #define TB_PKT_BC7_ACK_REQUEST  0x26
+#define TB_PKT_BC7_TILE_DELTA   0x27
+#define TB_PKT_BC7_KEYFRAME_REQUEST 0x28
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31
 #define TB_PKT_CURSOR           0x32

@@ -15,6 +15,7 @@
 
 #include "net.h"
 #include "bc7_frame.h"
+#include "bc7_delta.h"
 #include "bc7_renderer.h"
 #include "decoder.h"
 #include "display.h"
@@ -74,6 +75,19 @@ struct app {
     uint64_t bc7_render_failures;
     uint64_t bc7_ack_requests;
     uint64_t bc7_acks_sent;
+    uint64_t bc7_delta_frames;
+    uint64_t bc7_keyframe_requests;
+    uint64_t bc7_applied_sequence;
+    uint64_t bc7_checksum;
+    uint64_t bc7_last_keyframe_request_ms;
+    int bc7_keyframe_request_pending;
+    uint8_t *bc7_shadow;
+    uint64_t *bc7_tile_checksums;
+    size_t bc7_shadow_len;
+    size_t bc7_tile_count;
+    uint32_t bc7_width;
+    uint32_t bc7_height;
+    uint32_t bc7_bytes_per_row;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      debug_enabled;
@@ -613,6 +627,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "supportsHEVCDecode", 1, tb_dec_supports_hevc_hwdecode() ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsRawNV12", 1, "1");
     TXTRecordSetValue(&txt, "supportsBC7Mode6", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
+    TXTRecordSetValue(&txt, "supportsBC7TileDelta", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
 
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) == 0) {
@@ -952,6 +967,111 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     a->frames++;
 }
 
+static void reset_bc7_delta_state(struct app *a) {
+    free(a->bc7_shadow);
+    free(a->bc7_tile_checksums);
+    a->bc7_shadow = NULL;
+    a->bc7_tile_checksums = NULL;
+    a->bc7_shadow_len = 0;
+    a->bc7_tile_count = 0;
+    a->bc7_width = 0;
+    a->bc7_height = 0;
+    a->bc7_bytes_per_row = 0;
+    a->bc7_applied_sequence = 0;
+    a->bc7_checksum = 0;
+}
+
+static uint64_t checksum_bc7_tiles(const uint8_t *blocks,
+                                   uint32_t width,
+                                   uint32_t height,
+                                   uint32_t bytes_per_row,
+                                   uint64_t *tile_checksums) {
+    const uint32_t tiles_wide = width / TB_BC7_DELTA_TILE_SIZE;
+    const uint32_t tiles_high =
+        (height + TB_BC7_DELTA_TILE_SIZE - 1u) / TB_BC7_DELTA_TILE_SIZE;
+    uint64_t checksum = 0;
+    for (uint32_t tile_y = 0; tile_y < tiles_high; tile_y++) {
+        const uint32_t pixel_height =
+            height - tile_y * TB_BC7_DELTA_TILE_SIZE < TB_BC7_DELTA_TILE_SIZE
+                ? height - tile_y * TB_BC7_DELTA_TILE_SIZE
+                : TB_BC7_DELTA_TILE_SIZE;
+        const uint32_t block_rows = pixel_height / 4u;
+        for (uint32_t tile_x = 0; tile_x < tiles_wide; tile_x++) {
+            const size_t tile_index = (size_t)tile_y * tiles_wide + tile_x;
+            const size_t offset =
+                (size_t)tile_y * (TB_BC7_DELTA_TILE_SIZE / 4u) * bytes_per_row +
+                (size_t)tile_x * (TB_BC7_DELTA_TILE_SIZE / 4u) * 16u;
+            uint64_t tile_checksum = tb_bc7_tile_checksum(
+                blocks + offset,
+                bytes_per_row,
+                block_rows,
+                (uint32_t)tile_index
+            );
+            tile_checksums[tile_index] = tile_checksum;
+            checksum ^= tile_checksum;
+        }
+    }
+    return checksum;
+}
+
+static void request_bc7_keyframe(struct app *a, const char *reason) {
+    const uint64_t now = now_ms();
+    if (a->client_fd < 0 || a->bc7_keyframe_request_pending ||
+        (a->bc7_last_keyframe_request_ms != 0 &&
+         now - a->bc7_last_keyframe_request_ms < 250)) {
+        return;
+    }
+    uint8_t packet[9] = {
+        0, 0, 0, 5, TB_PKT_BC7_KEYFRAME_REQUEST,
+        (uint8_t)(a->bc7_render_generation >> 24),
+        (uint8_t)(a->bc7_render_generation >> 16),
+        (uint8_t)(a->bc7_render_generation >> 8),
+        (uint8_t)a->bc7_render_generation
+    };
+    if (send_all(a->client_fd, packet, sizeof(packet)) == 0) {
+        a->bc7_last_keyframe_request_ms = now;
+        a->bc7_keyframe_request_pending = 1;
+        a->bc7_keyframe_requests++;
+        if (a->debug_enabled) {
+            fprintf(stderr,
+                    "[diag] event=bc7-keyframe-request generation=%u reason=%s count=%llu\n",
+                    a->bc7_render_generation,
+                    reason,
+                    (unsigned long long)a->bc7_keyframe_requests);
+        }
+    }
+}
+
+static void maybe_send_bc7_render_ack(struct app *a,
+                                      uint32_t width,
+                                      uint32_t height) {
+    if (a->bc7_render_ack_sent || a->client_fd < 0) return;
+    uint8_t packet[17] = {
+        0, 0, 0, 13, TB_PKT_BC7_RENDER_ACK,
+        (uint8_t)(a->bc7_render_generation >> 24),
+        (uint8_t)(a->bc7_render_generation >> 16),
+        (uint8_t)(a->bc7_render_generation >> 8),
+        (uint8_t)a->bc7_render_generation,
+        (uint8_t)(width >> 24),
+        (uint8_t)(width >> 16),
+        (uint8_t)(width >> 8),
+        (uint8_t)width,
+        (uint8_t)(height >> 24),
+        (uint8_t)(height >> 16),
+        (uint8_t)(height >> 8),
+        (uint8_t)height
+    };
+    if (send_all(a->client_fd, packet, sizeof(packet)) == 0) {
+        a->bc7_render_ack_sent = 1;
+        a->bc7_acks_sent++;
+        if (a->debug_enabled) {
+            fprintf(stderr,
+                    "[diag] event=bc7-render-ack generation=%u width=%u height=%u\n",
+                    a->bc7_render_generation, width, height);
+        }
+    }
+}
+
 /* Full-frame BC7 Mode 6 texture.
  * Payload: [1: format=1][BE32 w][BE32 h][BE32 bytesPerRow]
  *          [BC7 blocks: bytesPerRow*(h/4)] */
@@ -966,15 +1086,71 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         return;
     }
 
-    if (tb_disp_render_bc7(a->disp,
-                           frame.blocks,
-                           frame.blocks_len,
-                           frame.width,
-                           frame.height,
-                           frame.bytes_per_row,
-                           !a->bc7_render_ack_sent) != 0) {
+    if (frame.format == 2) {
+        if (frame.width % TB_BC7_DELTA_TILE_SIZE != 0) {
+            a->bc7_invalid_frames++;
+            request_bc7_keyframe(a, "keyframe-width");
+            return;
+        }
+        const size_t tile_count =
+            (size_t)(frame.width / TB_BC7_DELTA_TILE_SIZE) *
+            ((frame.height + TB_BC7_DELTA_TILE_SIZE - 1u) /
+             TB_BC7_DELTA_TILE_SIZE);
+        uint8_t *shadow = malloc(frame.blocks_len);
+        uint64_t *tile_checksums = calloc(tile_count, sizeof(*tile_checksums));
+        if (!shadow || !tile_checksums) {
+            free(shadow);
+            free(tile_checksums);
+            a->bc7_invalid_frames++;
+            return;
+        }
+        memcpy(shadow, frame.blocks, frame.blocks_len);
+        uint64_t checksum = checksum_bc7_tiles(
+            shadow, frame.width, frame.height, frame.bytes_per_row, tile_checksums
+        );
+        if (checksum != frame.checksum) {
+            free(shadow);
+            free(tile_checksums);
+            a->bc7_invalid_frames++;
+            request_bc7_keyframe(a, "keyframe-checksum");
+            return;
+        }
+        if (tb_disp_upload_bc7(a->disp,
+                               frame.blocks,
+                               frame.blocks_len,
+                               frame.width,
+                               frame.height,
+                               frame.bytes_per_row) != 0) {
+            free(shadow);
+            free(tile_checksums);
+            a->bc7_render_failures++;
+            return;
+        }
+        reset_bc7_delta_state(a);
+        a->bc7_shadow = shadow;
+        a->bc7_tile_checksums = tile_checksums;
+        a->bc7_shadow_len = frame.blocks_len;
+        a->bc7_tile_count = tile_count;
+        a->bc7_width = frame.width;
+        a->bc7_height = frame.height;
+        a->bc7_bytes_per_row = frame.bytes_per_row;
+        a->bc7_applied_sequence = frame.sequence;
+        a->bc7_checksum = checksum;
+        a->bc7_keyframe_request_pending = 0;
+    } else if (tb_disp_upload_bc7(a->disp,
+                                  frame.blocks,
+                                  frame.blocks_len,
+                                  frame.width,
+                                  frame.height,
+                                  frame.bytes_per_row) != 0) {
         a->bc7_render_failures++;
-        fprintf(stderr, "[bc7] unable to render %ux%u frame\n",
+        fprintf(stderr, "[bc7] unable to upload %ux%u frame\n",
+                frame.width, frame.height);
+        return;
+    }
+    if (tb_disp_present_bc7(a->disp, !a->bc7_render_ack_sent) != 0) {
+        a->bc7_render_failures++;
+        fprintf(stderr, "[bc7] unable to present %ux%u frame\n",
                 frame.width, frame.height);
         return;
     }
@@ -997,34 +1173,92 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
     a->bc7_bytes += frame.blocks_len;
     snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7");
 
-    if (!a->bc7_render_ack_sent && a->client_fd >= 0) {
-        uint8_t packet[17];
-        packet[0] = 0;
-        packet[1] = 0;
-        packet[2] = 0;
-        packet[3] = 13;
-        packet[4] = TB_PKT_BC7_RENDER_ACK;
-        packet[5] = (uint8_t)(a->bc7_render_generation >> 24);
-        packet[6] = (uint8_t)(a->bc7_render_generation >> 16);
-        packet[7] = (uint8_t)(a->bc7_render_generation >> 8);
-        packet[8] = (uint8_t)a->bc7_render_generation;
-        packet[9] = (uint8_t)(frame.width >> 24);
-        packet[10] = (uint8_t)(frame.width >> 16);
-        packet[11] = (uint8_t)(frame.width >> 8);
-        packet[12] = (uint8_t)frame.width;
-        packet[13] = (uint8_t)(frame.height >> 24);
-        packet[14] = (uint8_t)(frame.height >> 16);
-        packet[15] = (uint8_t)(frame.height >> 8);
-        packet[16] = (uint8_t)frame.height;
-        if (send_all(a->client_fd, packet, sizeof(packet)) == 0) {
-            a->bc7_render_ack_sent = 1;
-            a->bc7_acks_sent++;
-            if (a->debug_enabled) {
-                fprintf(stderr,
-                        "[diag] event=bc7-render-ack generation=%u width=%u height=%u\n",
-                        a->bc7_render_generation, frame.width, frame.height);
+    maybe_send_bc7_render_ack(a, frame.width, frame.height);
+}
+
+static void handle_bc7_delta(struct app *a, const uint8_t *p, size_t len) {
+            struct tb_bc7_delta_frame frame;
+            if (tb_bc7_delta_parse(p, len, &frame) != 0 ||
+                !a->bc7_shadow || !a->bc7_tile_checksums ||
+                frame.width != a->bc7_width || frame.height != a->bc7_height ||
+                !tb_bc7_delta_sequence_valid(
+                    frame.sequence, frame.base_sequence, a->bc7_applied_sequence
+                )) {
+                a->bc7_invalid_frames++;
+                request_bc7_keyframe(a, "delta-base");
+                return;
             }
-        }
+
+            uint8_t *candidate = malloc(a->bc7_shadow_len);
+            uint64_t *candidate_checksums =
+                malloc(a->bc7_tile_count * sizeof(*candidate_checksums));
+            if (!candidate || !candidate_checksums) {
+                free(candidate);
+                free(candidate_checksums);
+                a->bc7_invalid_frames++;
+                return;
+            }
+            memcpy(candidate, a->bc7_shadow, a->bc7_shadow_len);
+            memcpy(candidate_checksums,
+                   a->bc7_tile_checksums,
+                   a->bc7_tile_count * sizeof(*candidate_checksums));
+
+            uint64_t checksum = 0;
+            if (tb_bc7_delta_apply_to_shadow(
+                    &frame,
+                    candidate,
+                    a->bc7_shadow_len,
+                    a->bc7_bytes_per_row,
+                    candidate_checksums,
+                    a->bc7_tile_count,
+                    &checksum) != 0) {
+                free(candidate);
+                free(candidate_checksums);
+                a->bc7_invalid_frames++;
+                request_bc7_keyframe(a, "delta-checksum");
+                return;
+            }
+
+            for (uint16_t index = 0; index < frame.run_count; index++) {
+                const struct tb_bc7_delta_run *run = &frame.runs[index];
+                const uint32_t run_width = (uint32_t)run->tile_count_x * frame.tile_size;
+                const uint32_t run_row_bytes = (run_width / 4u) * 16u;
+                if (tb_disp_upload_bc7_region(
+                        a->disp,
+                        run->data,
+                        run->data_length,
+                        frame.width,
+                        frame.height,
+                        (uint32_t)run->tile_x * frame.tile_size,
+                        (uint32_t)run->tile_y * frame.tile_size,
+                        run_width,
+                        run->pixel_height,
+                        run_row_bytes) != 0) {
+                    free(candidate);
+                    free(candidate_checksums);
+                    a->bc7_render_failures++;
+                    reset_bc7_delta_state(a);
+                    request_bc7_keyframe(a, "delta-upload");
+                    return;
+                }
+            }
+
+            free(a->bc7_shadow);
+            free(a->bc7_tile_checksums);
+            a->bc7_shadow = candidate;
+            a->bc7_tile_checksums = candidate_checksums;
+            a->bc7_applied_sequence = frame.sequence;
+            a->bc7_checksum = checksum;
+            a->frames++;
+            a->bc7_frames++;
+            a->bc7_delta_frames++;
+            a->bc7_bytes += len;
+            snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7-delta");
+    const int wait_for_ack = !a->bc7_render_ack_sent;
+    if (tb_disp_present_bc7(a->disp, wait_for_ack) != 0) {
+        a->bc7_render_failures++;
+    } else {
+        maybe_send_bc7_render_ack(a, frame.width, frame.height);
     }
 }
 
@@ -1181,6 +1415,10 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
     case TB_PKT_BC7_FRAME:
         a->session_active = 1;
         handle_bc7_frame(a, payload, len);
+        break;
+    case TB_PKT_BC7_TILE_DELTA:
+        a->session_active = 1;
+        handle_bc7_delta(a, payload, len);
         break;
     case TB_PKT_BC7_ACK_REQUEST:
         if (len == 4) {
@@ -1769,6 +2007,7 @@ static void send_receiver_info(struct app *a) {
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
         "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsBC7Mode6\":%s,"
+        "\"supportsBC7TileDelta\":%s,"
         "\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
         escaped_name,
         panel_w,
@@ -1778,6 +2017,7 @@ static void send_receiver_info(struct app *a) {
         capture_w,
         capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
+        tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
         tb_receiver_accessibility_trusted() ? "true" : "false"
@@ -1805,6 +2045,7 @@ static void close_client(struct app *a) {
         fprintf(stderr,
                 "[diag] event=disconnect transport=%s frames=%llu packets=%llu "
                 "bytes=%llu bc7Frames=%llu bc7Invalid=%llu renderFailures=%llu "
+                "bc7Deltas=%llu appliedSequence=%llu keyframeRequests=%llu "
                 "ackRequests=%llu acksSent=%llu\n",
                 a->active_transport,
                 (unsigned long long)a->frames,
@@ -1813,6 +2054,9 @@ static void close_client(struct app *a) {
                 (unsigned long long)a->bc7_frames,
                 (unsigned long long)a->bc7_invalid_frames,
                 (unsigned long long)a->bc7_render_failures,
+                (unsigned long long)a->bc7_delta_frames,
+                (unsigned long long)a->bc7_applied_sequence,
+                (unsigned long long)a->bc7_keyframe_requests,
                 (unsigned long long)a->bc7_ack_requests,
                 (unsigned long long)a->bc7_acks_sent);
     }
@@ -1823,6 +2067,9 @@ static void close_client(struct app *a) {
     a->have_video_frame = 0;
     a->bc7_render_ack_sent = 0;
     a->bc7_render_generation = 0;
+    a->bc7_last_keyframe_request_ms = 0;
+    a->bc7_keyframe_request_pending = 0;
+    reset_bc7_delta_state(a);
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
     SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
@@ -1905,11 +2152,12 @@ int main(int argc, char **argv) {
         printf(
             "{\"version\":\"%s\",\"build\":\"%s\",\"architecture\":\"%s\","
             "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
-            "\"supportsRawNV12\":true}\n",
+            "\"supportsBC7TileDelta\":%s,\"supportsRawNV12\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
             architecture,
             metal_device,
+            tb_bc7_renderer_supported() ? "true" : "false",
             tb_bc7_renderer_supported() ? "true" : "false"
         );
         return 0;
@@ -2072,6 +2320,9 @@ int main(int argc, char **argv) {
                 a.session_active = 0;
                 a.bc7_render_ack_sent = 0;
                 a.bc7_render_generation = 0;
+                a.bc7_last_keyframe_request_ms = 0;
+                a.bc7_keyframe_request_pending = 0;
+                reset_bc7_delta_state(&a);
                 a.frames = 0;
                 a.last_fps_count = 0;
                 a.received_bytes = 0;
@@ -2083,6 +2334,8 @@ int main(int argc, char **argv) {
                 a.bc7_render_failures = 0;
                 a.bc7_ack_requests = 0;
                 a.bc7_acks_sent = 0;
+                a.bc7_delta_frames = 0;
+                a.bc7_keyframe_requests = 0;
                 snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
@@ -2214,6 +2467,7 @@ int main(int argc, char **argv) {
                         "transport=%s fps=%.2f networkGbps=%.3f packets=%llu "
                         "bc7Frames=%llu bc7PayloadBytes=%llu bc7Invalid=%llu "
                         "renderFailures=%llu generation=%u ackPending=%s "
+                        "bc7Deltas=%llu appliedSequence=%llu keyframeRequests=%llu "
                         "ackRequests=%llu acksSent=%llu\n",
                         a.client_fd >= 0 ? "true" : "false",
                         a.session_active ? "true" : "false",
@@ -2227,6 +2481,9 @@ int main(int argc, char **argv) {
                         (unsigned long long)a.bc7_render_failures,
                         a.bc7_render_generation,
                         (a.bc7_render_generation != 0 && !a.bc7_render_ack_sent) ? "true" : "false",
+                        (unsigned long long)a.bc7_delta_frames,
+                        (unsigned long long)a.bc7_applied_sequence,
+                        (unsigned long long)a.bc7_keyframe_requests,
                         (unsigned long long)a.bc7_ack_requests,
                         (unsigned long long)a.bc7_acks_sent);
             } else if (df > 0) {

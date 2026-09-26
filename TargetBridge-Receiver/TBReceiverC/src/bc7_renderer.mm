@@ -318,6 +318,54 @@ fragment float4 tb_bc7_fragment(
     return [self renderCurrentTextureWaitingForCompletion:waitForCompletion];
 }
 
+- (BOOL)uploadBlocks:(const uint8_t *)blocks
+              length:(size_t)length
+               width:(uint32_t)width
+              height:(uint32_t)height
+         bytesPerRow:(uint32_t)bytesPerRow {
+    if (!blocks || width == 0 || height == 0 || (width & 3u) || (height & 3u)) {
+        return NO;
+    }
+    size_t required = (size_t)bytesPerRow * (height / 4u);
+    if (bytesPerRow != (width / 4u) * 16u || length < required ||
+        ![self ensureTextureWidth:width height:height]) {
+        return NO;
+    }
+    [self.texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                    mipmapLevel:0
+                      withBytes:blocks
+                    bytesPerRow:bytesPerRow];
+    self.view.hidden = NO;
+    return YES;
+}
+
+- (BOOL)uploadBlocks:(const uint8_t *)blocks
+              length:(size_t)length
+        textureWidth:(uint32_t)textureWidth
+       textureHeight:(uint32_t)textureHeight
+                   x:(uint32_t)x
+                   y:(uint32_t)y
+               width:(uint32_t)width
+              height:(uint32_t)height
+         bytesPerRow:(uint32_t)bytesPerRow {
+    if (!blocks || !self.texture ||
+        self.textureWidth != textureWidth || self.textureHeight != textureHeight ||
+        width == 0 || height == 0 || (x & 3u) || (y & 3u) ||
+        (width & 3u) || (height & 3u) ||
+        x + width > textureWidth || y + height > textureHeight) {
+        return NO;
+    }
+    size_t required = (size_t)bytesPerRow * (height / 4u);
+    if (bytesPerRow != (width / 4u) * 16u || length < required) {
+        return NO;
+    }
+    [self.texture replaceRegion:MTLRegionMake2D(x, y, width, height)
+                    mipmapLevel:0
+                      withBytes:blocks
+                    bytesPerRow:bytesPerRow];
+    return YES;
+}
+
 - (BOOL)renderCurrentTextureWaitingForCompletion:(BOOL)waitForCompletion {
     if (!self.texture || self.view.hidden) return NO;
     [self updateDrawableSize];
@@ -415,6 +463,52 @@ int tb_bc7_renderer_render(struct tb_bc7_renderer *renderer,
                          height:height
                     bytesPerRow:bytes_per_row
               waitForCompletion:wait_for_completion ? YES : NO] ? 0 : -1;
+}
+
+int tb_bc7_renderer_upload(struct tb_bc7_renderer *renderer,
+                           const uint8_t *blocks,
+                           size_t length,
+                           uint32_t width,
+                           uint32_t height,
+                           uint32_t bytes_per_row) {
+    if (!renderer) return -1;
+    TBBC7Renderer *object = (__bridge TBBC7Renderer *)renderer;
+    return [object uploadBlocks:blocks
+                        length:length
+                         width:width
+                        height:height
+                   bytesPerRow:bytes_per_row] ? 0 : -1;
+}
+
+int tb_bc7_renderer_upload_region(struct tb_bc7_renderer *renderer,
+                                  const uint8_t *blocks,
+                                  size_t length,
+                                  uint32_t texture_width,
+                                  uint32_t texture_height,
+                                  uint32_t x,
+                                  uint32_t y,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  uint32_t bytes_per_row) {
+    if (!renderer) return -1;
+    TBBC7Renderer *object = (__bridge TBBC7Renderer *)renderer;
+    return [object uploadBlocks:blocks
+                        length:length
+                  textureWidth:texture_width
+                 textureHeight:texture_height
+                             x:x
+                             y:y
+                         width:width
+                        height:height
+                   bytesPerRow:bytes_per_row] ? 0 : -1;
+}
+
+int tb_bc7_renderer_present(struct tb_bc7_renderer *renderer,
+                            int wait_for_completion) {
+    if (!renderer) return -1;
+    TBBC7Renderer *object = (__bridge TBBC7Renderer *)renderer;
+    return [object renderCurrentTextureWaitingForCompletion:
+        wait_for_completion ? YES : NO] ? 0 : -1;
 }
 
 void tb_bc7_renderer_set_cursor(struct tb_bc7_renderer *renderer,

@@ -32,6 +32,16 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(TBMonitorProtocol.readBE32(data, offset: 4), 0x0000_BEEF)
     }
 
+    func testBE64RoundTrip() {
+        let values: [UInt64] = [0, 1, 0x0123_4567_89AB_CDEF, UInt64.max]
+        for value in values {
+            var data = Data()
+            TBMonitorProtocol.appendBE64(&data, value)
+            XCTAssertEqual(data.count, 8)
+            XCTAssertEqual(TBMonitorProtocol.readBE64(data, offset: 0), value)
+        }
+    }
+
     // MARK: - Packet framing
 
     func testMakePacketLayout() {
@@ -45,6 +55,8 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(TBMonitorPacketType.bc7Frame.rawValue, 0x24)
         XCTAssertEqual(TBMonitorPacketType.bc7RenderAck.rawValue, 0x25)
         XCTAssertEqual(TBMonitorPacketType.bc7RenderAckRequest.rawValue, 0x26)
+        XCTAssertEqual(TBMonitorPacketType.bc7TileDelta.rawValue, 0x27)
+        XCTAssertEqual(TBMonitorPacketType.bc7KeyframeRequest.rawValue, 0x28)
 
         let olderProfile = Data("""
         {
@@ -62,6 +74,176 @@ final class TBMonitorProtocolTests: XCTestCase {
         let profile = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: olderProfile)
         XCTAssertNil(profile.supportsRawNV12)
         XCTAssertNil(profile.supportsBC7Mode6)
+        XCTAssertNil(profile.supportsBC7TileDelta)
+    }
+
+    func testBC7DeltaPlannerKeyframeDeltaAndRecovery() throws {
+        let width = 128
+        let height = 64
+        let bytesPerRow = 512
+        let frameBytes = bytesPerRow * (height / 4)
+        let planner = TBBC7DeltaPlanner(keyframeIntervalFrames: 2)
+        let initial = Data(repeating: 0x11, count: frameBytes)
+
+        guard case .keyframe(let firstSequence, _, _) =
+            try XCTUnwrap(planner.plan(
+                current: initial, width: width, height: height, bytesPerRow: bytesPerRow
+            )) else {
+            return XCTFail("first frame must be a keyframe")
+        }
+        XCTAssertEqual(firstSequence, 1)
+
+        guard case .delta(let secondSequence, let baseSequence, _, let runs, let dirty, let total) =
+            try XCTUnwrap(planner.plan(
+                current: initial, width: width, height: height, bytesPerRow: bytesPerRow
+            )) else {
+            return XCTFail("identical frame must be a zero-run delta")
+        }
+        XCTAssertEqual(secondSequence, 2)
+        XCTAssertEqual(baseSequence, 1)
+        XCTAssertTrue(runs.isEmpty)
+        XCTAssertEqual(dirty, 0)
+        XCTAssertEqual(total, 2)
+
+        var oneTileChanged = initial
+        oneTileChanged[256] ^= 0xFF
+        guard case .delta(let thirdSequence, _, _, let changedRuns, let changedCount, _) =
+            try XCTUnwrap(planner.plan(
+                current: oneTileChanged, width: width, height: height, bytesPerRow: bytesPerRow
+            )) else {
+            return XCTFail("single changed tile must remain a delta")
+        }
+        XCTAssertEqual(thirdSequence, 3)
+        XCTAssertEqual(changedCount, 1)
+        XCTAssertEqual(changedRuns.count, 1)
+        XCTAssertEqual(changedRuns[0].tileX, 1)
+
+        planner.markSendFailure()
+        guard case .keyframe(let recoverySequence, _, _) =
+            try XCTUnwrap(planner.plan(
+                current: oneTileChanged, width: width, height: height, bytesPerRow: bytesPerRow
+            )) else {
+            return XCTFail("send failure must force a recovery keyframe")
+        }
+        XCTAssertEqual(recoverySequence, 4)
+    }
+
+    func testBC7DeltaChecksumMatchesReceiverFixture() throws {
+        let planner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        let frame = Data(repeating: 0x11, count: 4096)
+        guard case .keyframe(_, let checksum, _) =
+            try XCTUnwrap(planner.plan(
+                current: frame, width: 64, height: 64, bytesPerRow: 256
+            )) else {
+            return XCTFail("first fixture frame must be a keyframe")
+        }
+        XCTAssertEqual(checksum, 0x2DA5_3169_9A69_7325)
+    }
+
+    func testBC7DeltaPlannerPeriodicAndRunCountKeyframes() throws {
+        let periodic = TBBC7DeltaPlanner(keyframeIntervalFrames: 1)
+        let frame = Data(repeating: 0, count: 4096)
+        _ = periodic.plan(current: frame, width: 64, height: 64, bytesPerRow: 256)
+        guard case .delta = try XCTUnwrap(periodic.plan(
+            current: frame, width: 64, height: 64, bytesPerRow: 256
+        )) else {
+            return XCTFail("one interval frame should remain a delta")
+        }
+        guard case .keyframe = try XCTUnwrap(periodic.plan(
+            current: frame, width: 64, height: 64, bytesPerRow: 256
+        )) else {
+            return XCTFail("periodic recovery must force a keyframe")
+        }
+
+        let width = 5120
+        let height = 512
+        let bytesPerRow = width * 4
+        let runLimited = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        let initial = Data(repeating: 0, count: bytesPerRow * height / 4)
+        _ = runLimited.plan(
+            current: initial, width: width, height: height, bytesPerRow: bytesPerRow
+        )
+        var checkerboard = initial
+        let tileRowBytes = 256
+        let tilesWide = width / 64
+        for tileY in 0..<(height / 64) {
+            for tileX in stride(from: 0, to: tilesWide, by: 2) {
+                let offset = tileY * 16 * bytesPerRow + tileX * tileRowBytes
+                checkerboard[offset] = 1
+            }
+        }
+        guard case .keyframe = try XCTUnwrap(runLimited.plan(
+            current: checkerboard,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow
+        )) else {
+            return XCTFail("more than 256 disjoint runs must force a keyframe")
+        }
+    }
+
+    func testBC7DeltaPlannerCoalescesRunsAndFallsBackAtThreshold() throws {
+        let width = 128
+        let height = 64
+        let bytesPerRow = 512
+        let initial = Data(repeating: 0, count: bytesPerRow * (height / 4))
+        let planner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        _ = planner.plan(current: initial, width: width, height: height, bytesPerRow: bytesPerRow)
+
+        var bothTilesChanged = initial
+        bothTilesChanged[0] = 1
+        bothTilesChanged[256] = 2
+        guard case .keyframe(let sequence, _, _) =
+            try XCTUnwrap(planner.plan(
+                current: bothTilesChanged, width: width, height: height, bytesPerRow: bytesPerRow
+            )) else {
+            return XCTFail("delta larger than threshold must become a keyframe")
+        }
+        XCTAssertEqual(sequence, 2)
+
+        let widePlanner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        let wideWidth = 192
+        let wideBytesPerRow = 768
+        let wideInitial = Data(repeating: 0, count: wideBytesPerRow * (height / 4))
+        _ = widePlanner.plan(
+            current: wideInitial, width: wideWidth, height: height, bytesPerRow: wideBytesPerRow
+        )
+        var adjacentTilesChanged = wideInitial
+        adjacentTilesChanged[0] = 1
+        adjacentTilesChanged[256] = 2
+        guard case .delta(_, _, _, let runs, let dirty, _) =
+            try XCTUnwrap(widePlanner.plan(
+                current: adjacentTilesChanged,
+                width: wideWidth,
+                height: height,
+                bytesPerRow: wideBytesPerRow
+            )) else {
+            return XCTFail("two adjacent tiles in a three-tile row should remain a delta")
+        }
+        XCTAssertEqual(dirty, 2)
+        XCTAssertEqual(runs.count, 1)
+        XCTAssertEqual(runs[0].tileCountX, 2)
+    }
+
+    func testNative5KRequiresNativeSourceFramebuffer() {
+        XCTAssertFalse(tbSourceFramebufferSupportsNativeCapture(
+            preset: .native5k, pixelWidth: 2560, pixelHeight: 1440
+        ))
+        XCTAssertTrue(tbSourceFramebufferSupportsNativeCapture(
+            preset: .native5k, pixelWidth: 5120, pixelHeight: 2880
+        ))
+        XCTAssertFalse(tbSourceFramebufferSupportsNativeCapture(
+            preset: .native5k60Experimental, pixelWidth: 5120, pixelHeight: 2160
+        ))
+        XCTAssertFalse(tbSourceFramebufferSupportsNativeCapture(
+            preset: .native5k, pixelWidth: 5120, pixelHeight: 3200
+        ))
+        XCTAssertTrue(tbSourceFramebufferSupportsNativeCapture(
+            preset: .native5k, pixelWidth: 6016, pixelHeight: 3384
+        ))
+        XCTAssertTrue(tbSourceFramebufferSupportsNativeCapture(
+            preset: .standard1440p, pixelWidth: 1920, pixelHeight: 1080
+        ))
     }
 
     func testBC7RenderAckCarriesRenderedDimensions() throws {

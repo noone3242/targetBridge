@@ -14,10 +14,13 @@ BC7 能否使用，不由 CPU 架构直接决定。真正的硬条件如下：
 | Receiver | 可创建 `MTLPixelFormatBC7_RGBAUnorm` texture | 首帧创建 BC7 texture，失败时不发送 render ACK |
 | 网络 | 能持续承载完整帧 BC7 流量 | Sender/Receiver Diagnostics 实测 Gbit/s |
 
-当前实现是 **full-frame BC7**，不是 tile/delta：
+当前实现支持 **64×64 tile 差分 BC7**：
 
 - `4 × 4 pixels` 编码为一个 16-byte BC7 block。
-- 5K `5120 × 2880 @ 60 Hz` 的纯 BC7 payload 约为 `7.08 Gbit/s`。
+- 首帧、周期恢复帧、大范围变化帧仍发送 full keyframe。
+- 静态帧发送 zero-run delta；局部变化只发送对应 horizontal tile runs。
+- 5K `5120 × 2880 @ 60 Hz` 的 full keyframe payload 约为 `7.08 Gbit/s`，
+  但稳定桌面不再持续占用该带宽。
 - 实际链路还包含 packet header、控制消息和 TCP 开销。
 
 “Intel Mac”本身不能保证 BC7 可用。不同机型可能使用 Intel 核显或 AMD
@@ -83,6 +86,7 @@ build/intel-validation/<timestamp>/
   "architecture": "x86_64",
   "metalDevice": "AMD Radeon Pro 580",
   "supportsBC7Mode6": true,
+  "supportsBC7TileDelta": true,
   "supportsRawNV12": true
 }
 ```
@@ -111,9 +115,10 @@ Receiver 每秒输出一条结构化 metrics：
 
 ```text
 [diag] event=metrics connected=true sessionActive=true transport=bc7 \
-fps=59.98 networkGbps=7.084 packets=601 bc7Frames=600 \
+fps=59.98 networkGbps=0.012 packets=601 bc7Frames=600 \
 bc7PayloadBytes=8847360000 bc7Invalid=0 renderFailures=0 \
-generation=3 ackPending=false ackRequests=1 acksSent=1
+generation=3 ackPending=false bc7Deltas=596 appliedSequence=600 \
+keyframeRequests=0 ackRequests=1 acksSent=1
 ```
 
 字段说明：
@@ -127,7 +132,10 @@ generation=3 ackPending=false ackRequests=1 acksSent=1
 | `networkGbps` | Receiver socket 实际接收速率 |
 | `packets` | 当前连接累计解析 packet 数 |
 | `bc7Frames` | 成功完成 Metal render 的 BC7 帧数 |
-| `bc7PayloadBytes` | 成功渲染的 BC7 block bytes |
+| `bc7PayloadBytes` | 成功处理的 full/delta BC7 wire payload bytes |
+| `bc7Deltas` | 成功应用的 tile delta 帧数 |
+| `appliedSequence` | 当前 texture 已应用的 BC7 frame sequence |
+| `keyframeRequests` | 因 baseline/sequence/checksum/upload 异常请求恢复帧的次数 |
 | `bc7Invalid` | 被严格 wire validator 拒绝的 BC7 帧 |
 | `renderFailures` | BC7 texture upload/draw/command completion 失败次数 |
 | `generation` | 当前 Sender pipeline generation |
@@ -158,8 +166,11 @@ generation=3 ackPending=false ackRequests=1 acksSent=1
 4. 在 Sender 的 Output 页面选择该 Receiver。
 5. 把 `Video transport` 设为 `BC7 Mode 6 (Experimental)`。
 6. 打开 Diagnostics，点击 `Start BC7 Test`。
-7. 联合测试固定使用 1440p BC7，并等待 generation-matched render ACK。
-8. 通过后再进行 5K sustained run。
+7. 联合测试使用当前选中的 preset，不再强制回退到 1440p。
+8. 测试 5K 时选择 `5K` 或 `5K 60 Experimental`；推荐使用
+   `Extended Desktop` 并开启 `Match render to stream`。
+9. Sender 会同时检查 source display mode 和首个实际 capture frame：
+   两者都必须达到 `5120×2880`，否则明确失败，不把 upscale 当成 native 5K。
 
 在接入真实 Sender 前，可以先在 Receiver 本机验证 Metal BC7
 texture upload 和 generation ACK：
@@ -171,10 +182,13 @@ make
 
 # 另一个 Terminal
 uv run python tests/mock_sender.py --mode bc7
+uv run python tests/mock_sender.py --mode bc7-delta
 ```
 
-mock sender 必须输出 `BC7 render ACK verified`，Receiver 必须记录同一
-generation 的 `bc7-ack-request` 和 `bc7-render-ack`。
+full-frame mock 必须输出 `BC7 render ACK verified`；delta mock 必须输出
+`BC7 delta apply and stale-base recovery verified`。Receiver 必须记录同一
+generation 的 `bc7-render-ack`，并在 stale base 后记录
+`bc7-keyframe-request`。
 
 ## 6. 通过判据
 
@@ -216,7 +230,7 @@ generation 的 `bc7-ack-request` 和 `bc7-render-ack`。
 已在 Apple Silicon 开发机验证：
 
 - Sender XCTest。
-- Receiver 90 项 parser/BC7/cursor checks。
+- Receiver 115 项 parser/BC7/delta/shadow/cursor checks。
 - Receiver build。
 - `--capabilities` 输出和 Metal BC7 探测。
 - Intel validation script 在非 Intel 主机上的拒绝路径。
@@ -226,5 +240,5 @@ generation 的 `bc7-ack-request` 和 `bc7-render-ack`。
 - 原生 `x86_64` app 和所有 bundled dylib 的实际构建验证。
 - 目标 GPU 的 `supportsBCTextureCompression` 实测。
 - Intel Receiver 的真实 BC7 texture render。
-- Thunderbolt Bridge 1440p 联合测试。
+- 差分 BC7 的 Intel Receiver 实机联合测试。
 - 5K60 sustained throughput、CPU/GPU 和端到端延迟测量。

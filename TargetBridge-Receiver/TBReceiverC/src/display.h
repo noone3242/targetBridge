@@ -86,6 +86,23 @@ int tb_disp_render_bc7(struct tb_display *d,
                        uint32_t height,
                        uint32_t bytes_per_row,
                        int wait_for_completion);
+int tb_disp_upload_bc7(struct tb_display *d,
+                       const uint8_t *blocks,
+                       size_t length,
+                       uint32_t width,
+                       uint32_t height,
+                       uint32_t bytes_per_row);
+int tb_disp_upload_bc7_region(struct tb_display *d,
+                              const uint8_t *blocks,
+                              size_t length,
+                              uint32_t texture_width,
+                              uint32_t texture_height,
+                              uint32_t x,
+                              uint32_t y,
+                              uint32_t width,
+                              uint32_t height,
+                              uint32_t bytes_per_row);
+int tb_disp_present_bc7(struct tb_display *d, int wait_for_completion);
 
 /* Update low-latency local cursor overlay in source-frame coordinates. */
 void tb_disp_set_cursor(struct tb_display *d,

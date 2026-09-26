@@ -809,7 +809,11 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                             Divider().overlay(Color.white.opacity(0.08))
 
                             HStack(spacing: 12) {
-                                Button(service.language == .chinese ? "开始 BC7 联合测试" : "Start BC7 Test") {
+                                Button(
+                                    service.language == .chinese
+                                        ? "开始 BC7 联合测试：\(session.capturePreset.description)"
+                                        : "Start BC7 Test: \(session.capturePreset.description)"
+                                ) {
                                     session.startBC7Test()
                                 }
                                 .buttonStyle(.borderedProminent)

@@ -8,6 +8,7 @@
 #include "../src/net.h"
 #include "../src/proto.h"
 #include "../src/bc7_frame.h"
+#include "../src/bc7_delta.h"
 #include "../src/bc7_cursor.h"
 
 #include <stdio.h>
@@ -63,6 +64,16 @@ static void put_be32(uint8_t *dst, uint32_t v) {
     dst[1] = (uint8_t)(v >> 16);
     dst[2] = (uint8_t)(v >> 8);
     dst[3] = (uint8_t)v;
+}
+
+static void put_be16(uint8_t *dst, uint16_t v) {
+    dst[0] = (uint8_t)(v >> 8);
+    dst[1] = (uint8_t)v;
+}
+
+static void put_be64(uint8_t *dst, uint64_t v) {
+    put_be32(dst, (uint32_t)(v >> 32));
+    put_be32(dst + 4, (uint32_t)v);
 }
 
 /* Builds [4B BE len][1B type][payload] into buf; returns total size. */
@@ -259,7 +270,7 @@ static void test_bc7_payload_validation(void) {
     CHECK(frame.width == 4 && frame.height == 4, "BC7 dimensions parsed");
     CHECK(frame.bytes_per_row == 16, "BC7 row bytes parsed");
 
-    payload[0] = 2;
+    payload[0] = 3;
     CHECK(tb_bc7_frame_parse(payload, sizeof(payload), &frame) == -1,
           "unknown BC7 format rejected");
 
@@ -284,6 +295,115 @@ static void test_bc7_payload_validation(void) {
           "truncated BC7 block payload rejected");
     CHECK(tb_bc7_frame_parse(payload, sizeof(payload) + 1, &frame) == -1,
           "trailing BC7 payload bytes rejected");
+}
+
+static void test_bc7_sequenced_keyframe_validation(void) {
+    const size_t blocks_len = 4096;
+    uint8_t *payload = calloc(1, 29 + blocks_len);
+    struct tb_bc7_frame frame;
+    CHECK(payload != NULL, "sequenced keyframe alloc");
+    if (!payload) return;
+    payload[0] = 2;
+    put_be64(payload + 1, 9);
+    put_be64(payload + 9, UINT64_C(0x0123456789abcdef));
+    put_be32(payload + 17, 64);
+    put_be32(payload + 21, 64);
+    put_be32(payload + 25, 256);
+    CHECK(tb_bc7_frame_parse(payload, 29 + blocks_len, &frame) == 0,
+          "sequenced BC7 keyframe accepted");
+    CHECK(frame.format == 2, "sequenced keyframe format parsed");
+    CHECK(frame.sequence == 9, "sequenced keyframe sequence parsed");
+    CHECK(frame.checksum == UINT64_C(0x0123456789abcdef),
+          "sequenced keyframe checksum parsed");
+    CHECK(frame.blocks == payload + 29, "sequenced keyframe header skipped");
+    put_be64(payload + 1, 0);
+    CHECK(tb_bc7_frame_parse(payload, 29 + blocks_len, &frame) == -1,
+          "zero sequenced keyframe rejected");
+    free(payload);
+}
+
+static void test_bc7_delta_validation(void) {
+    const size_t run_len = 4096;
+    uint8_t *payload = calloc(1, 37 + 12 + run_len);
+    struct tb_bc7_delta_frame frame;
+    CHECK(payload != NULL, "delta alloc");
+    if (!payload) return;
+    payload[0] = 1;
+    put_be64(payload + 1, 2);
+    put_be64(payload + 9, 1);
+    put_be64(payload + 17, UINT64_C(0xfedcba9876543210));
+    put_be32(payload + 25, 64);
+    put_be32(payload + 29, 64);
+    put_be16(payload + 33, 64);
+    put_be16(payload + 35, 1);
+    put_be16(payload + 37, 0);
+    put_be16(payload + 39, 0);
+    put_be16(payload + 41, 1);
+    put_be16(payload + 43, 64);
+    put_be32(payload + 45, (uint32_t)run_len);
+    for (size_t i = 0; i < run_len; i++) payload[49 + i] = (uint8_t)(i * 17u);
+    put_be64(payload + 17, tb_bc7_tile_checksum(payload + 49, 256, 16, 0));
+
+    CHECK(tb_bc7_delta_parse(payload, 49 + run_len, &frame) == 0,
+          "valid one-tile delta accepted");
+    CHECK(frame.sequence == 2 && frame.base_sequence == 1,
+          "delta sequence pair parsed");
+    CHECK(frame.run_count == 1, "delta run count parsed");
+    CHECK(frame.runs[0].data_length == run_len, "delta run length parsed");
+    CHECK(frame.runs[0].data == payload + 49, "delta run data pointer parsed");
+    uint8_t shadow[4096] = {0};
+    uint64_t tile_checksums[1] = {0};
+    uint64_t applied_checksum = 0;
+    CHECK(tb_bc7_delta_apply_to_shadow(
+              &frame, shadow, sizeof(shadow), 256,
+              tile_checksums, 1, &applied_checksum) == 0,
+          "validated delta applies to candidate shadow");
+    CHECK(memcmp(shadow, payload + 49, sizeof(shadow)) == 0,
+          "shadow contains the delta tile bytes");
+    CHECK(applied_checksum == frame.checksum,
+          "applied shadow checksum matches wire checksum");
+    memset(shadow, 0, sizeof(shadow));
+    tile_checksums[0] = 0;
+    frame.checksum ^= 1u;
+    CHECK(tb_bc7_delta_apply_to_shadow(
+              &frame, shadow, sizeof(shadow), 256,
+              tile_checksums, 1, &applied_checksum) == -1,
+          "content checksum mismatch rejected before live-state commit");
+    frame.checksum ^= 1u;
+
+    put_be32(payload + 45, (uint32_t)run_len - 1);
+    CHECK(tb_bc7_delta_parse(payload, 49 + run_len, &frame) == -1,
+          "delta data length mismatch rejected");
+    put_be32(payload + 45, (uint32_t)run_len);
+    put_be16(payload + 41, 2);
+    CHECK(tb_bc7_delta_parse(payload, 49 + run_len, &frame) == -1,
+          "delta run outside tile grid rejected");
+    put_be16(payload + 41, 1);
+    CHECK(tb_bc7_delta_parse(payload, 48 + run_len, &frame) == -1,
+          "truncated delta rejected");
+    free(payload);
+
+    uint8_t zero_run[37] = {0};
+    zero_run[0] = 1;
+    put_be64(zero_run + 1, 3);
+    put_be64(zero_run + 9, 2);
+    put_be32(zero_run + 25, 64);
+    put_be32(zero_run + 29, 64);
+    put_be16(zero_run + 33, 64);
+    CHECK(tb_bc7_delta_parse(zero_run, sizeof(zero_run), &frame) == 0,
+          "zero-run liveness delta accepted");
+    CHECK(tb_bc7_delta_sequence_valid(3, 2, 2),
+          "next delta sequence accepted");
+    CHECK(!tb_bc7_delta_sequence_valid(4, 2, 2),
+          "skipped delta sequence rejected");
+    CHECK(!tb_bc7_delta_sequence_valid(3, 2, 1),
+          "stale delta base rejected");
+
+    uint8_t tile[4096];
+    memset(tile, 0x11, sizeof(tile));
+    CHECK(tb_bc7_tile_checksum(tile, 256, 16, 0) ==
+              UINT64_C(0x2da531699a697325),
+          "tile checksum matches cross-language fixture");
 }
 
 static void test_bc7_cursor_policy(void) {
@@ -320,6 +440,8 @@ int main(void) {
     test_large_payload_roundtrip();
     test_bc7_packet_type();
     test_bc7_payload_validation();
+    test_bc7_sequenced_keyframe_validation();
+    test_bc7_delta_validation();
     test_bc7_cursor_policy();
 
     if (g_failures == 0) {

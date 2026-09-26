@@ -291,6 +291,17 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     }
 }
 
+func tbSourceFramebufferSupportsNativeCapture(
+    preset: TBDisplayCapturePreset,
+    pixelWidth: Int,
+    pixelHeight: Int
+) -> Bool {
+    guard preset == .native5k || preset == .native5k60Experimental else { return true }
+    return pixelWidth >= preset.width &&
+        pixelHeight >= preset.height &&
+        pixelWidth * preset.height == pixelHeight * preset.width
+}
+
 enum TBDisplayCaptureSource: String, CaseIterable, Identifiable {
     case desktopMirror
     case extendedDesktop
@@ -652,6 +663,260 @@ final class TBBC7Mode6Encoder {
     }
 }
 
+struct TBBC7DeltaRun: Equatable {
+    let tileX: Int
+    let tileY: Int
+    let tileCountX: Int
+    let pixelHeight: Int
+    let data: Data
+}
+
+enum TBBC7DeltaPlan {
+    case keyframe(sequence: UInt64, checksum: UInt64, data: Data)
+    case delta(sequence: UInt64, baseSequence: UInt64, checksum: UInt64, runs: [TBBC7DeltaRun], dirtyTiles: Int, totalTiles: Int)
+}
+
+final class TBBC7DeltaPlanner {
+    static let tileSize = 64
+    static let maxDeltaRuns = 256
+
+    private var baseline: Data?
+    private var tileChecksums: [UInt64] = []
+    private var sequence: UInt64 = 0
+    private var framesSinceKeyframe = 0
+    private var forceKeyframe = true
+    private let keyframeIntervalFrames: Int
+
+    init(keyframeIntervalFrames: Int) {
+        self.keyframeIntervalFrames = max(1, keyframeIntervalFrames)
+    }
+
+    func reset() {
+        baseline = nil
+        tileChecksums = []
+        sequence = 0
+        framesSinceKeyframe = 0
+        forceKeyframe = true
+    }
+
+    func markSendFailure() {
+        forceKeyframe = true
+    }
+
+    func plan(current: Data, width: Int, height: Int, bytesPerRow: Int) -> TBBC7DeltaPlan? {
+        guard width > 0, height > 0, width % Self.tileSize == 0, height % 4 == 0,
+              bytesPerRow == (width / 4) * 16,
+              current.count == bytesPerRow * (height / 4)
+        else {
+            return nil
+        }
+
+        let tilesWide = width / Self.tileSize
+        let tilesHigh = (height + Self.tileSize - 1) / Self.tileSize
+        let totalTiles = tilesWide * tilesHigh
+        let nextSequence = sequence &+ 1
+
+        guard !forceKeyframe,
+              let baseline,
+              baseline.count == current.count,
+              tileChecksums.count == totalTiles,
+              framesSinceKeyframe < keyframeIntervalFrames
+        else {
+            let checksums = computeTileChecksums(
+                data: current,
+                width: width,
+                height: height,
+                bytesPerRow: bytesPerRow
+            )
+            self.baseline = current
+            tileChecksums = checksums
+            sequence = nextSequence
+            framesSinceKeyframe = 0
+            forceKeyframe = false
+            return .keyframe(
+                sequence: nextSequence,
+                checksum: checksums.reduce(0, ^),
+                data: current
+            )
+        }
+
+        var dirty = [Bool](repeating: false, count: totalTiles)
+        current.withUnsafeBytes { currentBytes in
+            baseline.withUnsafeBytes { baselineBytes in
+                guard let currentBase = currentBytes.baseAddress,
+                      let baselineBase = baselineBytes.baseAddress else { return }
+                for tileY in 0..<tilesHigh {
+                    let pixelHeight = min(Self.tileSize, height - tileY * Self.tileSize)
+                    let blockRows = pixelHeight / 4
+                    for tileX in 0..<tilesWide {
+                        let tileByteOffset = tileX * (Self.tileSize / 4) * 16
+                        let tileRowBytes = (Self.tileSize / 4) * 16
+                        var differs = false
+                        for blockRow in 0..<blockRows {
+                            let offset = (tileY * (Self.tileSize / 4) + blockRow) * bytesPerRow + tileByteOffset
+                            if memcmp(
+                                currentBase.advanced(by: offset),
+                                baselineBase.advanced(by: offset),
+                                tileRowBytes
+                            ) != 0 {
+                                differs = true
+                                break
+                            }
+                        }
+                        dirty[tileY * tilesWide + tileX] = differs
+                    }
+                }
+            }
+        }
+
+        var runs: [TBBC7DeltaRun] = []
+        var dirtyTiles = 0
+        for tileY in 0..<tilesHigh {
+            var tileX = 0
+            while tileX < tilesWide {
+                if !dirty[tileY * tilesWide + tileX] {
+                    tileX += 1
+                    continue
+                }
+                let startX = tileX
+                while tileX < tilesWide, dirty[tileY * tilesWide + tileX] {
+                    dirtyTiles += 1
+                    tileX += 1
+                }
+                let countX = tileX - startX
+                let pixelHeight = min(Self.tileSize, height - tileY * Self.tileSize)
+                let runData = Self.copyRun(
+                    from: current,
+                    bytesPerRow: bytesPerRow,
+                    tileX: startX,
+                    tileY: tileY,
+                    tileCountX: countX,
+                    pixelHeight: pixelHeight
+                )
+                runs.append(TBBC7DeltaRun(
+                    tileX: startX,
+                    tileY: tileY,
+                    tileCountX: countX,
+                    pixelHeight: pixelHeight,
+                    data: runData
+                ))
+            }
+        }
+
+        let runBytes = runs.reduce(0) { $0 + 12 + $1.data.count }
+        if runBytes >= current.count * 7 / 10 || runs.count > Self.maxDeltaRuns {
+            let checksums = computeTileChecksums(
+                data: current,
+                width: width,
+                height: height,
+                bytesPerRow: bytesPerRow
+            )
+            self.baseline = current
+            tileChecksums = checksums
+            sequence = nextSequence
+            framesSinceKeyframe = 0
+            return .keyframe(
+                sequence: nextSequence,
+                checksum: checksums.reduce(0, ^),
+                data: current
+            )
+        }
+
+        var updatedChecksums = tileChecksums
+        for tileY in 0..<tilesHigh {
+            for tileX in 0..<tilesWide where dirty[tileY * tilesWide + tileX] {
+                updatedChecksums[tileY * tilesWide + tileX] = Self.tileChecksum(
+                    data: current,
+                    width: width,
+                    height: height,
+                    bytesPerRow: bytesPerRow,
+                    tileX: tileX,
+                    tileY: tileY
+                )
+            }
+        }
+        self.baseline = current
+        tileChecksums = updatedChecksums
+        let baseSequence = sequence
+        sequence = nextSequence
+        framesSinceKeyframe += 1
+        return .delta(
+            sequence: nextSequence,
+            baseSequence: baseSequence,
+            checksum: updatedChecksums.reduce(0, ^),
+            runs: runs,
+            dirtyTiles: dirtyTiles,
+            totalTiles: totalTiles
+        )
+    }
+
+    private func computeTileChecksums(
+        data: Data,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int
+    ) -> [UInt64] {
+        let tilesWide = width / Self.tileSize
+        let tilesHigh = (height + Self.tileSize - 1) / Self.tileSize
+        return (0..<(tilesWide * tilesHigh)).map { index in
+            Self.tileChecksum(
+                data: data,
+                width: width,
+                height: height,
+                bytesPerRow: bytesPerRow,
+                tileX: index % tilesWide,
+                tileY: index / tilesWide
+            )
+        }
+    }
+
+    private static func tileChecksum(
+        data: Data,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        tileX: Int,
+        tileY: Int
+    ) -> UInt64 {
+        let pixelHeight = min(tileSize, height - tileY * tileSize)
+        let blockRows = pixelHeight / 4
+        let tileRowBytes = (tileSize / 4) * 16
+        let tileByteOffset = tileX * tileRowBytes
+        var hash = UInt64(14_695_981_039_346_656_037) ^ UInt64(tileY * (width / tileSize) + tileX)
+        data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            for row in 0..<blockRows {
+                let offset = (tileY * (tileSize / 4) + row) * bytesPerRow + tileByteOffset
+                let rowBytes = base.advanced(by: offset).assumingMemoryBound(to: UInt8.self)
+                for index in 0..<tileRowBytes {
+                    hash ^= UInt64(rowBytes[index])
+                    hash &*= 1_099_511_628_211
+                }
+            }
+        }
+        return hash
+    }
+
+    private static func copyRun(
+        from data: Data,
+        bytesPerRow: Int,
+        tileX: Int,
+        tileY: Int,
+        tileCountX: Int,
+        pixelHeight: Int
+    ) -> Data {
+        let blockRows = pixelHeight / 4
+        let runRowBytes = tileCountX * (tileSize / 4) * 16
+        let xOffset = tileX * (tileSize / 4) * 16
+        var result = Data(capacity: runRowBytes * blockRows)
+        for row in 0..<blockRows {
+            let start = (tileY * (tileSize / 4) + row) * bytesPerRow + xOffset
+            result.append(data[start..<(start + runRowBytes)])
+        }
+        return result
+    }
+}
+
 private final class TBVideoPipeline: @unchecked Sendable {
     let queue = DispatchQueue(label: "fd.tbmonitor.sender.pipeline", qos: .userInteractive)
 
@@ -662,15 +927,20 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let displayID: CGDirectDisplayID
     private let usesRawNV12: Bool
     private let usesBC7Mode6: Bool
-    private let onFirstFrame: @Sendable () -> Void
+    private let usesBC7TileDelta: Bool
+    private let onFirstFrame: @Sendable (Int, Int) -> Void
 
     // Confined to `queue`.
     private var vtEncoder: VTCompressionSession?
     private var vtEncoderRef: Unmanaged<TBVideoPipeline>?
     private var bc7Encoder: TBBC7Mode6Encoder?
+    private var bc7DeltaPlanner: TBBC7DeltaPlanner?
     private var pendingVideoPackets = 0
     private var inFlightEncodeFrames = 0
     private var droppedVideoFrames = 0
+    private var bc7Keyframes = 0
+    private var bc7DeltaFrames = 0
+    private var bc7DirtyTiles = 0
     private var displayStreamFrameSequence: CMTimeValue = 0
     private var lastEncodedDisplayPTS: CMTime?
     private var ackSent: Bool
@@ -690,8 +960,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
          displayID: CGDirectDisplayID,
          usesRawNV12: Bool,
          usesBC7Mode6: Bool,
+         usesBC7TileDelta: Bool,
          ackAlreadySent: Bool,
-         onFirstFrame: @escaping @Sendable () -> Void) {
+         onFirstFrame: @escaping @Sendable (Int, Int) -> Void) {
         self.preset = preset
         self.codecType = codecType
         self.connection = connection
@@ -699,6 +970,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
         self.usesBC7Mode6 = usesBC7Mode6
+        self.usesBC7TileDelta = usesBC7TileDelta
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
     }
@@ -711,6 +983,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
         queue.sync {
             if usesBC7Mode6 {
                 bc7Encoder = TBBC7Mode6Encoder()
+                if usesBC7TileDelta {
+                    bc7DeltaPlanner = TBBC7DeltaPlanner(
+                        keyframeIntervalFrames: preset.expectedFrameRate * 2
+                    )
+                }
                 running = bc7Encoder != nil
                 return running
             }
@@ -733,6 +1010,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
             if let encoder = vtEncoder { VTCompressionSessionInvalidate(encoder) }
             vtEncoder = nil
             bc7Encoder = nil
+            bc7DeltaPlanner = nil
             vtEncoderRef?.release()
             vtEncoderRef = nil
         }
@@ -755,13 +1033,24 @@ private final class TBVideoPipeline: @unchecked Sendable {
         return _sentBytes
     }
 
-    func diagnosticsSnapshot() -> (pending: Int, inFlight: Int, dropped: Int, ptsSeq: CMTimeValue) {
+    func diagnosticsSnapshot() -> (
+        pending: Int,
+        inFlight: Int,
+        dropped: Int,
+        ptsSeq: CMTimeValue,
+        bc7Keyframes: Int,
+        bc7DeltaFrames: Int,
+        bc7DirtyTiles: Int
+    ) {
         queue.sync {
             (
                 pending: pendingVideoPackets,
                 inFlight: inFlightEncodeFrames,
                 dropped: droppedVideoFrames,
-                ptsSeq: displayStreamFrameSequence
+                ptsSeq: displayStreamFrameSequence,
+                bc7Keyframes: bc7Keyframes,
+                bc7DeltaFrames: bc7DeltaFrames,
+                bc7DirtyTiles: bc7DirtyTiles
             )
         }
     }
@@ -927,7 +1216,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private func handleEncoded(_ sampleBuffer: CMSampleBuffer) {
         guard running else { return }
 
-        notifyFirstFrameIfNeeded()
+        let dimensions = CMSampleBufferGetFormatDescription(sampleBuffer)
+            .map(CMVideoFormatDescriptionGetDimensions)
+        notifyFirstFrameIfNeeded(
+            width: Int(dimensions?.width ?? 0),
+            height: Int(dimensions?.height ?? 0)
+        )
 
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
         let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
@@ -956,7 +1250,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
     }
 
-    private func notifyFirstFrameIfNeeded() {
+    private func notifyFirstFrameIfNeeded(width: Int, height: Int) {
         if !ackSent {
             ackSent = true
             let ack = TBMonitorCreateSessionAck(
@@ -970,7 +1264,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
         if !firstFrameNotified {
             firstFrameNotified = true
-            onFirstFrame()
+            onFirstFrame(width, height)
         }
     }
 
@@ -1004,7 +1298,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let uvSize = uvStride * uvHeight
 
         // Send the session ack on the first frame, mirroring the encoded path.
-        notifyFirstFrameIfNeeded()
+        notifyFirstFrameIfNeeded(width: width, height: height)
 
         var payload = Data(capacity: 17 + ySize + uvSize)
         payload.append(1) // format: NV12
@@ -1041,27 +1335,78 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
-        notifyFirstFrameIfNeeded()
+        notifyFirstFrameIfNeeded(width: width, height: height)
 
-        var payload = Data(capacity: 13 + encoded.data.count)
-        payload.append(1)
-        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
-        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
-        TBMonitorProtocol.appendBE32(&payload, UInt32(encoded.bytesPerRow))
-        payload.append(encoded.data)
-
-        let packet = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+        let packet: Data
+        if let planner = bc7DeltaPlanner,
+           let plan = planner.plan(
+               current: encoded.data,
+               width: width,
+               height: height,
+               bytesPerRow: encoded.bytesPerRow
+           ) {
+            switch plan {
+            case let .keyframe(sequence, checksum, data):
+                bc7Keyframes += 1
+                var payload = Data(capacity: 29 + data.count)
+                payload.append(2)
+                TBMonitorProtocol.appendBE64(&payload, sequence)
+                TBMonitorProtocol.appendBE64(&payload, checksum)
+                TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(encoded.bytesPerRow))
+                payload.append(data)
+                packet = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+            case let .delta(sequence, baseSequence, checksum, runs, dirtyTiles, _):
+                bc7DeltaFrames += 1
+                bc7DirtyTiles += dirtyTiles
+                var payload = Data()
+                payload.append(1)
+                TBMonitorProtocol.appendBE64(&payload, sequence)
+                TBMonitorProtocol.appendBE64(&payload, baseSequence)
+                TBMonitorProtocol.appendBE64(&payload, checksum)
+                TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+                TBMonitorProtocol.appendBE16(&payload, UInt16(TBBC7DeltaPlanner.tileSize))
+                TBMonitorProtocol.appendBE16(&payload, UInt16(runs.count))
+                for run in runs {
+                    TBMonitorProtocol.appendBE16(&payload, UInt16(run.tileX))
+                    TBMonitorProtocol.appendBE16(&payload, UInt16(run.tileY))
+                    TBMonitorProtocol.appendBE16(&payload, UInt16(run.tileCountX))
+                    TBMonitorProtocol.appendBE16(&payload, UInt16(run.pixelHeight))
+                    TBMonitorProtocol.appendBE32(&payload, UInt32(run.data.count))
+                    payload.append(run.data)
+                }
+                packet = TBMonitorProtocol.makePacket(type: .bc7TileDelta, payload: payload)
+            }
+        } else {
+            bc7Keyframes += 1
+            var payload = Data(capacity: 13 + encoded.data.count)
+            payload.append(1)
+            TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(encoded.bytesPerRow))
+            payload.append(encoded.data)
+            packet = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+        }
         pendingVideoPackets += 1
         connection.send(content: packet, completion: .contentProcessed({ [weak self] error in
             guard let self else { return }
             self.queue.async {
                 self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
                 if let error {
+                    self.bc7DeltaPlanner?.markSendFailure()
                     TBLog.connection.error("BC7 frame send failed: \(error.localizedDescription, privacy: .public)")
                 }
             }
         }))
         lock.lock(); _sentFrames += 1; _sentBytes += packet.count; lock.unlock()
+    }
+
+    func requestBC7Keyframe() {
+        queue.async { [weak self] in
+            self?.bc7DeltaPlanner?.markSendFailure()
+        }
     }
 
     private func buildParamSetsPacket(from format: CMVideoFormatDescription, codecType: CMVideoCodecType) -> Data? {
@@ -1300,6 +1645,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsHEVCDecodeHint = nil
                 receiverSupportsRawNV12Hint = nil
                 receiverSupportsBC7Mode6Hint = nil
+                receiverSupportsBC7TileDeltaHint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
             }
@@ -1315,6 +1661,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsHEVCDecodeHint = nil
                 receiverSupportsRawNV12Hint = nil
                 receiverSupportsBC7Mode6Hint = nil
+                receiverSupportsBC7TileDeltaHint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
             }
@@ -1366,6 +1713,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var receiverSupportsHEVCDecodeHint: Bool?
     var receiverSupportsRawNV12Hint: Bool?
     var receiverSupportsBC7Mode6Hint: Bool?
+    var receiverSupportsBC7TileDeltaHint: Bool?
     var receiverInputMonitoringTrustedHint: Bool?
     var receiverAccessibilityTrustedHint: Bool?
     @Published var senderFPS = 0
@@ -1806,9 +2154,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         videoTransportMode = .bc7Mode6
-        capturePreset = .standard1440p
+        if capturePreset == .native5k || capturePreset == .native5k60Experimental {
+            captureSource = .extendedDesktop
+            matchRenderToStream = true
+        }
         bc7TestStatusText = receiverSupportsBC7Mode6Hint == true
-            ? "Starting 1440p BC7 end-to-end test."
+            ? "Starting \(capturePreset.description) BC7 end-to-end test."
             : "Connecting to verify Receiver BC7 capability."
         connect()
     }
@@ -2200,6 +2551,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 let height = TBMonitorProtocol.readBE32(payload, offset: 8)
                 bc7RenderConfirmed = true
                 bc7TestStatusText = "BC7 end-to-end test passed: Receiver rendered \(width)×\(height)."
+            case .bc7KeyframeRequest:
+                guard payload.count == 4 else { break }
+                let generation = TBMonitorProtocol.readBE32(payload, offset: 0)
+                guard generation == bc7RenderGeneration else { break }
+                pipeline?.requestBC7Keyframe()
             case .inputEvent:
                 if inputControlRole == .receiverMaster,
                    let event = TBMonitorProtocol.decodeJSON(TBMonitorInputEvent.self, from: payload) {
@@ -2589,6 +2945,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
         receiverSupportsRawNV12Hint = profile.supportsRawNV12
         receiverSupportsBC7Mode6Hint = profile.supportsBC7Mode6
+        receiverSupportsBC7TileDeltaHint = profile.supportsBC7TileDelta
         if let inputMonitoringTrusted = profile.inputMonitoringTrusted {
             receiverInputMonitoringTrustedHint = inputMonitoringTrusted
         }
@@ -2720,9 +3077,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 displayID: session.displayID,
                 usesRawNV12: usesRawNV12,
                 usesBC7Mode6: usesBC7Mode6,
+                usesBC7TileDelta: usesBC7Mode6 && profile.supportsBC7TileDelta == true,
                 ackAlreadySent: sessionAckSent,
-                onFirstFrame: { [weak self] in
-                    Task { @MainActor in self?.handleFirstEncodedFrame(generation: generation) }
+                onFirstFrame: { [weak self] width, height in
+                    Task { @MainActor in
+                        self?.handleFirstEncodedFrame(
+                            generation: generation,
+                            width: width,
+                            height: height
+                        )
+                    }
                 }
             )
             if usesBC7Mode6 {
@@ -2767,6 +3131,24 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 } else {
                     display = try await waitForCaptureDisplay()
                 }
+            }
+            if preset == .native5k || preset == .native5k60Experimental {
+                guard let sourceMode = CGDisplayCopyDisplayMode(display.displayID),
+                      tbSourceFramebufferSupportsNativeCapture(
+                          preset: preset,
+                          pixelWidth: sourceMode.pixelWidth,
+                          pixelHeight: sourceMode.pixelHeight
+                      ) else {
+                    let sourceMode = CGDisplayCopyDisplayMode(display.displayID)
+                    let sourceWidth = sourceMode?.pixelWidth ?? 0
+                    let sourceHeight = sourceMode?.pixelHeight ?? 0
+                    bc7TestStatusText =
+                        "5K validation failed: source framebuffer is \(sourceWidth)×\(sourceHeight), not native 5120×2880."
+                    setStatus(.captureError(bc7TestStatusText))
+                    return false
+                }
+                bc7TestStatusText =
+                    "Native 5K source verified: \(sourceMode.pixelWidth)×\(sourceMode.pixelHeight); waiting for Receiver render confirmation."
             }
 
             let configuration = SCStreamConfiguration()
@@ -3410,9 +3792,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         guard verboseDisplayLogging else { return }
         let online = onlineDisplayIDs()
         let virtualOnline = online.contains(session.displayID)
-        let diag = pipeline?.diagnosticsSnapshot() ?? (pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0)
+        let diag = pipeline?.diagnosticsSnapshot() ?? (
+            pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
+            bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0
+        )
         NSLog(
-            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d dropped=%d ptsSeq=%lld",
+            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d dropped=%d ptsSeq=%lld bc7Keyframes=%d bc7Deltas=%d bc7DirtyTiles=%d",
             isStreaming ? "yes" : "no",
             liveMetrics.senderFPS,
             session.displayID,
@@ -3420,7 +3805,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             diag.pending,
             diag.inFlight,
             diag.dropped,
-            diag.ptsSeq
+            diag.ptsSeq,
+            diag.bc7Keyframes,
+            diag.bc7DeltaFrames,
+            diag.bc7DirtyTiles
         )
     }
 
@@ -3504,14 +3892,22 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
 
-    private func handleFirstEncodedFrame(generation: UInt64) {
+    private func handleFirstEncodedFrame(generation: UInt64, width: Int, height: Int) {
         guard generation == captureGeneration else { return }
         sessionAckSent = true
         pipelineHasFirstFrame = true
         firstFrameTimer?.invalidate()
         firstFrameTimer = nil
         TBLog.connection.info("capture: first encoded frame received")
-        actualStreamText = streamResolutionText
+        actualStreamText = "\(width) × \(height) · \(activeCodecName ?? capturePreset.codecName)"
+        if capturePreset == .native5k || capturePreset == .native5k60Experimental,
+           (width != capturePreset.width || height != capturePreset.height) {
+            let message =
+                "5K validation failed: captured frame is \(width)×\(height), expected \(capturePreset.width)×\(capturePreset.height)."
+            bc7TestStatusText = message
+            stop(resetStatusTo: .captureError(message))
+            return
+        }
         setStatus(.captureActive(capturePreset.description, activeCodecName ?? capturePreset.codecName, captureSource))
     }
 
@@ -3526,16 +3922,22 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 let fps = total - sentSnapshot
                 let totalBytes = pipeline?.sentBytesSnapshot ?? 0
                 let bytesPerSecond = max(0, totalBytes - sentBytesSnapshot)
-                let diagnostics = pipeline?.diagnosticsSnapshot() ?? (pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0)
+                let diagnostics = pipeline?.diagnosticsSnapshot() ?? (
+                    pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
+                    bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0
+                )
                 liveMetrics.senderFPS = fps
                 senderFPS = fps
                 sentSnapshot = total
                 sentBytesSnapshot = totalBytes
                 transportDiagnosticsText = String(
-                    format: "pending=%d · in-flight=%d · dropped=%d · %.2f Gbit/s",
+                    format: "pending=%d · in-flight=%d · dropped=%d · key=%d · delta=%d · dirty=%d · %.2f Gbit/s",
                     diagnostics.pending,
                     diagnostics.inFlight,
                     diagnostics.dropped,
+                    diagnostics.bc7Keyframes,
+                    diagnostics.bc7DeltaFrames,
+                    diagnostics.bc7DirtyTiles,
                     Double(bytesPerSecond) * 8.0 / 1_000_000_000.0
                 )
             }

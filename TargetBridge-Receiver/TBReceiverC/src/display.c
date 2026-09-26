@@ -1170,6 +1170,42 @@ int tb_disp_render_bc7(struct tb_display *d,
     );
 }
 
+int tb_disp_upload_bc7(struct tb_display *d,
+                       const uint8_t *blocks,
+                       size_t length,
+                       uint32_t width,
+                       uint32_t height,
+                       uint32_t bytes_per_row) {
+    if (!d || !d->bc7) return -1;
+    tb_disp_set_connection_state(d, 1);
+    d->last_video_frame_time = SDL_GetTicks();
+    return tb_bc7_renderer_upload(d->bc7, blocks, length, width, height, bytes_per_row);
+}
+
+int tb_disp_upload_bc7_region(struct tb_display *d,
+                              const uint8_t *blocks,
+                              size_t length,
+                              uint32_t texture_width,
+                              uint32_t texture_height,
+                              uint32_t x,
+                              uint32_t y,
+                              uint32_t width,
+                              uint32_t height,
+                              uint32_t bytes_per_row) {
+    if (!d || !d->bc7) return -1;
+    tb_disp_set_connection_state(d, 1);
+    d->last_video_frame_time = SDL_GetTicks();
+    return tb_bc7_renderer_upload_region(
+        d->bc7, blocks, length, texture_width, texture_height,
+        x, y, width, height, bytes_per_row
+    );
+}
+
+int tb_disp_present_bc7(struct tb_display *d, int wait_for_completion) {
+    if (!d || !d->bc7) return -1;
+    return tb_bc7_renderer_present(d->bc7, wait_for_completion);
+}
+
 void tb_disp_set_cursor(struct tb_display *d,
                         int x, int y,
                         int source_w, int source_h,

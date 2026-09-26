@@ -12,6 +12,8 @@ enum TBMonitorPacketType: UInt8 {
     case bc7Frame = 0x24   // Full-frame BC7 Mode 6 blocks
     case bc7RenderAck = 0x25
     case bc7RenderAckRequest = 0x26
+    case bc7TileDelta = 0x27
+    case bc7KeyframeRequest = 0x28
     case heartbeat = 0x30
     case teardown = 0x31
     case cursor = 0x32
@@ -46,6 +48,7 @@ struct TBMonitorDisplayProfile: Codable {
     var supportsHEVCDecode: Bool?
     var supportsRawNV12: Bool?
     var supportsBC7Mode6: Bool?
+    var supportsBC7TileDelta: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
 }
@@ -196,9 +199,30 @@ enum TBMonitorProtocol {
         withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
     }
 
+    static func appendBE64(_ data: inout Data, _ value: UInt64) {
+        data.append(UInt8(truncatingIfNeeded: value >> 56))
+        data.append(UInt8(truncatingIfNeeded: value >> 48))
+        data.append(UInt8(truncatingIfNeeded: value >> 40))
+        data.append(UInt8(truncatingIfNeeded: value >> 32))
+        data.append(UInt8(truncatingIfNeeded: value >> 24))
+        data.append(UInt8(truncatingIfNeeded: value >> 16))
+        data.append(UInt8(truncatingIfNeeded: value >> 8))
+        data.append(UInt8(truncatingIfNeeded: value))
+    }
+
+    static func appendBE16(_ data: inout Data, _ value: UInt16) {
+        data.append(UInt8(truncatingIfNeeded: value >> 8))
+        data.append(UInt8(truncatingIfNeeded: value))
+    }
+
     static func readBE32(_ data: Data, offset: Int) -> UInt32 {
         data.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
             $0.load(as: UInt32.self).bigEndian
         }
+    }
+
+    static func readBE64(_ data: Data, offset: Int) -> UInt64 {
+        guard offset >= 0, data.count >= offset + 8 else { return 0 }
+        return data[offset..<(offset + 8)].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
     }
 }

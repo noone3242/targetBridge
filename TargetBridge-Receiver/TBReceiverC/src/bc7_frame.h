@@ -5,6 +5,9 @@
 #include <stdint.h>
 
 struct tb_bc7_frame {
+    uint8_t format;
+    uint64_t sequence;
+    uint64_t checksum;
     const uint8_t *blocks;
     size_t blocks_len;
     uint32_t width;
