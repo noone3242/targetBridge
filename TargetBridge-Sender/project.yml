@@ -42,11 +42,13 @@ targets:
         script: |
           set -euo pipefail
           STAMP="$(date +%Y%m%d%H%M%S)"
+          COMMIT="$(git -C "${SRCROOT}/.." rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
           cat > "${SRCROOT}/TBDisplaySender/TBDisplaySenderBuildInfo.swift" <<EOI
           enum TBDisplaySenderBuildInfo {
               static let marketingVersion = "3.3.0"
               static let buildNumber = "${STAMP}"
-              static let versionDisplay = "\\(marketingVersion) + build \\(buildNumber)"
+              static let gitCommit = "${COMMIT}"
+              static let versionDisplay = "\\(marketingVersion) + build \\(buildNumber) · commit \\(gitCommit)"
           }
           EOI
 
