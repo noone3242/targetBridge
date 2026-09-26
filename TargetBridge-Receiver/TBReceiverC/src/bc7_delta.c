@@ -97,6 +97,18 @@ int tb_bc7_delta_sequence_valid(uint64_t sequence,
            sequence == base_sequence + 1u;
 }
 
+int tb_bc7_delta_prefers_full_upload(const struct tb_bc7_delta_frame *frame,
+                                     size_t full_frame_length) {
+    if (!frame || full_frame_length == 0) return 0;
+    size_t changed_bytes = 0;
+    for (uint16_t index = 0; index < frame->run_count; index++) {
+        if (SIZE_MAX - changed_bytes < frame->runs[index].data_length) return 1;
+        changed_bytes += frame->runs[index].data_length;
+    }
+    return changed_bytes >= full_frame_length / 4 ||
+           (frame->run_count > 8 && changed_bytes >= full_frame_length / 16);
+}
+
 uint64_t tb_bc7_tile_checksum(const uint8_t *data,
                               uint32_t row_bytes,
                               uint32_t block_rows,

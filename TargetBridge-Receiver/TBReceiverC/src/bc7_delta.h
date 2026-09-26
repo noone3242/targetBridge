@@ -33,6 +33,8 @@ int tb_bc7_delta_parse(const uint8_t *payload,
 int tb_bc7_delta_sequence_valid(uint64_t sequence,
                                 uint64_t base_sequence,
                                 uint64_t applied_sequence);
+int tb_bc7_delta_prefers_full_upload(const struct tb_bc7_delta_frame *frame,
+                                     size_t full_frame_length);
 
 uint64_t tb_bc7_tile_checksum(const uint8_t *data,
                               uint32_t row_bytes,

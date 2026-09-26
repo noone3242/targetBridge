@@ -1,4 +1,5 @@
 import CoreVideo
+import ScreenCaptureKit
 import XCTest
 @testable import TargetBridge
 
@@ -199,6 +200,101 @@ final class TBMonitorProtocolTests: XCTestCase {
             return XCTFail("first fixture frame must be a keyframe")
         }
         XCTAssertEqual(checksum, 0x2DA5_3169_9A69_7325)
+    }
+
+    func testBC7DirtyRegionsAlignToTilesAndClampToFramebuffer() {
+        let plan = tbBC7DirtyRegionPlan(
+            dirtyRects: [
+                CGRect(x: 63, y: 65, width: 4, height: 2),
+                CGRect(x: -20, y: -10, width: 30, height: 20)
+            ],
+            width: 128,
+            height: 128
+        )
+
+        XCTAssertEqual(plan.tileIndices, Set([0, 2, 3]))
+        XCTAssertEqual(plan.regions, [
+            TBBC7DirtyRegionPlan.Region(blockX: 0, blockY: 16, blockWidth: 32, blockHeight: 16),
+            TBBC7DirtyRegionPlan.Region(blockX: 0, blockY: 0, blockWidth: 16, blockHeight: 16)
+        ])
+    }
+
+    func testBC7DirtyRectsStayInFramebufferPixelCoordinates() throws {
+        let dirtyRects = [CGRect(x: 64, y: 128, width: 200, height: 100)]
+        let validated = try XCTUnwrap(tbBC7PixelDirtyRects(
+            dirtyRects: dirtyRects,
+            outputWidth: 5120,
+            outputHeight: 2880
+        ))
+        XCTAssertEqual(validated, dirtyRects)
+
+        XCTAssertEqual(tbBC7PixelDirtyRects(
+            dirtyRects: [CGRect(x: 5000, y: 0, width: 200, height: 10)],
+            outputWidth: 5120,
+            outputHeight: 2880
+        ), [CGRect(x: 5000, y: 0, width: 120, height: 10)])
+    }
+
+    func testBC7DirtyRectAttachmentDictionariesDecode() throws {
+        let contentRect = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+        let dirtyRect = CGRect(x: 64, y: 128, width: 200, height: 100)
+        let frame: [SCStreamFrameInfo: Any] = [
+            .contentRect: try XCTUnwrap(contentRect.dictionaryRepresentation),
+            .contentScale: NSNumber(value: 2.0),
+            .dirtyRects: [try XCTUnwrap(dirtyRect.dictionaryRepresentation)]
+        ]
+
+        XCTAssertEqual(
+            tbBC7DirtyRects(from: frame, outputWidth: 5120, outputHeight: 2880),
+            [dirtyRect]
+        )
+    }
+
+    func testBC7DeltaPlannerOnlyScansCandidateDirtyTiles() throws {
+        let width = 128
+        let height = 64
+        let bytesPerRow = 512
+        let planner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        let initial = Data(repeating: 0, count: bytesPerRow * (height / 4))
+        _ = planner.plan(
+            current: initial,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow
+        )
+
+        var next = initial
+        next[0] = 1
+        next[256] = 2
+        guard case .delta(_, _, _, let runs, let dirtyTiles, _) = try XCTUnwrap(
+            planner.plan(
+                current: next,
+                width: width,
+                height: height,
+                bytesPerRow: bytesPerRow,
+                candidateDirtyTiles: [1]
+            )
+        ) else {
+            return XCTFail("candidate-limited update must remain a delta")
+        }
+
+        XCTAssertEqual(dirtyTiles, 1)
+        XCTAssertEqual(runs.count, 1)
+        XCTAssertEqual(runs[0].tileX, 1)
+    }
+
+    func testBC7RecoveryRequiresAFullFrame() throws {
+        let planner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        XCTAssertTrue(planner.requiresFullFrame)
+        _ = planner.plan(
+            current: Data(repeating: 0, count: 4096),
+            width: 64,
+            height: 64,
+            bytesPerRow: 256
+        )
+        XCTAssertFalse(planner.requiresFullFrame)
+        planner.markSendFailure()
+        XCTAssertTrue(planner.requiresFullFrame)
     }
 
     func testBC7DeltaPlannerPeriodicAndRunCountKeyframes() throws {
@@ -427,6 +523,31 @@ final class TBMonitorProtocolTests: XCTestCase {
         }
     }
 
+    func testMetalBC7Mode6EncoderUpdatesOnlyDirtyTiles() throws {
+        let width = 128
+        let height = 64
+        let initial = try makeBGRAPixelBuffer(width: width, height: height) { _, _ in
+            (0, 0, 0, 255)
+        }
+        let updated = try makeBGRAPixelBuffer(width: width, height: height) { x, y in
+            if x < 4 && y < 4 {
+                return (0, 0, 255, 255)
+            }
+            return x < 64 ? (0, 0, 0, 255) : (255, 255, 255, 255)
+        }
+        let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+        let first = try XCTUnwrap(encoder.encode(pixelBuffer: initial))
+        let second = try XCTUnwrap(encoder.encode(
+            pixelBuffer: updated,
+            dirtyRects: [CGRect(x: 64, y: 0, width: 64, height: 64)]
+        ))
+
+        XCTAssertEqual(second.candidateDirtyTiles, Set([1]))
+        XCTAssertEqual(first.data.subdata(in: 0..<16), second.data.subdata(in: 0..<16))
+        XCTAssertNotEqual(first.data.subdata(in: 256..<272), second.data.subdata(in: 256..<272))
+        XCTAssertNil(encoder.encode(pixelBuffer: updated, dirtyRects: []))
+    }
+
     func testMetalBC7Mode6EncoderRejectsUnsupportedPixelBuffers() throws {
         let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
         let unaligned = try makeBGRAPixelBuffer(width: 5, height: 4) { _, _ in
@@ -461,25 +582,33 @@ final class TBMonitorProtocolTests: XCTestCase {
             return (value, value, value, 255)
         }
         let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
-        _ = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+        let initial = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+        XCTAssertEqual(initial.data.count, 14_745_600)
 
-        let iterations = 10
-        let start = DispatchTime.now().uptimeNanoseconds
-        var encodedBytes = 0
-        for _ in 0..<iterations {
-            encodedBytes += try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer)).data.count
+        let fullFrameIterations = 3
+        let fullFrameStart = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<fullFrameIterations {
+            _ = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
         }
-        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000
-        let averageMilliseconds = elapsedSeconds * 1_000 / Double(iterations)
-        let effectiveGigabitsPerSecond = Double(encodedBytes * 8) / elapsedSeconds / 1_000_000_000
+        let fullFrameSeconds =
+            Double(DispatchTime.now().uptimeNanoseconds - fullFrameStart) / 1_000_000_000
+
+        let dirtyIterations = 30
+        let dirtyStart = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<dirtyIterations {
+            _ = try XCTUnwrap(encoder.encode(
+                pixelBuffer: pixelBuffer,
+                dirtyRects: [CGRect(x: 0, y: 0, width: 64, height: 64)]
+            ))
+        }
+        let dirtySeconds = Double(DispatchTime.now().uptimeNanoseconds - dirtyStart) / 1_000_000_000
         print(
             String(
-                format: "BC7 5K benchmark: %.3f ms/frame, %.3f Gbit/s encoded output",
-                averageMilliseconds,
-                effectiveGigabitsPerSecond
+                format: "BC7 5K benchmark: full %.3f ms/frame, one-tile %.3f ms/frame",
+                fullFrameSeconds * 1_000 / Double(fullFrameIterations),
+                dirtySeconds * 1_000 / Double(dirtyIterations)
             )
         )
-        XCTAssertEqual(encodedBytes, 14_745_600 * iterations)
     }
 
     private func makeBGRAPixelBuffer(

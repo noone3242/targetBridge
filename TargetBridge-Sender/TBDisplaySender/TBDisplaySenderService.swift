@@ -450,6 +450,116 @@ private final class TBDirectDisplayStreamCapture {
 /// state is confined to `queue`; the two values the main thread polls
 /// (`sentFrames`, `lastCaptureFrameAt`) are guarded by a small lock instead of
 /// a per-frame hop back to main.
+struct TBBC7DirtyRegionPlan: Equatable {
+    struct Region: Equatable {
+        let blockX: Int
+        let blockY: Int
+        let blockWidth: Int
+        let blockHeight: Int
+    }
+
+    let regions: [Region]
+    let tileIndices: Set<Int>
+}
+
+func tbBC7DirtyRegionPlan(
+    dirtyRects: [CGRect],
+    width: Int,
+    height: Int,
+    tileSize: Int = TBBC7DeltaPlanner.tileSize
+) -> TBBC7DirtyRegionPlan {
+    guard width > 0, height > 0, tileSize > 0 else {
+        return TBBC7DirtyRegionPlan(regions: [], tileIndices: [])
+    }
+
+    let tilesWide = (width + tileSize - 1) / tileSize
+    let tilesHigh = (height + tileSize - 1) / tileSize
+    var regions: [TBBC7DirtyRegionPlan.Region] = []
+    var tileIndices = Set<Int>()
+
+    for rect in dirtyRects where !rect.isNull && !rect.isEmpty {
+        let minX = max(0, min(width, Int(floor(rect.minX))))
+        let minY = max(0, min(height, Int(floor(rect.minY))))
+        let maxX = max(0, min(width, Int(ceil(rect.maxX))))
+        let maxY = max(0, min(height, Int(ceil(rect.maxY))))
+        guard minX < maxX, minY < maxY else { continue }
+
+        let firstTileX = minX / tileSize
+        let firstTileY = minY / tileSize
+        let lastTileX = min(tilesWide, (maxX + tileSize - 1) / tileSize)
+        let lastTileY = min(tilesHigh, (maxY + tileSize - 1) / tileSize)
+        guard firstTileX < lastTileX, firstTileY < lastTileY else { continue }
+
+        for tileY in firstTileY..<lastTileY {
+            for tileX in firstTileX..<lastTileX {
+                tileIndices.insert(tileY * tilesWide + tileX)
+            }
+        }
+
+        let pixelX = firstTileX * tileSize
+        let pixelY = firstTileY * tileSize
+        let pixelMaxX = min(width, lastTileX * tileSize)
+        let pixelMaxY = min(height, lastTileY * tileSize)
+        regions.append(TBBC7DirtyRegionPlan.Region(
+            blockX: pixelX / 4,
+            blockY: pixelY / 4,
+            blockWidth: (pixelMaxX - pixelX) / 4,
+            blockHeight: (pixelMaxY - pixelY) / 4
+        ))
+    }
+
+    return TBBC7DirtyRegionPlan(regions: regions, tileIndices: tileIndices)
+}
+
+func tbBC7PixelDirtyRects(
+    dirtyRects: [CGRect],
+    outputWidth: Int,
+    outputHeight: Int
+) -> [CGRect]? {
+    let framebuffer = CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
+    var result: [CGRect] = []
+    result.reserveCapacity(dirtyRects.count)
+    for rect in dirtyRects {
+        guard !rect.isNull else { return nil }
+        let clipped = rect.intersection(framebuffer)
+        if !clipped.isNull && !clipped.isEmpty {
+            result.append(clipped)
+        }
+    }
+    return result
+}
+
+func tbCGRect(from value: Any?) -> CGRect? {
+    if let rect = value as? CGRect {
+        return rect
+    }
+    if let value = value as? NSValue {
+        return value.rectValue
+    }
+    if let dictionary = value as? NSDictionary {
+        return CGRect(dictionaryRepresentation: dictionary)
+    }
+    return nil
+}
+
+func tbBC7DirtyRects(
+    from frame: [SCStreamFrameInfo: Any],
+    outputWidth: Int,
+    outputHeight: Int
+) -> [CGRect]? {
+    guard let rawRects = frame[.dirtyRects] as? [Any]
+    else {
+        return nil
+    }
+    let dirtyRects = rawRects.compactMap(tbCGRect(from:))
+    guard dirtyRects.count == rawRects.count else { return nil }
+    return tbBC7PixelDirtyRects(
+        dirtyRects: dirtyRects,
+        outputWidth: outputWidth,
+        outputHeight: outputHeight
+    )
+}
+
 final class TBBC7Mode6Encoder {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -457,6 +567,9 @@ final class TBBC7Mode6Encoder {
     private var textureCache: CVMetalTextureCache?
     private var outputBuffer: MTLBuffer?
     private var outputBufferLength = 0
+    private var hasCompleteFrame = false
+    private var outputWidth = 0
+    private var outputHeight = 0
 
     private static let source = """
     #include <metal_stdlib>
@@ -521,8 +634,10 @@ final class TBBC7Mode6Encoder {
         texture2d<float, access::read> source [[texture(0)]],
         device uint4 *blocks [[buffer(0)]],
         constant uint2 &image_size [[buffer(1)]],
-        uint2 block_position [[thread_position_in_grid]]
+        constant uint2 &block_origin [[buffer(2)]],
+        uint2 thread_position [[thread_position_in_grid]]
     ) {
+        uint2 block_position = thread_position + block_origin;
         uint blocks_wide = (image_size.x + 3u) / 4u;
         uint blocks_high = (image_size.y + 3u) / 4u;
         if (block_position.x >= blocks_wide || block_position.y >= blocks_high) {
@@ -627,7 +742,11 @@ final class TBBC7Mode6Encoder {
         textureCache = cache
     }
 
-    func encode(pixelBuffer: CVPixelBuffer) -> (data: Data, bytesPerRow: Int)? {
+    func encode(pixelBuffer: CVPixelBuffer, dirtyRects: [CGRect]? = nil) -> (
+        data: Data,
+        bytesPerRow: Int,
+        candidateDirtyTiles: Set<Int>?
+    )? {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         guard width > 0, height > 0, width % 4 == 0, height % 4 == 0,
@@ -659,9 +778,21 @@ final class TBBC7Mode6Encoder {
         let blocksHigh = height / 4
         let bytesPerRow = blocksWide * 16
         let requiredLength = bytesPerRow * blocksHigh
-        if outputBuffer == nil || outputBufferLength != requiredLength {
+        if outputBuffer == nil || outputBufferLength != requiredLength ||
+            outputWidth != width || outputHeight != height {
             outputBuffer = device.makeBuffer(length: requiredLength, options: .storageModeShared)
             outputBufferLength = requiredLength
+            outputWidth = width
+            outputHeight = height
+            hasCompleteFrame = false
+        }
+        let dirtyPlan = hasCompleteFrame
+            ? dirtyRects.map {
+                tbBC7DirtyRegionPlan(dirtyRects: $0, width: width, height: height)
+            }
+            : nil
+        if let dirtyPlan, dirtyPlan.regions.isEmpty {
+            return nil
         }
         guard let outputBuffer,
               let commandBuffer = commandQueue.makeCommandBuffer(),
@@ -671,15 +802,27 @@ final class TBBC7Mode6Encoder {
         }
 
         var imageSize = SIMD2<UInt32>(UInt32(width), UInt32(height))
+        let regions = dirtyPlan?.regions ?? [
+            TBBC7DirtyRegionPlan.Region(
+                blockX: 0,
+                blockY: 0,
+                blockWidth: blocksWide,
+                blockHeight: blocksHigh
+            )
+        ]
         encoder.setComputePipelineState(pipeline)
         encoder.setTexture(sourceTexture, index: 0)
         encoder.setBuffer(outputBuffer, offset: 0, index: 0)
         encoder.setBytes(&imageSize, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 1)
         let threadsPerGroup = MTLSize(width: 8, height: 8, depth: 1)
-        encoder.dispatchThreads(
-            MTLSize(width: blocksWide, height: blocksHigh, depth: 1),
-            threadsPerThreadgroup: threadsPerGroup
-        )
+        for region in regions {
+            var blockOrigin = SIMD2<UInt32>(UInt32(region.blockX), UInt32(region.blockY))
+            encoder.setBytes(&blockOrigin, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 2)
+            encoder.dispatchThreads(
+                MTLSize(width: region.blockWidth, height: region.blockHeight, depth: 1),
+                threadsPerThreadgroup: threadsPerGroup
+            )
+        }
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -689,8 +832,13 @@ final class TBBC7Mode6Encoder {
             }
             return nil
         }
+        hasCompleteFrame = true
 
-        return (Data(bytes: outputBuffer.contents(), count: requiredLength), bytesPerRow)
+        return (
+            Data(bytes: outputBuffer.contents(), count: requiredLength),
+            bytesPerRow,
+            dirtyPlan?.tileIndices
+        )
     }
 }
 
@@ -722,6 +870,10 @@ final class TBBC7DeltaPlanner {
         self.keyframeIntervalFrames = max(1, keyframeIntervalFrames)
     }
 
+    var requiresFullFrame: Bool {
+        forceKeyframe || baseline == nil || framesSinceKeyframe >= keyframeIntervalFrames
+    }
+
     func reset() {
         baseline = nil
         tileChecksums = []
@@ -734,7 +886,13 @@ final class TBBC7DeltaPlanner {
         forceKeyframe = true
     }
 
-    func plan(current: Data, width: Int, height: Int, bytesPerRow: Int) -> TBBC7DeltaPlan? {
+    func plan(
+        current: Data,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        candidateDirtyTiles: Set<Int>? = nil
+    ) -> TBBC7DeltaPlan? {
         guard width > 0, height > 0, width % Self.tileSize == 0, height % 4 == 0,
               bytesPerRow == (width / 4) * 16,
               current.count == bytesPerRow * (height / 4)
@@ -776,26 +934,27 @@ final class TBBC7DeltaPlanner {
             baseline.withUnsafeBytes { baselineBytes in
                 guard let currentBase = currentBytes.baseAddress,
                       let baselineBase = baselineBytes.baseAddress else { return }
-                for tileY in 0..<tilesHigh {
+                let candidates = candidateDirtyTiles ?? Set(0..<totalTiles)
+                for tileIndex in candidates where tileIndex >= 0 && tileIndex < totalTiles {
+                    let tileY = tileIndex / tilesWide
+                    let tileX = tileIndex % tilesWide
                     let pixelHeight = min(Self.tileSize, height - tileY * Self.tileSize)
                     let blockRows = pixelHeight / 4
-                    for tileX in 0..<tilesWide {
-                        let tileByteOffset = tileX * (Self.tileSize / 4) * 16
-                        let tileRowBytes = (Self.tileSize / 4) * 16
-                        var differs = false
-                        for blockRow in 0..<blockRows {
-                            let offset = (tileY * (Self.tileSize / 4) + blockRow) * bytesPerRow + tileByteOffset
-                            if memcmp(
-                                currentBase.advanced(by: offset),
-                                baselineBase.advanced(by: offset),
-                                tileRowBytes
-                            ) != 0 {
-                                differs = true
-                                break
-                            }
+                    let tileByteOffset = tileX * (Self.tileSize / 4) * 16
+                    let tileRowBytes = (Self.tileSize / 4) * 16
+                    var differs = false
+                    for blockRow in 0..<blockRows {
+                        let offset = (tileY * (Self.tileSize / 4) + blockRow) * bytesPerRow + tileByteOffset
+                        if memcmp(
+                            currentBase.advanced(by: offset),
+                            baselineBase.advanced(by: offset),
+                            tileRowBytes
+                        ) != 0 {
+                            differs = true
+                            break
                         }
-                        dirty[tileY * tilesWide + tileX] = differs
                     }
+                    dirty[tileIndex] = differs
                 }
             }
         }
@@ -972,6 +1131,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var bc7Keyframes = 0
     private var bc7DeltaFrames = 0
     private var bc7DirtyTiles = 0
+    private var bc7FullEncodeFallbacks = 0
     private var displayStreamFrameSequence: CMTimeValue = 0
     private var lastEncodedDisplayPTS: CMTime?
     private var ackSent: Bool
@@ -1016,7 +1176,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 bc7Encoder = TBBC7Mode6Encoder()
                 if usesBC7TileDelta {
                     bc7DeltaPlanner = TBBC7DeltaPlanner(
-                        keyframeIntervalFrames: preset.expectedFrameRate * 2
+                        keyframeIntervalFrames: preset.expectedFrameRate * 30
                     )
                 }
                 running = bc7Encoder != nil
@@ -1071,7 +1231,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
         ptsSeq: CMTimeValue,
         bc7Keyframes: Int,
         bc7DeltaFrames: Int,
-        bc7DirtyTiles: Int
+        bc7DirtyTiles: Int,
+        bc7FullEncodeFallbacks: Int
     ) {
         queue.sync {
             (
@@ -1081,7 +1242,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 ptsSeq: displayStreamFrameSequence,
                 bc7Keyframes: bc7Keyframes,
                 bc7DeltaFrames: bc7DeltaFrames,
-                bc7DirtyTiles: bc7DirtyTiles
+                bc7DirtyTiles: bc7DirtyTiles,
+                bc7FullEncodeFallbacks: bc7FullEncodeFallbacks
             )
         }
     }
@@ -1357,8 +1519,25 @@ private final class TBVideoPipeline: @unchecked Sendable {
             droppedVideoFrames += 1
             return
         }
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let encoded = bc7Encoder?.encode(pixelBuffer: pixelBuffer)
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+        let requiresFullFrame = bc7DeltaPlanner?.requiresFullFrame != false
+        let dirtyRects = usesBC7TileDelta && !requiresFullFrame
+            ? Self.dirtyRects(
+                from: sampleBuffer,
+                pixelWidth: CVPixelBufferGetWidth(pixelBuffer),
+                pixelHeight: CVPixelBufferGetHeight(pixelBuffer)
+            )
+            : nil
+        if usesBC7TileDelta && !requiresFullFrame && dirtyRects == nil {
+            bc7FullEncodeFallbacks += 1
+        }
+        guard
+              let encoded = bc7Encoder?.encode(
+                  pixelBuffer: pixelBuffer,
+                  dirtyRects: dirtyRects
+              )
         else {
             return
         }
@@ -1374,7 +1553,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                current: encoded.data,
                width: width,
                height: height,
-               bytesPerRow: encoded.bytesPerRow
+               bytesPerRow: encoded.bytesPerRow,
+               candidateDirtyTiles: encoded.candidateDirtyTiles
            ) {
             switch plan {
             case let .keyframe(sequence, checksum, data):
@@ -1432,6 +1612,26 @@ private final class TBVideoPipeline: @unchecked Sendable {
             }
         }))
         lock.lock(); _sentFrames += 1; _sentBytes += packet.count; lock.unlock()
+    }
+
+    private static func dirtyRects(
+        from sampleBuffer: CMSampleBuffer,
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) -> [CGRect]? {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer,
+            createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]],
+        let frame = attachments.first
+        else {
+            return nil
+        }
+        return tbBC7DirtyRects(
+            from: frame,
+            outputWidth: pixelWidth,
+            outputHeight: pixelHeight
+        )
     }
 
     func requestBC7Keyframe() {
@@ -3892,10 +4092,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let virtualOnline = online.contains(session.displayID)
         let diag = pipeline?.diagnosticsSnapshot() ?? (
             pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
-            bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0
+            bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0,
+            bc7FullEncodeFallbacks: 0
         )
         NSLog(
-            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d dropped=%d ptsSeq=%lld bc7Keyframes=%d bc7Deltas=%d bc7DirtyTiles=%d",
+            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d dropped=%d ptsSeq=%lld bc7Keyframes=%d bc7Deltas=%d bc7DirtyTiles=%d bc7FullEncodeFallbacks=%d",
             isStreaming ? "yes" : "no",
             liveMetrics.senderFPS,
             session.displayID,
@@ -3906,7 +4107,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             diag.ptsSeq,
             diag.bc7Keyframes,
             diag.bc7DeltaFrames,
-            diag.bc7DirtyTiles
+            diag.bc7DirtyTiles,
+            diag.bc7FullEncodeFallbacks
         )
     }
 
@@ -4023,20 +4225,22 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 let bytesPerSecond = max(0, totalBytes - sentBytesSnapshot)
                 let diagnostics = pipeline?.diagnosticsSnapshot() ?? (
                     pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
-                    bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0
+                    bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0,
+                    bc7FullEncodeFallbacks: 0
                 )
                 liveMetrics.senderFPS = fps
                 senderFPS = fps
                 sentSnapshot = total
                 sentBytesSnapshot = totalBytes
                 transportDiagnosticsText = String(
-                    format: "pending=%d · in-flight=%d · dropped=%d · key=%d · delta=%d · dirty=%d · %.2f Gbit/s",
+                    format: "pending=%d · in-flight=%d · dropped=%d · key=%d · delta=%d · dirty=%d · fallback=%d · %.2f Gbit/s",
                     diagnostics.pending,
                     diagnostics.inFlight,
                     diagnostics.dropped,
                     diagnostics.bc7Keyframes,
                     diagnostics.bc7DeltaFrames,
                     diagnostics.bc7DirtyTiles,
+                    diagnostics.bc7FullEncodeFallbacks,
                     Double(bytesPerSecond) * 8.0 / 1_000_000_000.0
                 )
             }

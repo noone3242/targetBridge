@@ -1219,27 +1219,45 @@ static void handle_bc7_delta(struct app *a, const uint8_t *p, size_t len) {
                 return;
             }
 
-            for (uint16_t index = 0; index < frame.run_count; index++) {
-                const struct tb_bc7_delta_run *run = &frame.runs[index];
-                const uint32_t run_width = (uint32_t)run->tile_count_x * frame.tile_size;
-                const uint32_t run_row_bytes = (run_width / 4u) * 16u;
-                if (tb_disp_upload_bc7_region(
+            if (tb_bc7_delta_prefers_full_upload(&frame, a->bc7_shadow_len)) {
+                if (tb_disp_upload_bc7(
                         a->disp,
-                        run->data,
-                        run->data_length,
+                        candidate,
+                        a->bc7_shadow_len,
                         frame.width,
                         frame.height,
-                        (uint32_t)run->tile_x * frame.tile_size,
-                        (uint32_t)run->tile_y * frame.tile_size,
-                        run_width,
-                        run->pixel_height,
-                        run_row_bytes) != 0) {
+                        a->bc7_bytes_per_row) != 0) {
                     free(candidate);
                     free(candidate_checksums);
                     a->bc7_render_failures++;
                     reset_bc7_delta_state(a);
-                    request_bc7_keyframe(a, "delta-upload");
+                    request_bc7_keyframe(a, "delta-full-upload");
                     return;
+                }
+            } else {
+                for (uint16_t index = 0; index < frame.run_count; index++) {
+                    const struct tb_bc7_delta_run *run = &frame.runs[index];
+                    const uint32_t run_width =
+                        (uint32_t)run->tile_count_x * frame.tile_size;
+                    const uint32_t run_row_bytes = (run_width / 4u) * 16u;
+                    if (tb_disp_upload_bc7_region(
+                            a->disp,
+                            run->data,
+                            run->data_length,
+                            frame.width,
+                            frame.height,
+                            (uint32_t)run->tile_x * frame.tile_size,
+                            (uint32_t)run->tile_y * frame.tile_size,
+                            run_width,
+                            run->pixel_height,
+                            run_row_bytes) != 0) {
+                        free(candidate);
+                        free(candidate_checksums);
+                        a->bc7_render_failures++;
+                        reset_bc7_delta_state(a);
+                        request_bc7_keyframe(a, "delta-upload");
+                        return;
+                    }
                 }
             }
 

@@ -362,6 +362,23 @@ static void test_bc7_delta_validation(void) {
           "shadow contains the delta tile bytes");
     CHECK(applied_checksum == frame.checksum,
           "applied shadow checksum matches wire checksum");
+    CHECK(!tb_bc7_delta_prefers_full_upload(&frame, 32768),
+          "single small run keeps regional upload");
+    frame.run_count = 9;
+    for (uint16_t index = 1; index < frame.run_count; index++) {
+        frame.runs[index].data_length = 1;
+    }
+    CHECK(!tb_bc7_delta_prefers_full_upload(&frame, 1u << 20),
+          "many tiny runs stay as regional uploads");
+    for (uint16_t index = 0; index < frame.run_count; index++) {
+        frame.runs[index].data_length = 128;
+    }
+    CHECK(tb_bc7_delta_prefers_full_upload(&frame, 16384),
+          "many substantial runs collapse to one full texture upload");
+    frame.run_count = 1;
+    frame.runs[0].data_length = 4096;
+    CHECK(tb_bc7_delta_prefers_full_upload(&frame, 16384),
+          "large changed payload uses one full texture upload");
     memset(shadow, 0, sizeof(shadow));
     tile_checksums[0] = 0;
     frame.checksum ^= 1u;
