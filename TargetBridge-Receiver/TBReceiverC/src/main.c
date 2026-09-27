@@ -100,6 +100,10 @@ struct app {
     uint64_t bc7_keyframe_requests;
     uint64_t bc7_applied_sequence;
     uint64_t bc7_checksum;
+    uint8_t *raw_y_shadow;
+    uint8_t *raw_uv_shadow;
+    size_t raw_y_len, raw_uv_len;
+    uint32_t raw_width, raw_height, raw_y_stride, raw_uv_stride;
     uint64_t bc7_last_keyframe_request_ms;
     int bc7_keyframe_request_pending;
     uint8_t *bc7_shadow;
@@ -1012,6 +1016,38 @@ static void on_frame(const uint8_t *y, int y_stride,
  * Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
  *          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)] */
 static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
+    if (len >= 54 && p[0] == 3 && p[1] == 1 && a->raw_y_shadow) {
+        uint32_t v[11];
+        for (int i = 0; i < 11; i++) {
+            const uint8_t *q = p + 2 + i * 4;
+            v[i] = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) |
+                   ((uint32_t)q[2] << 8) | q[3];
+        }
+        uint64_t checksum =
+            ((uint64_t)p[46] << 56) | ((uint64_t)p[47] << 48) |
+            ((uint64_t)p[48] << 40) | ((uint64_t)p[49] << 32) |
+            ((uint64_t)p[50] << 24) | ((uint64_t)p[51] << 16) |
+            ((uint64_t)p[52] << 8) | p[53];
+        uint32_t w=v[0], h=v[1], ys=v[2], us=v[3], x=v[4], y=v[5],
+                 rw=v[6], rh=v[7], ylen=v[8], uvlen=v[9], clen=v[10];
+        if (w != a->raw_width || h != a->raw_height ||
+            ys != a->raw_y_stride || us != a->raw_uv_stride ||
+            !rw || !rh || ((x|y|rw|rh)&1u) || x+rw>w || y+rh>h ||
+            ylen != rw*rh || uvlen != rw*(rh/2) || clen != len-54) return;
+        size_t raw_len=(size_t)ylen+uvlen;
+        uint8_t *raw=malloc(raw_len); if(!raw)return;
+        size_t decoded=compression_decode_buffer(
+            raw,raw_len,p+54,clen,NULL,COMPRESSION_LZ4);
+        if(decoded!=raw_len ||
+           tb_bc7_supercompression_checksum(raw,raw_len)!=checksum){free(raw);return;}
+        for(uint32_t row=0;row<rh;row++)
+            memcpy(a->raw_y_shadow+(size_t)(y+row)*ys+x,raw+(size_t)row*rw,rw);
+        uint8_t *uv=raw+ylen;
+        for(uint32_t row=0;row<rh/2;row++)
+            memcpy(a->raw_uv_shadow+(size_t)(y/2+row)*us+x,uv+(size_t)row*rw,rw);
+        on_frame(a->raw_y_shadow,(int)ys,a->raw_uv_shadow,(int)us,(int)w,(int)h,a);
+        free(raw); return;
+    }
     if (len >= 38 && p[0] == 2) {
         if (p[1] != 1) return;
         uint32_t w = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
@@ -1053,6 +1089,16 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             free(raw);
             return;
         }
+        free(a->raw_y_shadow); free(a->raw_uv_shadow);
+        a->raw_y_shadow=malloc(y_size); a->raw_uv_shadow=malloc(uv_size);
+        if(!a->raw_y_shadow||!a->raw_uv_shadow){
+            free(a->raw_y_shadow); free(a->raw_uv_shadow);
+            a->raw_y_shadow=a->raw_uv_shadow=NULL; free(raw); return;
+        }
+        memcpy(a->raw_y_shadow,raw,y_size);
+        memcpy(a->raw_uv_shadow,raw+y_size,uv_size);
+        a->raw_y_len=y_size; a->raw_uv_len=uv_size;
+        a->raw_width=w; a->raw_height=h; a->raw_y_stride=ys; a->raw_uv_stride=us;
         on_frame(raw, (int)ys, raw + y_size, (int)us, (int)w, (int)h, a);
         free(raw);
         return;
@@ -1109,6 +1155,14 @@ static void reset_bc7_delta_state(struct app *a) {
     a->bc7_checksum = 0;
     a->bc7_present_pending = 0;
     a->bc7_present_retry_after_ms = 0;
+}
+
+static void reset_raw_state(struct app *a) {
+    free(a->raw_y_shadow); free(a->raw_uv_shadow);
+    a->raw_y_shadow = a->raw_uv_shadow = NULL;
+    a->raw_y_len = a->raw_uv_len = 0;
+    a->raw_width = a->raw_height = 0;
+    a->raw_y_stride = a->raw_uv_stride = 0;
 }
 
 static uint64_t checksum_bc7_tiles(const uint8_t *blocks,
@@ -1315,6 +1369,7 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         }
         metric_record(&a->bc7_upload_ns, now_ns() - upload_started);
         reset_bc7_delta_state(a);
+        reset_raw_state(a);
         a->bc7_shadow = shadow;
         a->bc7_tile_checksums = tile_checksums;
         a->bc7_candidate_tile_checksums = candidate_tile_checksums;
@@ -2422,6 +2477,7 @@ static void close_client(struct app *a) {
     a->bc7_last_keyframe_request_ms = 0;
     a->bc7_keyframe_request_pending = 0;
     reset_bc7_delta_state(a);
+    reset_raw_state(a);
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
     SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
@@ -2681,6 +2737,7 @@ int main(int argc, char **argv) {
                 a.bc7_last_keyframe_request_ms = 0;
                 a.bc7_keyframe_request_pending = 0;
                 reset_bc7_delta_state(&a);
+                reset_raw_state(&a);
                 a.frames = 0;
                 a.last_fps_count = 0;
                 a.last_presented_count = 0;

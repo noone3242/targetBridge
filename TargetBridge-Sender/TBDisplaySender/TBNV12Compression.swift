@@ -57,6 +57,57 @@ enum TBNV12Compression {
         return raw.count + 17 - packet.count >= 4 * 1024 ? packet : nil
     }
 
+    static func makeRegionPacket(
+        yBase: UnsafeRawPointer, uvBase: UnsafeRawPointer,
+        width: Int, height: Int, yStride: Int, uvStride: Int,
+        x: Int, y: Int, regionWidth: Int, regionHeight: Int
+    ) -> Data? {
+        guard x >= 0, y >= 0, regionWidth > 0, regionHeight > 0,
+              x % 2 == 0, y % 2 == 0, regionWidth % 2 == 0,
+              regionHeight % 2 == 0, x + regionWidth <= width,
+              y + regionHeight <= height else { return nil }
+        var raw = Data(capacity: regionWidth * regionHeight * 3 / 2)
+        for row in 0..<regionHeight {
+            raw.append(
+                yBase.advanced(by: (y + row) * yStride + x)
+                    .assumingMemoryBound(to: UInt8.self),
+                count: regionWidth
+            )
+        }
+        for row in 0..<(regionHeight / 2) {
+            raw.append(
+                uvBase.advanced(by: (y / 2 + row) * uvStride + x)
+                    .assumingMemoryBound(to: UInt8.self),
+                count: regionWidth
+            )
+        }
+        let capacity = raw.count + 64 * 1024
+        var compressed = Data(count: capacity)
+        let size = raw.withUnsafeBytes { src in
+            compressed.withUnsafeMutableBytes { dst in
+                guard let s = src.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let d = dst.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                else { return 0 }
+                return compression_encode_buffer(
+                    d, capacity, s, raw.count, nil, COMPRESSION_LZ4
+                )
+            }
+        }
+        guard size > 0 else { return nil }
+        compressed.count = size
+        var payload = Data(capacity: 54 + size)
+        payload.append(3); payload.append(1)
+        for value in [width, height, yStride, uvStride, x, y,
+                      regionWidth, regionHeight,
+                      regionWidth * regionHeight,
+                      regionWidth * regionHeight / 2, size] {
+            TBMonitorProtocol.appendBE32(&payload, UInt32(value))
+        }
+        TBMonitorProtocol.appendBE64(&payload, checksum(raw))
+        payload.append(compressed)
+        return TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+    }
+
     static func decodePacket(_ packet: Data) -> Decoded? {
         guard packet.count >= 43,
               packet[4] == TBMonitorPacketType.rawFrame.rawValue,

@@ -1753,6 +1753,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var ackSent: Bool
     private var firstFrameNotified = false
     private var running = false
+    private var rawNV12HasBaseline = false
     private let latestBC7Frame = TBLatestFrameSlot<TBCapturedFrame>()
 
     // Read from the main thread (fps timer / watchdog); guarded by `lock`.
@@ -1850,6 +1851,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     func stop() {
         queue.sync {
             running = false
+            rawNV12HasBaseline = false
             latestBC7Frame.cancel()
             if let encoder = vtEncoder { VTCompressionSessionInvalidate(encoder) }
             vtEncoder = nil
@@ -2280,19 +2282,40 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // Send the session ack on the first frame, mirroring the encoded path.
         notifyFirstFrameIfNeeded(width: width, height: height)
 
-        let y = Data(bytes: yBase, count: ySize)
-        let uv = Data(bytes: uvBase, count: uvSize)
         let packet: Data
-        if usesRawNV12LZ4, let compressed = TBNV12Compression.makePacket(
+        let dirtyRects = Self.dirtyRects(
+            from: sampleBuffer, pixelWidth: width, pixelHeight: height
+        )
+        if usesRawNV12LZ4, rawNV12HasBaseline,
+           let rects = dirtyRects, !rects.isEmpty {
+            let union = rects.dropFirst().reduce(rects[0]) { $0.union($1) }
+            let x = max(0, Int(floor(union.minX)) & ~1)
+            let y = max(0, Int(floor(union.minY)) & ~1)
+            let maxX = min(width, (Int(ceil(union.maxX)) + 1) & ~1)
+            let maxY = min(height, (Int(ceil(union.maxY)) + 1) & ~1)
+            packet = TBNV12Compression.makeRegionPacket(
+                yBase: yBase, uvBase: uvBase,
+                width: width, height: height,
+                yStride: yStride, uvStride: uvStride,
+                x: x, y: y, regionWidth: maxX - x, regionHeight: maxY - y
+            ) ?? Data()
+            if packet.isEmpty { return }
+        } else if usesRawNV12LZ4 {
+            let y = Data(bytes: yBase, count: ySize)
+            let uv = Data(bytes: uvBase, count: uvSize)
+            guard let compressed = TBNV12Compression.makePacket(
             y: y,
             uv: uv,
             width: width,
             height: height,
             yStride: yStride,
             uvStride: uvStride
-        ) {
+            ) else { return }
             packet = compressed
+            rawNV12HasBaseline = true
         } else {
+            let y = Data(bytes: yBase, count: ySize)
+            let uv = Data(bytes: uvBase, count: uvSize)
             var payload = Data(capacity: 17 + ySize + uvSize)
             payload.append(1)
             TBMonitorProtocol.appendBE32(&payload, UInt32(width))
