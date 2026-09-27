@@ -663,3 +663,94 @@ Receiver 新增：
 - 不用加深队列来隐藏吞吐不足。
 - 不宣称当前 60 Hz iMac 能物理显示 90 Hz。
 - 不在实验数据出来前承诺全屏原生 5K 等价质量下的 90 FPS。
+
+## 19. 首版实机实验结果
+
+### 19.1 实验版本与范围
+
+- Sender/Receiver 实验提交：
+  `4b0b12af7f3c34d21a2ca3943e8da1f2ce768662`。
+- Sender 使用 `5K 90 Adaptive` preset。
+- Receiver 使用新增的 `0x29 BC7_ADAPTIVE_FRAME`、固定 5K canvas 和
+  scaled patch 合成路径。
+- 首版控制策略：
+  - dirty tiles 达全屏约 20% 时进入 adaptive。
+  - 所有 dirty tiles 合并为一个 bounding-box patch。
+  - patch 使用 0.5× 宽高 BC7。
+  - 退出 adaptive 后使用完整 5K native keyframe 恢复。
+- 本轮为短时交互实测，用于判断首版机制是否具备基本可用性，不等同于
+  第 15 节要求的完整 10 分钟性能矩阵。
+
+### 19.2 Sender 实测
+
+从 52 个约 1 秒 telemetry 窗口汇总：
+
+| 指标 | Adaptive 首版实测 | GPU planner 稳定版高负载基线 |
+|---|---:|---:|
+| 平均 capture | 43.86 Hz | 45.33 Hz |
+| 平均 sent | 34.77 Hz | 45.33 Hz |
+| 平均 completed | 34.77 Hz | 45.33 Hz |
+| sent 最低值 | 2.00 Hz | 未观察到同类跌落 |
+| encode 平均 | 3.64 ms | 5.80 ms |
+| packet 平均 | 3.38 ms | 1.435 ms |
+| send completion 平均 | 11.17 ms | 6.095 ms |
+| 平均网络吞吐 | 0.541 Gbit/s | 1.841 Gbit/s |
+| pending 峰值 | 3 | ≤1 |
+| dropped 累计峰值 | 376 | 0 |
+| adaptive frames | 1073 | 不适用 |
+| adaptive tiles | 2,308,285 | 不适用 |
+
+在约 52 秒观测区间中：
+
+- native keyframe 计数增加约 69。
+- native delta 计数增加约 662。
+- 35 个采样窗口中出现 adaptive frame。
+- Sender 没有 send error。
+
+### 19.3 Receiver 实测与视觉结果
+
+Receiver telemetry：
+
+- FPS 在约 2–60 FPS 之间剧烈波动。
+- `invalid=0`。
+- `render failures=0`。
+- `keyframe requests=0`。
+
+人工观察结果：
+
+- 运动过程中出现明显画面撕裂和跳变。
+- 流畅度低于
+  `bc7-5k-gpu-planner-stable-2026-09-26`。
+- 局部低分辨率 patch 与完整 native keyframe 高频切换时，视觉连续性差。
+
+协议无效帧、Receiver render failure 和 checksum resync 均为零，因此本轮
+问题不是 wire corruption 或 Receiver 拒绝 packet。
+
+### 19.4 结论
+
+本轮实测否定的是首版的具体恢复策略：
+
+> 局部 0.5× bounding-box patch +
+> 退出 adaptive 时发送完整 5K native keyframe。
+
+完整 5K BC7 keyframe 约为 14.75 MB。首版在 adaptive 与 native 状态之间
+频繁震荡，导致：
+
+- 大量完整 keyframe repair。
+- packet 和 send completion 时间上升。
+- pending 与 dropped 增长。
+- 输出 cadence 从接近 60 FPS 反复跌至个位数。
+
+因此该首版没有达到“比稳定版更流畅”的目标，不具备继续作为当前运行版本
+使用的条件。实验结束后应切回
+`bc7-5k-gpu-planner-stable-2026-09-26`。
+
+本轮尚未验证、因此不能据此判定成败的方案包括：
+
+- degraded tile map + 增量 native repair runs。
+- 多 patch atlas，避免单个 bounding box 覆盖大量未变化区域。
+- 进入/退出 hysteresis 和最短驻留时间。
+- 按网络余量限制的逐帧 repair budget。
+
+如果继续 adaptive 方向，正常恢复路径不得再使用完整 5K keyframe；完整
+keyframe 只应用于断连、resize、checksum 失配和协议错误后的 resync。
