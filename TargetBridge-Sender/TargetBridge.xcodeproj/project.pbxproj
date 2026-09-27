@@ -358,7 +358,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nSTAMP=\"$(date +%Y%m%d%H%M%S)\"\nCOMMIT=\"$(git -C \"${SRCROOT}/..\" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)\"\ncat > \"${SRCROOT}/TBDisplaySender/TBDisplaySenderBuildInfo.swift\" <<EOI\nenum TBDisplaySenderBuildInfo {\n    static let marketingVersion = \"3.3.0\"\n    static let buildNumber = \"${STAMP}\"\n    static let gitCommit = \"${COMMIT}\"\n    static let versionDisplay = \"\\\\(marketingVersion) + build \\\\(buildNumber) · commit \\\\(gitCommit)\"\n}\nEOI\n";
+			shellScript = "set -euo pipefail\nSTAMP=\"$(date +%Y%m%d%H%M%S)\"\nCOMMIT=\"$(git -C \"${SRCROOT}/..\" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)\"\ncat > \"${SRCROOT}/TBDisplaySender/TBDisplaySenderBuildInfo.swift\" <<EOI\nenum TBDisplaySenderBuildInfo {\n    static let marketingVersion = \"4.0.1\"\n    static let buildNumber = \"${STAMP}\"\n    static let gitCommit = \"${COMMIT}\"\n    static let versionDisplay = \"\\\\(marketingVersion) + build \\\\(buildNumber) · commit \\\\(gitCommit)\"\n}\nEOI\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -440,7 +440,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 3.3.0;
+				MARKETING_VERSION = 4.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.targetbridge.sender;
 				PRODUCT_NAME = TargetBridge;
 				SDKROOT = macosx;
@@ -464,7 +464,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 3.3.0;
+				MARKETING_VERSION = 4.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.targetbridge.sender;
 				PRODUCT_NAME = TargetBridge;
 				SDKROOT = macosx;
