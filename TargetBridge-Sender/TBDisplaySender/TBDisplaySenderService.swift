@@ -1725,7 +1725,11 @@ struct TBPipelineDiagnosticsSnapshot {
     let nv12WireBytes: UInt64
     let nv12CopyTime: TBMetricSummary
     let nv12CompressionTime: TBMetricSummary
+    let nv12ChecksumTime: TBMetricSummary
+    let nv12PacketTime: TBMetricSummary
     let nv12RegionPixels: TBMetricSummary
+    let nv12DirtyPixels: TBMetricSummary
+    let nv12DirtyRectCount: TBMetricSummary
     let nv12OverfetchPermille: TBMetricSummary
 
     static let empty = TBPipelineDiagnosticsSnapshot(
@@ -1749,7 +1753,9 @@ struct TBPipelineDiagnosticsSnapshot {
         nv12FullFrames: 0, nv12RegionFrames: 0,
         nv12RawBytes: 0, nv12WireBytes: 0,
         nv12CopyTime: .empty, nv12CompressionTime: .empty,
-        nv12RegionPixels: .empty, nv12OverfetchPermille: .empty
+        nv12ChecksumTime: .empty, nv12PacketTime: .empty,
+        nv12RegionPixels: .empty, nv12DirtyPixels: .empty,
+        nv12DirtyRectCount: .empty, nv12OverfetchPermille: .empty
     )
 }
 
@@ -1836,7 +1842,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _nv12WireBytes: UInt64 = 0
     private var _nv12CopyTimeWindow = TBRollingMetricWindow()
     private var _nv12CompressionTimeWindow = TBRollingMetricWindow()
+    private var _nv12ChecksumTimeWindow = TBRollingMetricWindow()
+    private var _nv12PacketTimeWindow = TBRollingMetricWindow()
     private var _nv12RegionPixelsWindow = TBRollingMetricWindow()
+    private var _nv12DirtyPixelsWindow = TBRollingMetricWindow()
+    private var _nv12DirtyRectCountWindow = TBRollingMetricWindow()
     private var _nv12OverfetchPermilleWindow = TBRollingMetricWindow()
     private var _lastCaptureFrameAt = Date()
 
@@ -1987,7 +1997,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 nv12WireBytes: _nv12WireBytes,
                 nv12CopyTime: _nv12CopyTimeWindow.summary(),
                 nv12CompressionTime: _nv12CompressionTimeWindow.summary(),
+                nv12ChecksumTime: _nv12ChecksumTimeWindow.summary(),
+                nv12PacketTime: _nv12PacketTimeWindow.summary(),
                 nv12RegionPixels: _nv12RegionPixelsWindow.summary(),
+                nv12DirtyPixels: _nv12DirtyPixelsWindow.summary(),
+                nv12DirtyRectCount: _nv12DirtyRectCountWindow.summary(),
                 nv12OverfetchPermille: _nv12OverfetchPermilleWindow.summary()
             )
         }
@@ -2062,7 +2076,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private func recordNV12Packet(
         _ result: TBNV12Compression.PacketResult,
         isRegion: Bool,
-        dirtyPixels: Int
+        dirtyPixels: Int,
+        dirtyRectCount: Int = 1
     ) {
         lock.lock()
         if isRegion { _nv12RegionFrames += 1 } else { _nv12FullFrames += 1 }
@@ -2070,7 +2085,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
         _nv12WireBytes &+= UInt64(result.wireBytes)
         _nv12CopyTimeWindow.record(result.copyNanoseconds)
         _nv12CompressionTimeWindow.record(result.compressionNanoseconds)
+        _nv12ChecksumTimeWindow.record(result.checksumNanoseconds)
+        _nv12PacketTimeWindow.record(result.packetNanoseconds)
         _nv12RegionPixelsWindow.record(UInt64(result.regionPixels))
+        _nv12DirtyPixelsWindow.record(UInt64(max(0, dirtyPixels)))
+        _nv12DirtyRectCountWindow.record(UInt64(max(0, dirtyRectCount)))
         if dirtyPixels > 0 {
             _nv12OverfetchPermilleWindow.record(
                 UInt64(result.regionPixels * 1000 / dirtyPixels)
@@ -2436,7 +2455,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     $0 + max(0, Int($1.width * $1.height))
                 }
                 recordNV12Packet(
-                    result, isRegion: true, dirtyPixels: dirtyPixels
+                    result, isRegion: true, dirtyPixels: dirtyPixels,
+                    dirtyRectCount: rects.count
                 )
             } else {
                 rawNV12HasBaseline = false
@@ -5583,8 +5603,22 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                         Double(diagnostics.nv12CompressionTime.p50) / 1_000_000.0,
                     "nv12CompressionP95Ms":
                         Double(diagnostics.nv12CompressionTime.p95) / 1_000_000.0,
+                    "nv12ChecksumP50Ms":
+                        Double(diagnostics.nv12ChecksumTime.p50) / 1_000_000.0,
+                    "nv12ChecksumP95Ms":
+                        Double(diagnostics.nv12ChecksumTime.p95) / 1_000_000.0,
+                    "nv12PacketP50Ms":
+                        Double(diagnostics.nv12PacketTime.p50) / 1_000_000.0,
+                    "nv12PacketP95Ms":
+                        Double(diagnostics.nv12PacketTime.p95) / 1_000_000.0,
                     "nv12RegionPixelsP50": diagnostics.nv12RegionPixels.p50,
                     "nv12RegionPixelsP95": diagnostics.nv12RegionPixels.p95,
+                    "nv12DirtyPixelsP50": diagnostics.nv12DirtyPixels.p50,
+                    "nv12DirtyPixelsP95": diagnostics.nv12DirtyPixels.p95,
+                    "nv12DirtyRectCountP50":
+                        diagnostics.nv12DirtyRectCount.p50,
+                    "nv12DirtyRectCountP95":
+                        diagnostics.nv12DirtyRectCount.p95,
                     "nv12OverfetchP50":
                         Double(diagnostics.nv12OverfetchPermille.p50) / 1000.0,
                     "nv12OverfetchP95":

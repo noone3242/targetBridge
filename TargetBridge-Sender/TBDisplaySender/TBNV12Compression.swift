@@ -8,6 +8,8 @@ enum TBNV12Compression {
         let wireBytes: Int
         let copyNanoseconds: UInt64
         let compressionNanoseconds: UInt64
+        let checksumNanoseconds: UInt64
+        let packetNanoseconds: UInt64
         let regionPixels: Int
     }
     struct Decoded {
@@ -63,6 +65,10 @@ enum TBNV12Compression {
         let compressionFinished = DispatchTime.now().uptimeNanoseconds
         guard size > 0 else { return nil }
         compressed.count = size
+        let checksumStarted = DispatchTime.now().uptimeNanoseconds
+        let checksumValue = checksum(raw)
+        let checksumFinished = DispatchTime.now().uptimeNanoseconds
+        let packetStarted = checksumFinished
         var payload = Data(capacity: 38 + size)
         payload.append(2)
         payload.append(1)
@@ -73,9 +79,10 @@ enum TBNV12Compression {
         TBMonitorProtocol.appendBE32(&payload, UInt32(y.count))
         TBMonitorProtocol.appendBE32(&payload, UInt32(uv.count))
         TBMonitorProtocol.appendBE32(&payload, UInt32(size))
-        TBMonitorProtocol.appendBE64(&payload, checksum(raw))
+        TBMonitorProtocol.appendBE64(&payload, checksumValue)
         payload.append(compressed)
         let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+        let packetFinished = DispatchTime.now().uptimeNanoseconds
         guard raw.count + 17 - packet.count >= 4 * 1024 else { return nil }
         return PacketResult(
             packet: packet,
@@ -83,6 +90,8 @@ enum TBNV12Compression {
             wireBytes: packet.count,
             copyNanoseconds: copyFinished - copyStarted,
             compressionNanoseconds: compressionFinished - compressionStarted,
+            checksumNanoseconds: checksumFinished - checksumStarted,
+            packetNanoseconds: packetFinished - packetStarted,
             regionPixels: width * height
         )
     }
@@ -129,6 +138,10 @@ enum TBNV12Compression {
         let compressionFinished = DispatchTime.now().uptimeNanoseconds
         guard size > 0 else { return nil }
         compressed.count = size
+        let checksumStarted = DispatchTime.now().uptimeNanoseconds
+        let checksumValue = checksum(raw)
+        let checksumFinished = DispatchTime.now().uptimeNanoseconds
+        let packetStarted = checksumFinished
         var payload = Data(capacity: 54 + size)
         payload.append(3); payload.append(1)
         for value in [width, height, yStride, uvStride, x, y,
@@ -137,15 +150,18 @@ enum TBNV12Compression {
                       regionWidth * regionHeight / 2, size] {
             TBMonitorProtocol.appendBE32(&payload, UInt32(value))
         }
-        TBMonitorProtocol.appendBE64(&payload, checksum(raw))
+        TBMonitorProtocol.appendBE64(&payload, checksumValue)
         payload.append(compressed)
         let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+        let packetFinished = DispatchTime.now().uptimeNanoseconds
         return PacketResult(
             packet: packet,
             rawBytes: raw.count,
             wireBytes: packet.count,
             copyNanoseconds: copyFinished - copyStarted,
             compressionNanoseconds: compressionFinished - compressionStarted,
+            checksumNanoseconds: checksumFinished - checksumStarted,
+            packetNanoseconds: packetFinished - packetStarted,
             regionPixels: regionWidth * regionHeight
         )
     }
@@ -232,11 +248,11 @@ enum TBNV12Compression {
     }
 
     static func checksum(_ data: Data) -> UInt64 {
-        var hash = UInt64(14_695_981_039_346_656_037)
-        for byte in data {
-            hash ^= UInt64(byte)
-            hash &*= 1_099_511_628_211
+        data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else {
+                return UInt64(14_695_981_039_346_656_037)
+            }
+            return TBChecksum64(base, data.count)
         }
-        return hash
     }
 }

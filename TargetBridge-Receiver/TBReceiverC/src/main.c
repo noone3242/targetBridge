@@ -100,10 +100,11 @@ struct app {
     uint64_t bc7_keyframe_requests;
     uint64_t bc7_applied_sequence;
     uint64_t bc7_checksum;
-    uint8_t *raw_y_shadow;
-    uint8_t *raw_uv_shadow;
+    int raw_has_baseline;
     size_t raw_y_len, raw_uv_len;
     uint32_t raw_width, raw_height, raw_y_stride, raw_uv_stride;
+    uint8_t *raw_decode_buffer;
+    size_t raw_decode_capacity;
     uint64_t raw_last_keyframe_request_ms;
     int raw_keyframe_request_pending;
     uint64_t bc7_last_keyframe_request_ms;
@@ -1044,7 +1045,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     record_bc7_packet_arrival(a, apply_started);
     if (len > 0 && p[0] == 3) {
         if (len < 54 || p[1] != 1 ||
-            !a->raw_y_shadow || !a->raw_uv_shadow) {
+            !a->raw_has_baseline) {
             request_raw_keyframe(a, "region-base");
             return;
         }
@@ -1080,7 +1081,16 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             return;
         }
         size_t raw_len=(size_t)ylen+uvlen;
-        uint8_t *raw=malloc(raw_len);
+        if (a->raw_decode_capacity < raw_len) {
+            uint8_t *resized = realloc(a->raw_decode_buffer, raw_len);
+            if (!resized) {
+                request_raw_keyframe(a, "region-allocation");
+                return;
+            }
+            a->raw_decode_buffer = resized;
+            a->raw_decode_capacity = raw_len;
+        }
+        uint8_t *raw = a->raw_decode_buffer;
         if(!raw) {
             request_raw_keyframe(a, "region-allocation");
             return;
@@ -1091,7 +1101,6 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         metric_record(&a->bc7_decompression_ns, now_ns() - decode_started);
         if(decoded!=raw_len ||
            tb_bc7_supercompression_checksum(raw,raw_len)!=checksum){
-            free(raw);
             request_raw_keyframe(a, "region-checksum");
             return;
         }
@@ -1100,17 +1109,11 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         if (tb_disp_render_nv12_region(
                 a->disp, raw, (int)rw, uv, (int)rw,
                 (int)w, (int)h, (int)x, (int)y, (int)rw, (int)rh) != 0) {
-            free(raw);
             request_raw_keyframe(a, "region-upload");
             return;
         }
         const uint64_t present_finished = now_ns();
-        const uint64_t commit_started = present_finished;
-        for(uint32_t row=0;row<rh;row++)
-            memcpy(a->raw_y_shadow+(size_t)(y+row)*ys+x,raw+(size_t)row*rw,rw);
-        for(uint32_t row=0;row<rh/2;row++)
-            memcpy(a->raw_uv_shadow+(size_t)(y/2+row)*us+x,uv+(size_t)row*rw,rw);
-        metric_record(&a->raw_shadow_commit_ns, now_ns() - commit_started);
+        metric_record(&a->raw_shadow_commit_ns, 0);
         metric_record(&a->raw_upload_ns, present_finished - present_started);
         metric_record(&a->bc7_present_ns, present_finished - present_started);
         if (a->bc7_last_present_ns != 0) {
@@ -1125,7 +1128,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         a->have_video_frame = 1;
         a->frames++;
         metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
-        free(raw); return;
+        return;
     }
     if (len >= 38 && p[0] == 2) {
         if (p[1] != 1) {
@@ -1166,7 +1169,16 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             return;
         }
         size_t raw_len = (size_t)y_size + uv_size;
-        uint8_t *raw = malloc(raw_len);
+        if (a->raw_decode_capacity < raw_len) {
+            uint8_t *resized = realloc(a->raw_decode_buffer, raw_len);
+            if (!resized) {
+                request_raw_keyframe(a, "full-allocation");
+                return;
+            }
+            a->raw_decode_buffer = resized;
+            a->raw_decode_capacity = raw_len;
+        }
+        uint8_t *raw = a->raw_decode_buffer;
         if (!raw) {
             request_raw_keyframe(a, "full-allocation");
             return;
@@ -1178,35 +1190,18 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         metric_record(&a->bc7_decompression_ns, now_ns() - decode_started);
         if (decoded != raw_len ||
             tb_bc7_supercompression_checksum(raw, raw_len) != checksum) {
-            free(raw);
             request_raw_keyframe(a, "full-checksum");
             return;
         }
-        const uint64_t commit_started = now_ns();
-        uint8_t *next_y = malloc(y_size);
-        uint8_t *next_uv = malloc(uv_size);
-        if(!next_y || !next_uv){
-            free(next_y); free(next_uv); free(raw);
-            request_raw_keyframe(a, "full-shadow-allocation");
-            return;
-        }
-        memcpy(next_y,raw,y_size);
-        memcpy(next_uv,raw+y_size,uv_size);
-        metric_record(
-            &a->raw_shadow_commit_ns,
-            now_ns() - commit_started
-        );
         const uint64_t upload_started = now_ns();
         if (tb_disp_render_nv12(
                 a->disp, raw, (int)ys, raw + y_size, (int)us,
                 (int)w, (int)h) != 0) {
-            free(next_y); free(next_uv); free(raw);
             request_raw_keyframe(a, "full-upload");
             return;
         }
         const uint64_t upload_finished = now_ns();
-        free(a->raw_y_shadow); free(a->raw_uv_shadow);
-        a->raw_y_shadow=next_y; a->raw_uv_shadow=next_uv;
+        a->raw_has_baseline = 1;
         a->raw_y_len=y_size; a->raw_uv_len=uv_size;
         a->raw_width=w; a->raw_height=h; a->raw_y_stride=ys; a->raw_uv_stride=us;
         metric_record(&a->raw_upload_ns, upload_finished - upload_started);
@@ -1224,7 +1219,6 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         a->raw_full_frames++;
         a->raw_keyframe_request_pending = 0;
         metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
-        free(raw);
         return;
     }
     if (len < 17) {
@@ -1257,27 +1251,14 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     }
     const uint8_t *y  = p + 17;
     const uint8_t *uv = y + y_size;
-    uint8_t *next_y = malloc(y_size);
-    uint8_t *next_uv = malloc(uv_size);
-    if (!next_y || !next_uv) {
-        free(next_y); free(next_uv);
-        request_raw_keyframe(a, "raw-shadow-allocation");
-        return;
-    }
-    const uint64_t commit_started = now_ns();
-    memcpy(next_y, y, y_size);
-    memcpy(next_uv, uv, uv_size);
-    metric_record(&a->raw_shadow_commit_ns, now_ns() - commit_started);
     const uint64_t upload_started = now_ns();
     if (tb_disp_render_nv12(
             a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h) != 0) {
-        free(next_y); free(next_uv);
         request_raw_keyframe(a, "raw-upload");
         return;
     }
     const uint64_t upload_finished = now_ns();
-    free(a->raw_y_shadow); free(a->raw_uv_shadow);
-    a->raw_y_shadow = next_y; a->raw_uv_shadow = next_uv;
+    a->raw_has_baseline = 1;
     a->raw_y_len = y_size; a->raw_uv_len = uv_size;
     a->raw_width = w; a->raw_height = h;
     a->raw_y_stride = ys; a->raw_uv_stride = us;
@@ -1317,11 +1298,13 @@ static void reset_bc7_delta_state(struct app *a) {
 }
 
 static void reset_raw_state(struct app *a) {
-    free(a->raw_y_shadow); free(a->raw_uv_shadow);
-    a->raw_y_shadow = a->raw_uv_shadow = NULL;
+    a->raw_has_baseline = 0;
     a->raw_y_len = a->raw_uv_len = 0;
     a->raw_width = a->raw_height = 0;
     a->raw_y_stride = a->raw_uv_stride = 0;
+    free(a->raw_decode_buffer);
+    a->raw_decode_buffer = NULL;
+    a->raw_decode_capacity = 0;
 }
 
 static uint64_t checksum_bc7_tiles(const uint8_t *blocks,

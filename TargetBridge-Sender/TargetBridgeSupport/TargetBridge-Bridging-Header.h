@@ -12,6 +12,16 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 
+static inline uint64_t TBChecksum64(const void *data, size_t length) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t index = 0; index < length; index++) {
+        hash ^= bytes[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 // MARK: - CGVirtualDisplay Private API (macOS 14+)
 
 @interface CGVirtualDisplayDescriptor : NSObject
