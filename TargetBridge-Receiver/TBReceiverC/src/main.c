@@ -124,6 +124,8 @@ struct app {
     struct tb_metric_window bc7_present_interval_ns;
     struct tb_metric_window bc7_decompression_ns;
     struct tb_metric_window bc7_inverse_transform_ns;
+    struct tb_metric_window bc7_compressed_total_ns;
+    struct tb_bc7_supercompression_scratch bc7_compression_scratch;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      debug_enabled;
@@ -1437,8 +1439,10 @@ static void record_bc7_supercompression(
 
 static void handle_bc7_compressed_frame(
     struct app *a, const uint8_t *p, size_t len) {
+    const uint64_t total_started = now_ns();
     struct tb_bc7_supercompression_result result;
-    if (tb_bc7_supercompression_decode_frame(p, len, &result) != 0) {
+    if (tb_bc7_supercompression_decode_frame_reuse(
+            p, len, &a->bc7_compression_scratch, &result) != 0) {
         a->bc7_invalid_frames++;
         a->bc7_decompression_failures++;
         request_bc7_keyframe(a, "keyframe-supercompression");
@@ -1446,13 +1450,18 @@ static void handle_bc7_compressed_frame(
     }
     record_bc7_supercompression(a, &result);
     handle_bc7_frame(a, result.payload, result.payload_len);
-    tb_bc7_supercompression_result_free(&result);
+    metric_record(
+        &a->bc7_compressed_total_ns,
+        now_ns() - total_started
+    );
 }
 
 static void handle_bc7_compressed_delta(
     struct app *a, const uint8_t *p, size_t len) {
+    const uint64_t total_started = now_ns();
     struct tb_bc7_supercompression_result result;
-    if (tb_bc7_supercompression_decode_delta(p, len, &result) != 0) {
+    if (tb_bc7_supercompression_decode_delta_reuse(
+            p, len, &a->bc7_compression_scratch, &result) != 0) {
         a->bc7_invalid_frames++;
         a->bc7_decompression_failures++;
         request_bc7_keyframe(a, "delta-supercompression");
@@ -1460,7 +1469,10 @@ static void handle_bc7_compressed_delta(
     }
     record_bc7_supercompression(a, &result);
     handle_bc7_delta(a, result.payload, result.payload_len);
-    tb_bc7_supercompression_result_free(&result);
+    metric_record(
+        &a->bc7_compressed_total_ns,
+        now_ns() - total_started
+    );
 }
 
 static void ring_read(struct app *a, Uint8 *dst, int len) {
@@ -2275,7 +2287,9 @@ static void send_receiver_metrics(
         metric_summary(&a->bc7_decompression_ns);
     const struct tb_metric_summary inverse_transform =
         metric_summary(&a->bc7_inverse_transform_ns);
-    char json[2048];
+    const struct tb_metric_summary compressed_total =
+        metric_summary(&a->bc7_compressed_total_ns);
+    char json[2304];
     int json_len = snprintf(
         json,
         sizeof(json),
@@ -2294,7 +2308,8 @@ static void send_receiver_metrics(
         "\"compressedBlockBytes\":%llu,\"decompressionP50Ms\":%.3f,"
         "\"decompressionP95Ms\":%.3f,\"decompressionP99Ms\":%.3f,"
         "\"inverseTransformP50Ms\":%.3f,\"inverseTransformP95Ms\":%.3f,"
-        "\"inverseTransformP99Ms\":%.3f}",
+        "\"inverseTransformP99Ms\":%.3f,\"compressedTotalP50Ms\":%.3f,"
+        "\"compressedTotalP95Ms\":%.3f,\"compressedTotalP99Ms\":%.3f}",
         fps,
         present_fps,
         gbps,
@@ -2332,12 +2347,15 @@ static void send_receiver_metrics(
         ns_to_ms(decompression.p99),
         ns_to_ms(inverse_transform.p50),
         ns_to_ms(inverse_transform.p95),
-        ns_to_ms(inverse_transform.p99)
+        ns_to_ms(inverse_transform.p99),
+        ns_to_ms(compressed_total.p50),
+        ns_to_ms(compressed_total.p95),
+        ns_to_ms(compressed_total.p99)
     );
     if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
 
     const size_t packet_len = 5u + (size_t)json_len;
-    uint8_t packet[5 + 2048];
+    uint8_t packet[5 + 2304];
     write_be32(packet, (uint32_t)(1 + json_len));
     packet[4] = TB_PKT_RECEIVER_METRICS;
     memcpy(packet + 5, json, (size_t)json_len);
@@ -2891,6 +2909,7 @@ int main(int argc, char **argv) {
     if (a.server_fd >= 0) close(a.server_fd);
     bonjour_deinit(&a);
     tb_parser_free(&a.parser);
+    tb_bc7_supercompression_scratch_free(&a.bc7_compression_scratch);
     tb_dec_destroy(a.dec);
     if (a.audio_device != 0) {
         SDL_CloseAudioDevice(a.audio_device);

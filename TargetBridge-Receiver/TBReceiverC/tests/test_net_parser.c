@@ -518,6 +518,30 @@ static void test_bc7_delta_validation(void) {
                 CHECK(result.inverse_transform_ns == 0,
                       "raw BC7 LZ4 skips inverse transform");
                 tb_bc7_supercompression_result_free(&result);
+                struct tb_bc7_supercompression_scratch scratch = {0};
+                CHECK(tb_bc7_supercompression_decode_frame_reuse(
+                          lz4_wrapper,
+                          lz4_wrapper_len,
+                          &scratch,
+                          &result) == 0,
+                      "raw BC7 LZ4 frame decodes with reusable scratch");
+                uint8_t *first_blocks = scratch.blocks;
+                uint8_t *first_legacy = scratch.legacy;
+                CHECK(memcmp(
+                          result.payload + sizeof(metadata),
+                          blocks,
+                          blocks_len) == 0,
+                      "reusable raw BC7 LZ4 blocks preserved");
+                CHECK(tb_bc7_supercompression_decode_frame_reuse(
+                          lz4_wrapper,
+                          lz4_wrapper_len,
+                          &scratch,
+                          &result) == 0,
+                      "reusable raw BC7 LZ4 frame decodes twice");
+                CHECK(scratch.blocks == first_blocks &&
+                          scratch.legacy == first_legacy,
+                      "raw BC7 LZ4 scratch buffers reused");
+                tb_bc7_supercompression_scratch_free(&scratch);
                 uint8_t *lz4_trailing = malloc(lz4_wrapper_len + 1u);
                 CHECK(lz4_trailing != NULL, "LZ4 trailing fixture allocated");
                 if (lz4_trailing) {

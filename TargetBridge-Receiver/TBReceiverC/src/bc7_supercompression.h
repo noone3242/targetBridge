@@ -13,6 +13,15 @@ struct tb_bc7_supercompression_result {
     uint64_t inverse_transform_ns;
 };
 
+struct tb_bc7_supercompression_scratch {
+    uint8_t *transformed;
+    size_t transformed_capacity;
+    uint8_t *blocks;
+    size_t blocks_capacity;
+    uint8_t *legacy;
+    size_t legacy_capacity;
+};
+
 enum tb_bc7_compression_algorithm {
     TB_BC7_COMPRESSION_LZFSE = 1,
     TB_BC7_COMPRESSION_LZ4 = 2
@@ -31,6 +40,18 @@ int tb_bc7_supercompression_decode_delta(
     const uint8_t *payload,
     size_t payload_len,
     struct tb_bc7_supercompression_result *result);
+int tb_bc7_supercompression_decode_frame_reuse(
+    const uint8_t *payload,
+    size_t payload_len,
+    struct tb_bc7_supercompression_scratch *scratch,
+    struct tb_bc7_supercompression_result *result);
+int tb_bc7_supercompression_decode_delta_reuse(
+    const uint8_t *payload,
+    size_t payload_len,
+    struct tb_bc7_supercompression_scratch *scratch,
+    struct tb_bc7_supercompression_result *result);
+void tb_bc7_supercompression_scratch_free(
+    struct tb_bc7_supercompression_scratch *scratch);
 void tb_bc7_supercompression_result_free(
     struct tb_bc7_supercompression_result *result);
 

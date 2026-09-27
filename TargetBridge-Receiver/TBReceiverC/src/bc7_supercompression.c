@@ -307,6 +307,230 @@ static int decode_exact(
     return 0;
 }
 
+static int ensure_capacity(
+    uint8_t **buffer,
+    size_t *capacity,
+    size_t required) {
+    if (!buffer || !capacity || required == 0) return -1;
+    if (*capacity >= required && *buffer) return 0;
+    uint8_t *resized = realloc(*buffer, required);
+    if (!resized) return -1;
+    *buffer = resized;
+    *capacity = required;
+    return 0;
+}
+
+static int decode_exact_reuse(
+    const struct tb_bc7_compressed_wrapper *wrapper,
+    struct tb_bc7_supercompression_scratch *scratch,
+    uint8_t **blocks,
+    uint64_t *decompression_ns,
+    uint64_t *inverse_ns) {
+    if (!wrapper || !scratch || !blocks || !decompression_ns || !inverse_ns ||
+        wrapper->blocks_len == SIZE_MAX ||
+        ensure_capacity(
+            &scratch->blocks,
+            &scratch->blocks_capacity,
+            wrapper->blocks_len) != 0) {
+        return -1;
+    }
+
+    uint8_t *decode_destination = scratch->blocks;
+    size_t decode_capacity = wrapper->blocks_len + 1u;
+    if (wrapper->transform == TB_BC7_TRANSFORM_BYTE_PLANES) {
+        if (ensure_capacity(
+                &scratch->transformed,
+                &scratch->transformed_capacity,
+                decode_capacity) != 0) {
+            return -1;
+        }
+        decode_destination = scratch->transformed;
+    } else if (ensure_capacity(
+                   &scratch->blocks,
+                   &scratch->blocks_capacity,
+                   decode_capacity) != 0) {
+        return -1;
+    }
+
+    const compression_algorithm compression_algorithm =
+        wrapper->algorithm == TB_BC7_COMPRESSION_LZFSE
+            ? COMPRESSION_LZFSE
+            : COMPRESSION_LZ4;
+    compression_stream stream;
+    memset(&stream, 0, sizeof(stream));
+    if (compression_stream_init(
+            &stream,
+            COMPRESSION_STREAM_DECODE,
+            compression_algorithm) != COMPRESSION_STATUS_OK) {
+        return -1;
+    }
+    stream.src_ptr = wrapper->compressed;
+    stream.src_size = wrapper->compressed_len;
+    stream.dst_ptr = decode_destination;
+    stream.dst_size = decode_capacity;
+
+    const uint64_t decode_started = now_ns();
+    compression_status status;
+    do {
+        const size_t previous_src_size = stream.src_size;
+        const size_t previous_dst_size = stream.dst_size;
+        status = compression_stream_process(
+            &stream,
+            COMPRESSION_STREAM_FINALIZE
+        );
+        if (status == COMPRESSION_STATUS_OK &&
+            stream.src_size == previous_src_size &&
+            stream.dst_size == previous_dst_size) {
+            status = COMPRESSION_STATUS_ERROR;
+        }
+    } while (status == COMPRESSION_STATUS_OK && stream.dst_size > 0);
+    const uint64_t decode_finished = now_ns();
+    const size_t decoded = decode_capacity - stream.dst_size;
+    const size_t remaining_input = stream.src_size;
+    compression_stream_destroy(&stream);
+    if (status != COMPRESSION_STATUS_END ||
+        remaining_input != 0 ||
+        decoded != wrapper->blocks_len) {
+        return -1;
+    }
+
+    if (wrapper->transform == TB_BC7_TRANSFORM_BYTE_PLANES) {
+        const uint64_t inverse_started = decode_finished;
+        if (tb_bc7_plane_unsplit(
+                scratch->transformed,
+                wrapper->blocks_len,
+                scratch->blocks) != 0) {
+            return -1;
+        }
+        *inverse_ns = now_ns() - inverse_started;
+    } else {
+        *inverse_ns = 0;
+    }
+    *blocks = scratch->blocks;
+    *decompression_ns = decode_finished - decode_started;
+    return 0;
+}
+
+int tb_bc7_supercompression_decode_frame_reuse(
+    const uint8_t *payload,
+    size_t payload_len,
+    struct tb_bc7_supercompression_scratch *scratch,
+    struct tb_bc7_supercompression_result *result) {
+    if (!scratch || !result) return -1;
+    memset(result, 0, sizeof(*result));
+    struct tb_bc7_compressed_wrapper wrapper;
+    if (parse_wrapper(payload, payload_len, &wrapper) != 0 ||
+        validate_frame_wrapper(&wrapper) != 0) {
+        return -1;
+    }
+    uint8_t *blocks = NULL;
+    uint64_t decompression_ns = 0;
+    uint64_t inverse_ns = 0;
+    if (decode_exact_reuse(
+            &wrapper,
+            scratch,
+            &blocks,
+            &decompression_ns,
+            &inverse_ns) != 0) {
+        return -1;
+    }
+    const size_t legacy_len = wrapper.metadata_len + wrapper.blocks_len;
+    if (ensure_capacity(
+            &scratch->legacy,
+            &scratch->legacy_capacity,
+            legacy_len) != 0) {
+        return -1;
+    }
+    memcpy(scratch->legacy, wrapper.metadata, wrapper.metadata_len);
+    memcpy(
+        scratch->legacy + wrapper.metadata_len,
+        blocks,
+        wrapper.blocks_len
+    );
+    result->payload = scratch->legacy;
+    result->payload_len = legacy_len;
+    result->raw_block_bytes = wrapper.blocks_len;
+    result->compressed_block_bytes = wrapper.compressed_len;
+    result->decompression_ns = decompression_ns;
+    result->inverse_transform_ns = inverse_ns;
+    return 0;
+}
+
+int tb_bc7_supercompression_decode_delta_reuse(
+    const uint8_t *payload,
+    size_t payload_len,
+    struct tb_bc7_supercompression_scratch *scratch,
+    struct tb_bc7_supercompression_result *result) {
+    if (!scratch || !result) return -1;
+    memset(result, 0, sizeof(*result));
+    struct tb_bc7_compressed_wrapper wrapper;
+    if (parse_wrapper(payload, payload_len, &wrapper) != 0 ||
+        validate_delta_wrapper(&wrapper) != 0) {
+        return -1;
+    }
+    uint8_t *blocks = NULL;
+    uint64_t decompression_ns = 0;
+    uint64_t inverse_ns = 0;
+    if (decode_exact_reuse(
+            &wrapper,
+            scratch,
+            &blocks,
+            &decompression_ns,
+            &inverse_ns) != 0) {
+        return -1;
+    }
+    const uint16_t run_count = read_be16(wrapper.metadata + 35u);
+    const size_t legacy_len =
+        37u + (size_t)run_count * 12u + wrapper.blocks_len;
+    if (ensure_capacity(
+            &scratch->legacy,
+            &scratch->legacy_capacity,
+            legacy_len) != 0) {
+        return -1;
+    }
+    memcpy(scratch->legacy, wrapper.metadata, 37u);
+    size_t legacy_offset = 37u;
+    size_t block_offset = 0;
+    for (uint16_t index = 0; index < run_count; index++) {
+        const size_t descriptor_offset = 37u + (size_t)index * 12u;
+        const size_t run_len =
+            read_be32(wrapper.metadata + descriptor_offset + 8u);
+        memcpy(
+            scratch->legacy + legacy_offset,
+            wrapper.metadata + descriptor_offset,
+            12u
+        );
+        legacy_offset += 12u;
+        memcpy(
+            scratch->legacy + legacy_offset,
+            blocks + block_offset,
+            run_len
+        );
+        legacy_offset += run_len;
+        block_offset += run_len;
+    }
+    if (legacy_offset != legacy_len ||
+        block_offset != wrapper.blocks_len) {
+        return -1;
+    }
+    result->payload = scratch->legacy;
+    result->payload_len = legacy_len;
+    result->raw_block_bytes = wrapper.blocks_len;
+    result->compressed_block_bytes = wrapper.compressed_len;
+    result->decompression_ns = decompression_ns;
+    result->inverse_transform_ns = inverse_ns;
+    return 0;
+}
+
+void tb_bc7_supercompression_scratch_free(
+    struct tb_bc7_supercompression_scratch *scratch) {
+    if (!scratch) return;
+    free(scratch->transformed);
+    free(scratch->blocks);
+    free(scratch->legacy);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
 int tb_bc7_supercompression_decode_frame(
     const uint8_t *payload,
     size_t payload_len,

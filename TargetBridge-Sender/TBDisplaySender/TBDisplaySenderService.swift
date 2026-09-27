@@ -5334,6 +5334,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                             receiver.decompressionP95Ms ?? 0,
                         "inverseTransformP95Ms":
                             receiver.inverseTransformP95Ms ?? 0,
+                        "compressedTotalP95Ms":
+                            receiver.compressedTotalP95Ms ?? 0,
                         "invalid": receiver.bc7Invalid,
                         "renderFailures": receiver.renderFailures,
                         "keyframeRequests": receiver.keyframeRequests

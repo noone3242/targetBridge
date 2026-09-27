@@ -106,6 +106,9 @@ struct TBMonitorReceiverMetrics: Codable, Equatable {
     var inverseTransformP50Ms: Double?
     var inverseTransformP95Ms: Double?
     var inverseTransformP99Ms: Double?
+    var compressedTotalP50Ms: Double?
+    var compressedTotalP95Ms: Double?
+    var compressedTotalP99Ms: Double?
 }
 
 struct TBMonitorUILanguageUpdate: Codable {
