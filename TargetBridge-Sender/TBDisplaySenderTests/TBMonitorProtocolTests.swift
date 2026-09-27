@@ -167,13 +167,13 @@ final class TBMonitorProtocolTests: XCTestCase {
           "supportsBC7LZ4": true,
           "supportsRawNV12LZ4": true,
           "supportsRawNV12TileRuns": true,
-          "receiverVersion": "3.3.0",
+          "receiverVersion": "4.0.1",
           "receiverBuild": "dev-20260926163000",
           "receiverCommit": "9b6b092abcde"
         }
         """.utf8)
         let current = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: currentProfile)
-        XCTAssertEqual(current.receiverVersion, "3.3.0")
+        XCTAssertEqual(current.receiverVersion, "4.0.1")
         XCTAssertEqual(current.supportsBC7LZFSE, true)
         XCTAssertEqual(current.supportsBC7LZ4, true)
         XCTAssertEqual(current.supportsRawNV12LZ4, true)

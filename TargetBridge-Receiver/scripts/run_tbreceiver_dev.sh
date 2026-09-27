@@ -51,7 +51,7 @@ if (( BUILD == 1 )); then
     BUILD_STAMP="dev-$(date +%Y%m%d%H%M%S)"
     BUILD_COMMIT="$(git -C "$SCRIPT_DIR/../.." rev-parse --short=12 HEAD 2>/dev/null || print unknown)"
     make clean
-    make APP_VERSION="3.3.0" APP_BUILD="$BUILD_STAMP" APP_COMMIT="$BUILD_COMMIT"
+    make APP_VERSION="4.0.1" APP_BUILD="$BUILD_STAMP" APP_COMMIT="$BUILD_COMMIT"
 fi
 
 if [[ ! -x ./tbreceiver ]]; then

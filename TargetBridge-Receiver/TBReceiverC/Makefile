@@ -16,7 +16,7 @@
 
 CC       ?= clang
 PKG      ?= pkgconf
-APP_VERSION ?= 3.2.0
+APP_VERSION ?= 4.0.1
 APP_BUILD   ?= dev
 APP_COMMIT  ?= unknown
 
