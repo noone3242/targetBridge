@@ -362,6 +362,21 @@ static void test_bc7_delta_validation(void) {
           "shadow contains the delta tile bytes");
     CHECK(applied_checksum == frame.checksum,
           "applied shadow checksum matches wire checksum");
+    memset(shadow, 0, sizeof(shadow));
+    tile_checksums[0] = 0;
+    uint64_t candidate_checksums[1] = {0};
+    CHECK(tb_bc7_delta_validate_candidate(
+              &frame, tile_checksums, 1, 0,
+              candidate_checksums, &applied_checksum) == 0,
+          "candidate checksum validates before live-state mutation");
+    CHECK(shadow[0] == 0 && tile_checksums[0] == 0,
+          "validation leaves live shadow and checksums unchanged");
+    CHECK(tb_bc7_delta_commit_to_shadow(
+              &frame, shadow, sizeof(shadow), 256,
+              tile_checksums, 1, candidate_checksums) == 0,
+          "validated candidate commits in place");
+    CHECK(memcmp(shadow, payload + 49, sizeof(shadow)) == 0,
+          "in-place commit copies the validated tile");
     CHECK(!tb_bc7_delta_prefers_full_upload(&frame, 32768),
           "single small run keeps regional upload");
     frame.run_count = 9;

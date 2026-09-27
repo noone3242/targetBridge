@@ -36,6 +36,21 @@ int tb_bc7_delta_sequence_valid(uint64_t sequence,
 int tb_bc7_delta_prefers_full_upload(const struct tb_bc7_delta_frame *frame,
                                      size_t full_frame_length);
 
+int tb_bc7_delta_validate_candidate(
+    const struct tb_bc7_delta_frame *frame,
+    const uint64_t *tile_checksums,
+    size_t tile_count,
+    uint64_t current_checksum,
+    uint64_t *candidate_tile_checksums,
+    uint64_t *candidate_checksum);
+int tb_bc7_delta_commit_to_shadow(
+    const struct tb_bc7_delta_frame *frame,
+    uint8_t *shadow,
+    size_t shadow_len,
+    uint32_t bytes_per_row,
+    uint64_t *tile_checksums,
+    size_t tile_count,
+    const uint64_t *candidate_tile_checksums);
 uint64_t tb_bc7_tile_checksum(const uint8_t *data,
                               uint32_t row_bytes,
                               uint32_t block_rows,

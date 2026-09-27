@@ -54,6 +54,20 @@
  * heartbeats every 2s and streams frames continuously, so 10s of silence
  * (5 missed heartbeats) means it died without a FIN. */
 #define TB_SENDER_IDLE_TIMEOUT_MS 10000
+#define TB_METRIC_WINDOW_CAP 600
+
+struct tb_metric_window {
+    uint64_t values[TB_METRIC_WINDOW_CAP];
+    size_t count;
+    size_t next;
+};
+
+struct tb_metric_summary {
+    uint64_t p50;
+    uint64_t p95;
+    uint64_t p99;
+    uint64_t max;
+};
 
 struct app {
     struct tb_display *disp;
@@ -66,6 +80,7 @@ struct app {
     uint64_t frames;
     uint64_t last_fps_tick_ms;
     uint64_t last_fps_count;
+    uint64_t last_presented_count;
     uint64_t received_bytes;
     uint64_t last_debug_bytes;
     uint64_t packets_received;
@@ -83,11 +98,25 @@ struct app {
     int bc7_keyframe_request_pending;
     uint8_t *bc7_shadow;
     uint64_t *bc7_tile_checksums;
+    uint64_t *bc7_candidate_tile_checksums;
     size_t bc7_shadow_len;
     size_t bc7_tile_count;
     uint32_t bc7_width;
     uint32_t bc7_height;
     uint32_t bc7_bytes_per_row;
+    uint64_t bc7_last_packet_ns;
+    uint64_t bc7_last_present_ns;
+    uint64_t bc7_presented_frames;
+    uint64_t bc7_coalesced_frames;
+    int bc7_present_pending;
+    uint64_t bc7_present_retry_after_ms;
+    uint32_t bc7_pending_present_width;
+    uint32_t bc7_pending_present_height;
+    struct tb_metric_window bc7_packet_interval_ns;
+    struct tb_metric_window bc7_apply_ns;
+    struct tb_metric_window bc7_upload_ns;
+    struct tb_metric_window bc7_present_ns;
+    struct tb_metric_window bc7_present_interval_ns;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      debug_enabled;
@@ -189,6 +218,47 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void metric_record(struct tb_metric_window *window, uint64_t value) {
+    if (!window) return;
+    if (window->count < TB_METRIC_WINDOW_CAP) {
+        window->values[window->count++] = value;
+        return;
+    }
+    window->values[window->next] = value;
+    window->next = (window->next + 1u) % TB_METRIC_WINDOW_CAP;
+}
+
+static int compare_u64(const void *lhs, const void *rhs) {
+    const uint64_t a = *(const uint64_t *)lhs;
+    const uint64_t b = *(const uint64_t *)rhs;
+    return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static struct tb_metric_summary metric_summary(
+    const struct tb_metric_window *window) {
+    struct tb_metric_summary summary = {0};
+    if (!window || window->count == 0) return summary;
+    uint64_t sorted[TB_METRIC_WINDOW_CAP];
+    memcpy(sorted, window->values, window->count * sizeof(*sorted));
+    qsort(sorted, window->count, sizeof(*sorted), compare_u64);
+    const size_t last = window->count - 1u;
+    summary.p50 = sorted[(last * 50u + 99u) / 100u];
+    summary.p95 = sorted[(last * 95u + 99u) / 100u];
+    summary.p99 = sorted[(last * 99u + 99u) / 100u];
+    summary.max = sorted[last];
+    return summary;
+}
+
+static double ns_to_ms(uint64_t value) {
+    return (double)value / 1000000.0;
 }
 
 static void tb_copy_i18n(char *dest, size_t size, const char *key);
@@ -970,8 +1040,10 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
 static void reset_bc7_delta_state(struct app *a) {
     free(a->bc7_shadow);
     free(a->bc7_tile_checksums);
+    free(a->bc7_candidate_tile_checksums);
     a->bc7_shadow = NULL;
     a->bc7_tile_checksums = NULL;
+    a->bc7_candidate_tile_checksums = NULL;
     a->bc7_shadow_len = 0;
     a->bc7_tile_count = 0;
     a->bc7_width = 0;
@@ -979,6 +1051,8 @@ static void reset_bc7_delta_state(struct app *a) {
     a->bc7_bytes_per_row = 0;
     a->bc7_applied_sequence = 0;
     a->bc7_checksum = 0;
+    a->bc7_present_pending = 0;
+    a->bc7_present_retry_after_ms = 0;
 }
 
 static uint64_t checksum_bc7_tiles(const uint8_t *blocks,
@@ -1072,10 +1146,61 @@ static void maybe_send_bc7_render_ack(struct app *a,
     }
 }
 
+static void record_bc7_packet_arrival(struct app *a, uint64_t now) {
+    if (a->bc7_last_packet_ns != 0 && now >= a->bc7_last_packet_ns) {
+        metric_record(&a->bc7_packet_interval_ns, now - a->bc7_last_packet_ns);
+    }
+    a->bc7_last_packet_ns = now;
+}
+
+static void schedule_bc7_present(struct app *a,
+                                 uint32_t width,
+                                 uint32_t height) {
+    if (a->bc7_present_pending) {
+        a->bc7_coalesced_frames++;
+    }
+    a->bc7_present_pending = 1;
+    a->bc7_present_retry_after_ms = 0;
+    a->bc7_pending_present_width = width;
+    a->bc7_pending_present_height = height;
+}
+
+static void present_pending_bc7(struct app *a) {
+    if (!a->bc7_present_pending) return;
+    const uint64_t now = now_ms();
+    if (now < a->bc7_present_retry_after_ms) return;
+    const uint64_t started = now_ns();
+    const int wait_for_ack = !a->bc7_render_ack_sent;
+    if (tb_disp_present_bc7(a->disp, wait_for_ack) != 0) {
+        a->bc7_render_failures++;
+        a->bc7_present_retry_after_ms = now + 8u;
+        return;
+    }
+    const uint64_t finished = now_ns();
+    metric_record(&a->bc7_present_ns, finished - started);
+    if (a->bc7_last_present_ns != 0 && finished >= a->bc7_last_present_ns) {
+        metric_record(
+            &a->bc7_present_interval_ns,
+            finished - a->bc7_last_present_ns
+        );
+    }
+    a->bc7_last_present_ns = finished;
+    a->bc7_presented_frames++;
+    a->bc7_present_pending = 0;
+    a->bc7_present_retry_after_ms = 0;
+    maybe_send_bc7_render_ack(
+        a,
+        a->bc7_pending_present_width,
+        a->bc7_pending_present_height
+    );
+}
+
 /* Full-frame BC7 Mode 6 texture.
  * Payload: [1: format=1][BE32 w][BE32 h][BE32 bytesPerRow]
  *          [BC7 blocks: bytesPerRow*(h/4)] */
 static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
+    const uint64_t apply_started = now_ns();
+    record_bc7_packet_arrival(a, apply_started);
     struct tb_bc7_frame frame;
     if (tb_bc7_frame_parse(p, len, &frame) != 0) {
         a->bc7_invalid_frames++;
@@ -1098,9 +1223,12 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
              TB_BC7_DELTA_TILE_SIZE);
         uint8_t *shadow = malloc(frame.blocks_len);
         uint64_t *tile_checksums = calloc(tile_count, sizeof(*tile_checksums));
-        if (!shadow || !tile_checksums) {
+        uint64_t *candidate_tile_checksums =
+            malloc(tile_count * sizeof(*candidate_tile_checksums));
+        if (!shadow || !tile_checksums || !candidate_tile_checksums) {
             free(shadow);
             free(tile_checksums);
+            free(candidate_tile_checksums);
             a->bc7_invalid_frames++;
             return;
         }
@@ -1111,10 +1239,12 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         if (checksum != frame.checksum) {
             free(shadow);
             free(tile_checksums);
+            free(candidate_tile_checksums);
             a->bc7_invalid_frames++;
             request_bc7_keyframe(a, "keyframe-checksum");
             return;
         }
+        const uint64_t upload_started = now_ns();
         if (tb_disp_upload_bc7(a->disp,
                                frame.blocks,
                                frame.blocks_len,
@@ -1123,12 +1253,15 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
                                frame.bytes_per_row) != 0) {
             free(shadow);
             free(tile_checksums);
+            free(candidate_tile_checksums);
             a->bc7_render_failures++;
             return;
         }
+        metric_record(&a->bc7_upload_ns, now_ns() - upload_started);
         reset_bc7_delta_state(a);
         a->bc7_shadow = shadow;
         a->bc7_tile_checksums = tile_checksums;
+        a->bc7_candidate_tile_checksums = candidate_tile_checksums;
         a->bc7_shadow_len = frame.blocks_len;
         a->bc7_tile_count = tile_count;
         a->bc7_width = frame.width;
@@ -1137,22 +1270,20 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         a->bc7_applied_sequence = frame.sequence;
         a->bc7_checksum = checksum;
         a->bc7_keyframe_request_pending = 0;
-    } else if (tb_disp_upload_bc7(a->disp,
+    } else {
+        const uint64_t upload_started = now_ns();
+        if (tb_disp_upload_bc7(a->disp,
                                   frame.blocks,
                                   frame.blocks_len,
                                   frame.width,
                                   frame.height,
                                   frame.bytes_per_row) != 0) {
-        a->bc7_render_failures++;
-        fprintf(stderr, "[bc7] unable to upload %ux%u frame\n",
-                frame.width, frame.height);
-        return;
-    }
-    if (tb_disp_present_bc7(a->disp, !a->bc7_render_ack_sent) != 0) {
-        a->bc7_render_failures++;
-        fprintf(stderr, "[bc7] unable to present %ux%u frame\n",
-                frame.width, frame.height);
-        return;
+            a->bc7_render_failures++;
+            fprintf(stderr, "[bc7] unable to upload %ux%u frame\n",
+                    frame.width, frame.height);
+            return;
+        }
+        metric_record(&a->bc7_upload_ns, now_ns() - upload_started);
     }
 
     a->have_video_frame = 1;
@@ -1172,112 +1303,117 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
     a->bc7_frames++;
     a->bc7_bytes += frame.blocks_len;
     snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7");
-
-    maybe_send_bc7_render_ack(a, frame.width, frame.height);
+    schedule_bc7_present(a, frame.width, frame.height);
+    metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
 }
 
 static void handle_bc7_delta(struct app *a, const uint8_t *p, size_t len) {
-            struct tb_bc7_delta_frame frame;
-            if (tb_bc7_delta_parse(p, len, &frame) != 0 ||
-                !a->bc7_shadow || !a->bc7_tile_checksums ||
-                frame.width != a->bc7_width || frame.height != a->bc7_height ||
-                !tb_bc7_delta_sequence_valid(
-                    frame.sequence, frame.base_sequence, a->bc7_applied_sequence
-                )) {
-                a->bc7_invalid_frames++;
-                request_bc7_keyframe(a, "delta-base");
-                return;
-            }
-
-            uint8_t *candidate = malloc(a->bc7_shadow_len);
-            uint64_t *candidate_checksums =
-                malloc(a->bc7_tile_count * sizeof(*candidate_checksums));
-            if (!candidate || !candidate_checksums) {
-                free(candidate);
-                free(candidate_checksums);
-                a->bc7_invalid_frames++;
-                return;
-            }
-            memcpy(candidate, a->bc7_shadow, a->bc7_shadow_len);
-            memcpy(candidate_checksums,
-                   a->bc7_tile_checksums,
-                   a->bc7_tile_count * sizeof(*candidate_checksums));
-
-            uint64_t checksum = 0;
-            if (tb_bc7_delta_apply_to_shadow(
-                    &frame,
-                    candidate,
-                    a->bc7_shadow_len,
-                    a->bc7_bytes_per_row,
-                    candidate_checksums,
-                    a->bc7_tile_count,
-                    &checksum) != 0) {
-                free(candidate);
-                free(candidate_checksums);
-                a->bc7_invalid_frames++;
-                request_bc7_keyframe(a, "delta-checksum");
-                return;
-            }
-
-            if (tb_bc7_delta_prefers_full_upload(&frame, a->bc7_shadow_len)) {
-                if (tb_disp_upload_bc7(
-                        a->disp,
-                        candidate,
-                        a->bc7_shadow_len,
-                        frame.width,
-                        frame.height,
-                        a->bc7_bytes_per_row) != 0) {
-                    free(candidate);
-                    free(candidate_checksums);
-                    a->bc7_render_failures++;
-                    reset_bc7_delta_state(a);
-                    request_bc7_keyframe(a, "delta-full-upload");
-                    return;
-                }
-            } else {
-                for (uint16_t index = 0; index < frame.run_count; index++) {
-                    const struct tb_bc7_delta_run *run = &frame.runs[index];
-                    const uint32_t run_width =
-                        (uint32_t)run->tile_count_x * frame.tile_size;
-                    const uint32_t run_row_bytes = (run_width / 4u) * 16u;
-                    if (tb_disp_upload_bc7_region(
-                            a->disp,
-                            run->data,
-                            run->data_length,
-                            frame.width,
-                            frame.height,
-                            (uint32_t)run->tile_x * frame.tile_size,
-                            (uint32_t)run->tile_y * frame.tile_size,
-                            run_width,
-                            run->pixel_height,
-                            run_row_bytes) != 0) {
-                        free(candidate);
-                        free(candidate_checksums);
-                        a->bc7_render_failures++;
-                        reset_bc7_delta_state(a);
-                        request_bc7_keyframe(a, "delta-upload");
-                        return;
-                    }
-                }
-            }
-
-            free(a->bc7_shadow);
-            free(a->bc7_tile_checksums);
-            a->bc7_shadow = candidate;
-            a->bc7_tile_checksums = candidate_checksums;
-            a->bc7_applied_sequence = frame.sequence;
-            a->bc7_checksum = checksum;
-            a->frames++;
-            a->bc7_frames++;
-            a->bc7_delta_frames++;
-            a->bc7_bytes += len;
-            snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7-delta");
-    const int wait_for_ack = !a->bc7_render_ack_sent;
-    if (tb_disp_present_bc7(a->disp, wait_for_ack) != 0) {
-        a->bc7_render_failures++;
-    } else {
-        maybe_send_bc7_render_ack(a, frame.width, frame.height);
+    const uint64_t apply_started = now_ns();
+    record_bc7_packet_arrival(a, apply_started);
+    struct tb_bc7_delta_frame frame;
+    if (tb_bc7_delta_parse(p, len, &frame) != 0 ||
+        !a->bc7_shadow || !a->bc7_tile_checksums ||
+        !a->bc7_candidate_tile_checksums ||
+        frame.width != a->bc7_width || frame.height != a->bc7_height ||
+        !tb_bc7_delta_sequence_valid(
+            frame.sequence, frame.base_sequence, a->bc7_applied_sequence
+        )) {
+        a->bc7_invalid_frames++;
+        request_bc7_keyframe(a, "delta-base");
+        return;
     }
+
+    uint64_t checksum = 0;
+    if (tb_bc7_delta_validate_candidate(
+            &frame,
+            a->bc7_tile_checksums,
+            a->bc7_tile_count,
+            a->bc7_checksum,
+            a->bc7_candidate_tile_checksums,
+            &checksum) != 0) {
+        a->bc7_invalid_frames++;
+        request_bc7_keyframe(a, "delta-checksum");
+        return;
+    }
+
+    const int full_upload =
+        tb_bc7_delta_prefers_full_upload(&frame, a->bc7_shadow_len);
+    if (full_upload &&
+        tb_bc7_delta_commit_to_shadow(
+            &frame,
+            a->bc7_shadow,
+            a->bc7_shadow_len,
+            a->bc7_bytes_per_row,
+            a->bc7_tile_checksums,
+            a->bc7_tile_count,
+            a->bc7_candidate_tile_checksums) != 0) {
+        a->bc7_invalid_frames++;
+        request_bc7_keyframe(a, "delta-commit");
+        return;
+    }
+
+    const uint64_t upload_started = now_ns();
+    if (full_upload) {
+        if (tb_disp_upload_bc7(
+                a->disp,
+                a->bc7_shadow,
+                a->bc7_shadow_len,
+                frame.width,
+                frame.height,
+                a->bc7_bytes_per_row) != 0) {
+            a->bc7_render_failures++;
+            reset_bc7_delta_state(a);
+            request_bc7_keyframe(a, "delta-full-upload");
+            return;
+        }
+    } else {
+        for (uint16_t index = 0; index < frame.run_count; index++) {
+            const struct tb_bc7_delta_run *run = &frame.runs[index];
+            const uint32_t run_width =
+                (uint32_t)run->tile_count_x * frame.tile_size;
+            const uint32_t run_row_bytes = (run_width / 4u) * 16u;
+            if (tb_disp_upload_bc7_region(
+                    a->disp,
+                    run->data,
+                    run->data_length,
+                    frame.width,
+                    frame.height,
+                    (uint32_t)run->tile_x * frame.tile_size,
+                    (uint32_t)run->tile_y * frame.tile_size,
+                    run_width,
+                    run->pixel_height,
+                    run_row_bytes) != 0) {
+                a->bc7_render_failures++;
+                reset_bc7_delta_state(a);
+                request_bc7_keyframe(a, "delta-upload");
+                return;
+            }
+        }
+        if (tb_bc7_delta_commit_to_shadow(
+                &frame,
+                a->bc7_shadow,
+                a->bc7_shadow_len,
+                a->bc7_bytes_per_row,
+                a->bc7_tile_checksums,
+                a->bc7_tile_count,
+                a->bc7_candidate_tile_checksums) != 0) {
+            a->bc7_invalid_frames++;
+            reset_bc7_delta_state(a);
+            request_bc7_keyframe(a, "delta-commit");
+            return;
+        }
+    }
+    metric_record(&a->bc7_upload_ns, now_ns() - upload_started);
+
+    a->bc7_applied_sequence = frame.sequence;
+    a->bc7_checksum = checksum;
+    a->frames++;
+    a->bc7_frames++;
+    a->bc7_delta_frames++;
+    a->bc7_bytes += len;
+    snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7-delta");
+    schedule_bc7_present(a, frame.width, frame.height);
+    metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
 }
 
 static void ring_read(struct app *a, Uint8 *dst, int len) {
@@ -1547,12 +1683,15 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 static int drain_socket(struct app *a) {
     uint8_t buf[1024 * 1024];
     int saw_data = 0;
+    size_t drained_bytes = 0;
     for (;;) {
         ssize_t n = read(a->client_fd, buf, sizeof(buf));
         if (n > 0) {
             saw_data = 1;
+            drained_bytes += (size_t)n;
             a->received_bytes += (uint64_t)n;
             if (tb_parser_feed(&a->parser, buf, (size_t)n) < 0) return -1;
+            if (drained_bytes >= 32u * 1024u * 1024u) return saw_data;
         } else if (n == 0) {
             return -1;  /* peer closed */
         } else {
@@ -2064,17 +2203,33 @@ static void send_receiver_info(struct app *a) {
     free(pkt);
 }
 
-static void send_receiver_metrics(struct app *a, double fps, double gbps) {
+static void send_receiver_metrics(
+    struct app *a, double fps, double present_fps, double gbps) {
     if (!a || a->client_fd < 0) return;
-    char json[640];
+    const struct tb_metric_summary packet_interval =
+        metric_summary(&a->bc7_packet_interval_ns);
+    const struct tb_metric_summary apply = metric_summary(&a->bc7_apply_ns);
+    const struct tb_metric_summary upload = metric_summary(&a->bc7_upload_ns);
+    const struct tb_metric_summary present = metric_summary(&a->bc7_present_ns);
+    const struct tb_metric_summary present_interval =
+        metric_summary(&a->bc7_present_interval_ns);
+    char json[1536];
     int json_len = snprintf(
         json,
         sizeof(json),
-        "{\"fps\":%.3f,\"networkGbps\":%.6f,\"packets\":%llu,"
+        "{\"fps\":%.3f,\"presentFPS\":%.3f,\"networkGbps\":%.6f,\"packets\":%llu,"
         "\"bc7Frames\":%llu,\"bc7PayloadBytes\":%llu,\"bc7Invalid\":%llu,"
         "\"renderFailures\":%llu,\"bc7Deltas\":%llu,\"appliedSequence\":%llu,"
-        "\"keyframeRequests\":%llu}",
+        "\"keyframeRequests\":%llu,\"packetIntervalP50Ms\":%.3f,"
+        "\"packetIntervalP95Ms\":%.3f,\"packetIntervalP99Ms\":%.3f,"
+        "\"applyP50Ms\":%.3f,\"applyP95Ms\":%.3f,\"applyP99Ms\":%.3f,"
+        "\"uploadP50Ms\":%.3f,\"uploadP95Ms\":%.3f,\"uploadP99Ms\":%.3f,"
+        "\"presentP50Ms\":%.3f,\"presentP95Ms\":%.3f,\"presentP99Ms\":%.3f,"
+        "\"presentIntervalP50Ms\":%.3f,\"presentIntervalP95Ms\":%.3f,"
+        "\"presentIntervalP99Ms\":%.3f,\"presentedFrames\":%llu,"
+        "\"coalescedFrames\":%llu}",
         fps,
+        present_fps,
         gbps,
         (unsigned long long)a->packets_received,
         (unsigned long long)a->bc7_frames,
@@ -2083,12 +2238,29 @@ static void send_receiver_metrics(struct app *a, double fps, double gbps) {
         (unsigned long long)a->bc7_render_failures,
         (unsigned long long)a->bc7_delta_frames,
         (unsigned long long)a->bc7_applied_sequence,
-        (unsigned long long)a->bc7_keyframe_requests
+        (unsigned long long)a->bc7_keyframe_requests,
+        ns_to_ms(packet_interval.p50),
+        ns_to_ms(packet_interval.p95),
+        ns_to_ms(packet_interval.p99),
+        ns_to_ms(apply.p50),
+        ns_to_ms(apply.p95),
+        ns_to_ms(apply.p99),
+        ns_to_ms(upload.p50),
+        ns_to_ms(upload.p95),
+        ns_to_ms(upload.p99),
+        ns_to_ms(present.p50),
+        ns_to_ms(present.p95),
+        ns_to_ms(present.p99),
+        ns_to_ms(present_interval.p50),
+        ns_to_ms(present_interval.p95),
+        ns_to_ms(present_interval.p99),
+        (unsigned long long)a->bc7_presented_frames,
+        (unsigned long long)a->bc7_coalesced_frames
     );
     if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
 
     const size_t packet_len = 5u + (size_t)json_len;
-    uint8_t packet[5 + 640];
+    uint8_t packet[5 + 1536];
     write_be32(packet, (uint32_t)(1 + json_len));
     packet[4] = TB_PKT_RECEIVER_METRICS;
     memcpy(packet + 5, json, (size_t)json_len);
@@ -2382,6 +2554,7 @@ int main(int argc, char **argv) {
                 reset_bc7_delta_state(&a);
                 a.frames = 0;
                 a.last_fps_count = 0;
+                a.last_presented_count = 0;
                 a.received_bytes = 0;
                 a.last_debug_bytes = 0;
                 a.packets_received = 0;
@@ -2393,6 +2566,15 @@ int main(int argc, char **argv) {
                 a.bc7_acks_sent = 0;
                 a.bc7_delta_frames = 0;
                 a.bc7_keyframe_requests = 0;
+                a.bc7_last_packet_ns = 0;
+                a.bc7_last_present_ns = 0;
+                a.bc7_presented_frames = 0;
+                a.bc7_coalesced_frames = 0;
+                memset(&a.bc7_packet_interval_ns, 0, sizeof(a.bc7_packet_interval_ns));
+                memset(&a.bc7_apply_ns, 0, sizeof(a.bc7_apply_ns));
+                memset(&a.bc7_upload_ns, 0, sizeof(a.bc7_upload_ns));
+                memset(&a.bc7_present_ns, 0, sizeof(a.bc7_present_ns));
+                memset(&a.bc7_present_interval_ns, 0, sizeof(a.bc7_present_interval_ns));
                 snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
@@ -2424,6 +2606,8 @@ int main(int argc, char **argv) {
                 }
             }
         }
+
+        present_pending_bc7(&a);
 
         if (t - a.last_permissions_poll_ms >= 250) {
             a.last_permissions_poll_ms = t;
@@ -2511,30 +2695,49 @@ int main(int argc, char **argv) {
         /* FPS log */
         if (t - a.last_fps_tick_ms >= 1000) {
             uint64_t df = a.frames - a.last_fps_count;
+            uint64_t dpf = a.bc7_presented_frames - a.last_presented_count;
             uint64_t db = a.received_bytes - a.last_debug_bytes;
             uint64_t elapsed_ms = t - a.last_fps_tick_ms;
             a.last_fps_count   = a.frames;
+            a.last_presented_count = a.bc7_presented_frames;
             a.last_debug_bytes = a.received_bytes;
             a.last_fps_tick_ms = t;
             double fps = elapsed_ms > 0
                 ? ((double)df * 1000.0 / (double)elapsed_ms)
                 : 0.0;
+            double present_fps = elapsed_ms > 0
+                ? ((double)dpf * 1000.0 / (double)elapsed_ms)
+                : 0.0;
             double gbps = elapsed_ms > 0
                 ? ((double)db * 8.0 / ((double)elapsed_ms * 1000000.0))
                 : 0.0;
-            send_receiver_metrics(&a, fps, gbps);
+            send_receiver_metrics(&a, fps, present_fps, gbps);
             if (a.debug_enabled) {
+                const struct tb_metric_summary packet_interval =
+                    metric_summary(&a.bc7_packet_interval_ns);
+                const struct tb_metric_summary apply =
+                    metric_summary(&a.bc7_apply_ns);
+                const struct tb_metric_summary upload =
+                    metric_summary(&a.bc7_upload_ns);
+                const struct tb_metric_summary present =
+                    metric_summary(&a.bc7_present_ns);
+                const struct tb_metric_summary present_interval =
+                    metric_summary(&a.bc7_present_interval_ns);
                 fprintf(stderr,
                         "[diag] event=metrics connected=%s sessionActive=%s "
-                        "transport=%s fps=%.2f networkGbps=%.3f packets=%llu "
+                        "transport=%s fps=%.2f presentFps=%.2f networkGbps=%.3f packets=%llu "
                         "bc7Frames=%llu bc7PayloadBytes=%llu bc7Invalid=%llu "
                         "renderFailures=%llu generation=%u ackPending=%s "
                         "bc7Deltas=%llu appliedSequence=%llu keyframeRequests=%llu "
-                        "ackRequests=%llu acksSent=%llu\n",
+                        "ackRequests=%llu acksSent=%llu presented=%llu coalesced=%llu "
+                        "packetIntervalMs=%.2f/%.2f/%.2f applyMs=%.2f/%.2f/%.2f "
+                        "uploadMs=%.2f/%.2f/%.2f presentMs=%.2f/%.2f/%.2f "
+                        "presentIntervalMs=%.2f/%.2f/%.2f\n",
                         a.client_fd >= 0 ? "true" : "false",
                         a.session_active ? "true" : "false",
                         a.active_transport,
                         fps,
+                        present_fps,
                         gbps,
                         (unsigned long long)a.packets_received,
                         (unsigned long long)a.bc7_frames,
@@ -2547,7 +2750,24 @@ int main(int argc, char **argv) {
                         (unsigned long long)a.bc7_applied_sequence,
                         (unsigned long long)a.bc7_keyframe_requests,
                         (unsigned long long)a.bc7_ack_requests,
-                        (unsigned long long)a.bc7_acks_sent);
+                        (unsigned long long)a.bc7_acks_sent,
+                        (unsigned long long)a.bc7_presented_frames,
+                        (unsigned long long)a.bc7_coalesced_frames,
+                        ns_to_ms(packet_interval.p50),
+                        ns_to_ms(packet_interval.p95),
+                        ns_to_ms(packet_interval.p99),
+                        ns_to_ms(apply.p50),
+                        ns_to_ms(apply.p95),
+                        ns_to_ms(apply.p99),
+                        ns_to_ms(upload.p50),
+                        ns_to_ms(upload.p95),
+                        ns_to_ms(upload.p99),
+                        ns_to_ms(present.p50),
+                        ns_to_ms(present.p95),
+                        ns_to_ms(present.p99),
+                        ns_to_ms(present_interval.p50),
+                        ns_to_ms(present_interval.p95),
+                        ns_to_ms(present_interval.p99));
             } else if (df > 0) {
                 fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
             }

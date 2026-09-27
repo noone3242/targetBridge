@@ -379,7 +379,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertTrue(planner.requiresFullFrame)
     }
 
-    func testBC7DeltaPlannerPeriodicAndRunCountKeyframes() throws {
+    func testBC7DeltaPlannerPeriodicKeyframesAndRunCoalescing() throws {
         let periodic = TBBC7DeltaPlanner(keyframeIntervalFrames: 1)
         let frame = Data(repeating: 0, count: 4096)
         _ = periodic.plan(current: frame, width: 64, height: 64, bytesPerRow: 256)
@@ -411,17 +411,18 @@ final class TBMonitorProtocolTests: XCTestCase {
                 checkerboard[offset] = 1
             }
         }
-        guard case .keyframe = try XCTUnwrap(runLimited.plan(
+        guard case .delta(_, _, _, let runs, _, _) = try XCTUnwrap(runLimited.plan(
             current: checkerboard,
             width: width,
             height: height,
             bytesPerRow: bytesPerRow
         )) else {
-            return XCTFail("more than 256 disjoint runs must force a keyframe")
+            return XCTFail("fragmented changes should remain a bounded delta")
         }
+        XCTAssertLessThanOrEqual(runs.count, height / 64)
     }
 
-    func testBC7DeltaPlannerCoalescesRunsAndFallsBackAtThreshold() throws {
+    func testBC7DeltaPlannerCoalescesRunsWithoutPayloadKeyframeFallback() throws {
         let width = 128
         let height = 64
         let bytesPerRow = 512
@@ -432,13 +433,15 @@ final class TBMonitorProtocolTests: XCTestCase {
         var bothTilesChanged = initial
         bothTilesChanged[0] = 1
         bothTilesChanged[256] = 2
-        guard case .keyframe(let sequence, _, _) =
+        guard case .delta(let sequence, _, _, let fullRowRuns, _, _) =
             try XCTUnwrap(planner.plan(
                 current: bothTilesChanged, width: width, height: height, bytesPerRow: bytesPerRow
             )) else {
-            return XCTFail("delta larger than threshold must become a keyframe")
+            return XCTFail("large delta should not inject a latency-heavy keyframe")
         }
         XCTAssertEqual(sequence, 2)
+        XCTAssertEqual(fullRowRuns.count, 1)
+        XCTAssertEqual(fullRowRuns[0].tileCountX, 2)
 
         let widePlanner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
         let wideWidth = 192
@@ -462,6 +465,86 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(dirty, 2)
         XCTAssertEqual(runs.count, 1)
         XCTAssertEqual(runs[0].tileCountX, 2)
+    }
+
+    func testBC7DeltaPlannerDefersWithinBudgetAndConverges() throws {
+        let width = 256
+        let height = 64
+        let bytesPerRow = 1024
+        let planner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        let initial = Data(repeating: 0, count: bytesPerRow * (height / 4))
+        _ = planner.plan(
+            current: initial,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow
+        )
+
+        let changed = Data(repeating: 1, count: initial.count)
+        for expectedDeferred in stride(from: 3, through: 0, by: -1) {
+            guard case .delta(_, _, _, let runs, _, _) = try XCTUnwrap(
+                planner.plan(
+                    current: changed,
+                    width: width,
+                    height: height,
+                    bytesPerRow: bytesPerRow,
+                    maxTilesPerDelta: 1
+                )
+            ) else {
+                return XCTFail("budgeted update must remain a delta")
+            }
+            XCTAssertEqual(runs.reduce(0) { $0 + $1.tileCountX }, 1)
+            XCTAssertEqual(planner.lastStats.deferredTiles, expectedDeferred)
+            XCTAssertLessThanOrEqual(
+                planner.lastStats.worstDeferredAge,
+                TBBC7TileBudgetController.maxTileAge
+            )
+        }
+
+        guard case .delta(_, _, _, let finalRuns, let dirtyTiles, _) =
+            try XCTUnwrap(planner.plan(
+                current: changed,
+                width: width,
+                height: height,
+                bytesPerRow: bytesPerRow,
+                maxTilesPerDelta: 1
+            )) else {
+            return XCTFail("converged frame must remain a delta")
+        }
+        XCTAssertTrue(finalRuns.isEmpty)
+        XCTAssertEqual(dirtyTiles, 0)
+        XCTAssertEqual(planner.lastStats.deferredTiles, 0)
+    }
+
+    func testBC7TileBudgetControllerUsesHysteresisAndAgeFloor() {
+        var controller = TBBC7TileBudgetController()
+        XCTAssertEqual(controller.budget(totalTiles: 3600), 3600)
+
+        controller.recordSend(durationNanoseconds: 13_000_000, totalTiles: 3600)
+        XCTAssertEqual(controller.budget(totalTiles: 3600), 3600)
+        controller.recordSend(durationNanoseconds: 13_000_000, totalTiles: 3600)
+        XCTAssertEqual(controller.budget(totalTiles: 3600), 2700)
+
+        for _ in 0..<12 {
+            controller.recordSend(durationNanoseconds: 7_000_000, totalTiles: 3600)
+        }
+        XCTAssertGreaterThan(controller.budget(totalTiles: 3600), 2700)
+
+        for _ in 0..<40 {
+            controller.recordSend(durationNanoseconds: 20_000_000, totalTiles: 3600)
+        }
+        XCTAssertGreaterThanOrEqual(controller.budget(totalTiles: 3600), 900)
+    }
+
+    func testRollingMetricWindowReportsTailPercentiles() {
+        var window = TBRollingMetricWindow(capacity: 5)
+        [1, 2, 3, 4, 100].forEach { window.record(UInt64($0)) }
+        let summary = window.summary()
+        XCTAssertEqual(summary.count, 5)
+        XCTAssertEqual(summary.p50, 3)
+        XCTAssertEqual(summary.p95, 100)
+        XCTAssertEqual(summary.p99, 100)
+        XCTAssertEqual(summary.max, 100)
     }
 
     func testBC7DeltaPacketWritesRunsDirectlyFromFrameBuffer() throws {
@@ -679,6 +762,13 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(first.data.subdata(in: 0..<16), second.data.subdata(in: 0..<16))
         XCTAssertNotEqual(first.data.subdata(in: 256..<272), second.data.subdata(in: 256..<272))
         XCTAssertNil(encoder.encode(pixelBuffer: updated, dirtyRects: []))
+        let deferredPass = try XCTUnwrap(encoder.encode(
+            pixelBuffer: updated,
+            dirtyRects: [],
+            allowEmptyDirtyPlan: true
+        ))
+        XCTAssertEqual(deferredPass.data, second.data)
+        XCTAssertNotNil(deferredPass.tileAnalysis)
     }
 
     func testMetalTileAnalysisMatchesCPUPlannerChecksum() throws {

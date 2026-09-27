@@ -65,6 +65,7 @@ struct TBMonitorCreateSessionAck: Codable {
 
 struct TBMonitorReceiverMetrics: Codable, Equatable {
     var fps: Double
+    var presentFPS: Double?
     var networkGbps: Double
     var packets: UInt64
     var bc7Frames: UInt64
@@ -74,6 +75,23 @@ struct TBMonitorReceiverMetrics: Codable, Equatable {
     var bc7Deltas: UInt64
     var appliedSequence: UInt64
     var keyframeRequests: UInt64
+    var packetIntervalP50Ms: Double?
+    var packetIntervalP95Ms: Double?
+    var packetIntervalP99Ms: Double?
+    var applyP50Ms: Double?
+    var applyP95Ms: Double?
+    var applyP99Ms: Double?
+    var uploadP50Ms: Double?
+    var uploadP95Ms: Double?
+    var uploadP99Ms: Double?
+    var presentP50Ms: Double?
+    var presentP95Ms: Double?
+    var presentP99Ms: Double?
+    var presentIntervalP50Ms: Double?
+    var presentIntervalP95Ms: Double?
+    var presentIntervalP99Ms: Double?
+    var presentedFrames: UInt64?
+    var coalescedFrames: UInt64?
 }
 
 struct TBMonitorUILanguageUpdate: Codable {

@@ -255,6 +255,10 @@ fragment float4 tb_bc7_fragment(
     _metalLayer.device = _device;
     _metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     _metalLayer.framebufferOnly = YES;
+    _metalLayer.displaySyncEnabled = YES;
+    _metalLayer.maximumDrawableCount = 3;
+    _metalLayer.presentsWithTransaction = NO;
+    _metalLayer.allowsNextDrawableTimeout = YES;
     _metalLayer.contentsScale = nsWindow.backingScaleFactor;
     _view.layer = _metalLayer;
     _view.hidden = YES;
