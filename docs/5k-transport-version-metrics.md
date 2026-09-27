@@ -170,3 +170,48 @@ controlled benchmark.
 
 The active Raw NV12 branch may advance beyond `b904306`; use the checkpoint
 tag rather than the moving branch name when reproducing its measured behavior.
+
+## Unfinished Raw NV12 optimization work
+
+The items in this section are implementation status and measurement
+requirements, not measured performance claims.
+
+| Item | Status | Current cost addressed | Dependency / risk | Required validation |
+|---|---|---:|---|---|
+| GPU tile-run packing into a shared `MTLBuffer` | Implemented in `29c13be`; hardware load test pending | CPU run copy p95 averaged 2.26 ms in `7c03537` | Requires valid Screen Recording authorization after the signing migration | Byte-exact output, packing p50/p95, LZ4 p95, FPS and bandwidth under the same drag workload |
+| Candidate-only GPU tile comparison | Not implemented | Full-frame exact tile detection p95 averaged 2.84 ms | SCK dirty rectangles must be accumulated across dropped frames; periodic full scans may still be required | Missed-damage mutation tests, candidate tile count and detection p95 |
+| GPU run compaction | Not implemented | CPU reads tile flags and constructs horizontal run descriptors | Variable-length GPU output and synchronization | Run descriptors byte-exact against CPU planner; command count and wall time |
+| Independent compression chunks | Blocked on codec choice | Sender LZ4 p95 averaged 7.11 ms; Receiver LZ4 p95 averaged 3.25 ms | Separate chunks reset compression history and may increase wire bytes | Compression wall time, total CPU time, chunk count, wire/raw ratio and malformed-chunk recovery |
+| Multicore Sender compression | Not implemented | Single-stream CPU LZ4 compression | Requires independent chunk wire format | Same-frame byte-exact decode, p50/p95 wall time, per-core CPU and bandwidth |
+| Multicore Receiver decompression | Not implemented | Single-stream CPU LZ4 decode | Requires independent chunks and atomic completion before texture mutation | Decode wall time, failed-chunk recovery and no partial texture commit |
+| Alternative lossless tile codec | Undecided | LZ4 CPU cost and 22.2% average wire/raw ratio | Metal has no public LZ4/zstd hardware API; a custom GPU codec needs match finding and variable-output compaction | Cross-architecture decoder, bit-exact corpus, malformed data and throughput |
+| Hardware HEVC path | Existing product path, not evaluated as a replacement for format 4 | Could replace tile LZ4 with media-engine video coding | Lossy video semantics, frame dependencies and different latency/recovery behavior | Identical 5K drag/video workload, encode/decode hardware status, quality and end-to-end latency |
+| BC7 hardware texture path | Preserved at checkpoint `52b4ece` | 8 bpp texture blocks and GPU-native sampling | Lossy texture compression; historical Receiver cadence was poor | Retest `52b4ece` Sender against the latest Receiver before attributing 36.37 FPS to the codec |
+| Batched Receiver NV12 scatter | Not implemented | Multiple `SDL_UpdateNVTexture` calls; upload p95 averaged 2.18 ms | Requires a Metal NV12 renderer or staging-buffer scatter path instead of SDL-owned texture updates | Run-count scaling, upload p50/p95 and one-present-per-frame invariant |
+| Temporal XOR before lossless compression | Not implemented | Average packed raw input was 8.51 MB/frame | Requires an exact synchronized NV12 baseline and full-keyframe recovery after any loss | Byte-exact recovery, dropped-frame mutation and compression-ratio distribution |
+| Separate Y and UV compression | Not implemented | Different entropy in luma and chroma planes | Adds streams and metadata; benefit is content-dependent | Per-plane ratio and wall time on desktop, scrolling and video workloads |
+| Adaptive tile size | Not implemented | 64×64 can over-send boundaries or create many runs | Smaller tiles increase descriptors/uploads; larger tiles increase overfetch | 32/64/128 tile A/B with unique changed bytes, run count, bandwidth and FPS |
+| Tile budget / defer / worst-age governor | Not implemented for NV12 | Burst bandwidth and long LZ4 frames | Updates become delayed and require eventual-lossless convergence rules | Worst tile age, convergence time, bandwidth cap and visual behavior |
+| Fixed-cadence Receiver present loop | Not implemented for NV12 | Packet-arrival jitter affects display cadence | Does not create missing source frames; display loop must present the latest complete texture only | Present interval p50/p95/p99 and duplicate-present count |
+| Controlled version benchmark harness | Not implemented | Historical version samples used different drag workloads | Requires deterministic UI motion or a reproducible capture source | Same action duration and content for every tag, with raw JSONL artifacts retained |
+
+### Compression-path decision still open
+
+The next compression layer has materially different semantics:
+
+```text
+Lossless Raw NV12:
+  GPU pack -> CPU multicore LZ4/other lossless codec
+
+Lossy GPU texture:
+  GPU BC7/BC1 encode -> GPU-native texture sampling
+
+Lossy hardware video:
+  VideoToolbox HEVC encode -> VideoToolbox decode
+
+Custom lossless GPU:
+  GPU tile pack -> custom Metal codec -> custom GPU/CPU decoder
+```
+
+The format 4 checkpoint remains lossless Raw NV12 with CPU LZ4. GPU packing is
+independent of this decision and can feed any later compression path.
