@@ -37,6 +37,7 @@ fba7473  BC7 stable baseline
                                     └─ b904306 checksum disabled
                                        └─ tag: nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27
                                        └─ 7c03537 GPU-detected NV12 tile runs
+                                          └─ 29c13be GPU packing experiment (rejected)
 ```
 
 ## Frozen checkpoints
@@ -64,6 +65,7 @@ fba7473  BC7 stable baseline
 | `b3f416150a39` | NV12 pipeline breakdown | No tag | No valid paired deployment | Not available | Not available | Instrumentation, reusable decode scratch, and shadow-state changes; Receiver was not deployed at the same commit |
 | `b90430696861` | NV12 checksum disabled | `nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27` | 80 | 1.133 Gbit/s | 3.074 Gbit/s | Sender 51.72 Hz; Receiver 51.79 FPS; selected intervals reached 55–58 FPS |
 | `7c03537705c4` | GPU-detected NV12 64×64 tile runs | No tag | 48 high-load windows | 0.812 Gbit/s | 1.780 Gbit/s | Sender 55.04 Hz; Receiver 53.33 FPS; tile detection p95 snapshot average 2.84 ms; no protocol or render errors |
+| `29c13bed2a52` | GPU-packed NV12 runs | No tag; rejected experiment | 77 high-load windows | 1.152 Gbit/s | 2.323 Gbit/s | Sender 45.19 Hz; Receiver 45.03 FPS; GPU packing p95 snapshot average 6.88 ms; no protocol or render errors |
 
 ## Stage measurements
 
@@ -160,6 +162,32 @@ rates changed from 51.72/51.79 to 55.04/53.33 FPS. The workloads and sample
 counts were not identical, so this is an initial hardware result rather than a
 controlled benchmark.
 
+### `29c13be` GPU packing experiment
+
+This experiment replaced CPU row-copy assembly with a second Metal pass that
+packed run bytes into a shared `MTLBuffer`. Across 77 high-load windows:
+
+```text
+Sender capture/sent:          45.38 / 45.19 Hz
+Receiver present:             45.03 FPS
+network average/peak:         1.152 / 2.323 Gbit/s
+GPU tile detection p95 avg:   2.51 ms
+GPU run packing p95 avg:      6.88 ms
+Sender LZ4 p95 avg:           10.31 ms
+Sender send p95 avg:          2.49 ms
+Receiver decompress p95 avg:  3.93 ms
+Receiver upload p95 avg:      2.37 ms
+Receiver apply p95 avg:       6.14 ms
+invalid/render/key requests:  0 / 0 / 0
+```
+
+The previous CPU-packed `7c03537` sample measured 55.04/53.33 Sender/Receiver
+FPS and 2.26 ms copy p95. The extra Metal command submission, texture reads,
+shared-buffer writes, and synchronous wait increased packing p95 to 6.88 ms.
+The experiment was therefore rejected and retained in Git history rather than
+used as the active implementation. Workloads were not identical, but the
+direct packing-stage regression was large enough to reject this form.
+
 ## Branch heads
 
 | Branch | Head |
@@ -178,7 +206,7 @@ requirements, not measured performance claims.
 
 | Item | Status | Current cost addressed | Dependency / risk | Required validation |
 |---|---|---:|---|---|
-| GPU tile-run packing into a shared `MTLBuffer` | Implemented in `29c13be`; hardware load test pending | CPU run copy p95 averaged 2.26 ms in `7c03537` | Requires valid Screen Recording authorization after the signing migration | Byte-exact output, packing p50/p95, LZ4 p95, FPS and bandwidth under the same drag workload |
+| GPU tile-run packing into a shared `MTLBuffer` | Implemented in `29c13be`, measured, and rejected | CPU run copy p95 averaged 2.26 ms in `7c03537`; GPU packing measured 6.88 ms | A second Metal pass and synchronous wait cost more than CPU row copy | Retained in Git history; a future attempt would need fused detection/compaction/packing in one GPU submission |
 | Candidate-only GPU tile comparison | Not implemented | Full-frame exact tile detection p95 averaged 2.84 ms | SCK dirty rectangles must be accumulated across dropped frames; periodic full scans may still be required | Missed-damage mutation tests, candidate tile count and detection p95 |
 | GPU run compaction | Not implemented | CPU reads tile flags and constructs horizontal run descriptors | Variable-length GPU output and synchronization | Run descriptors byte-exact against CPU planner; command count and wall time |
 | Independent compression chunks | Blocked on codec choice | Sender LZ4 p95 averaged 7.11 ms; Receiver LZ4 p95 averaged 3.25 ms | Separate chunks reset compression history and may increase wire bytes | Compression wall time, total CPU time, chunk count, wire/raw ratio and malformed-chunk recovery |
