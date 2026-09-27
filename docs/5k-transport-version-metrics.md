@@ -38,6 +38,8 @@ fba7473  BC7 stable baseline
                                        └─ tag: nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27
                                        └─ 7c03537 GPU-detected NV12 tile runs
                                           └─ 29c13be GPU packing experiment (rejected)
+                                          └─ 0646020 restore CPU packing
+                                             └─ tag: nv12-5k-tile-runs-balanced-checkpoint-2026-09-27
 ```
 
 ## Frozen checkpoints
@@ -48,6 +50,19 @@ fba7473  BC7 stable baseline
 | `bc7-5k-gpu-planner-stable-2026-09-26` | `54a1836c81e5` | GPU BC7 encode and GPU tile analysis | Sender 45.33 Hz; Receiver 47.31 FPS average and 56.77 FPS peak; Sender average/peak bandwidth 1.841/3.228 Gbit/s; Receiver peak 2.928 Gbit/s; no drops or protocol/render errors |
 | `bc7-5k-lz4-low-bandwidth-checkpoint-2026-09-27` | `52b4ece57f1a` | Changed BC7 tile runs in one Raw-BC7 LZ4 stream | Sender 53.90 Hz; Receiver 36.37 FPS; average/peak bandwidth 0.417/0.518 Gbit/s; Sender LZ4 p95 about 3.83 ms; Receiver decompression p95 about 3.15 ms; visible stutter remained |
 | `nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27` | `b90430696861` | Raw NV12 bounding-region LZ4, partial texture upload, checksum disabled | High-load average Sender/Receiver 51.72/51.79 FPS; average/peak bandwidth 1.133/3.074 Gbit/s; a consistent drag interval reached about 55–58 FPS; no invalid frames, render failures, or keyframe requests |
+| `nv12-5k-tile-runs-balanced-checkpoint-2026-09-27` | `06460207cf64` | Exact GPU tile detection, CPU-packed NV12 tile runs, one LZ4 stream, Receiver scatter upload | High-load average Sender/Receiver 55.04/53.33 FPS; average/peak bandwidth 0.812/1.780 Gbit/s; GPU packing experiment rejected and reverted |
+
+## Checkpoint implementation timeline
+
+All timestamps below come directly from Git and use Pacific time (`-07:00`).
+
+| Checkpoint tag | Core implementation commit/time | Final tagged commit/time | Tag frozen time |
+|---|---|---|---|
+| `bc7-5k-stable-2026-09-26` | `fba7473` — 2026-09-26 16:43:25 | `fba7473` — 2026-09-26 16:43:25 | 2026-09-26 17:09:38 |
+| `bc7-5k-gpu-planner-stable-2026-09-26` | `54a1836` — 2026-09-26 17:31:56 | `54a1836` — 2026-09-26 17:31:56 | 2026-09-26 17:48:55 |
+| `bc7-5k-lz4-low-bandwidth-checkpoint-2026-09-27` | `52b4ece` — 2026-09-27 00:20:51 | `52b4ece` — 2026-09-27 00:20:51 | 2026-09-27 10:53:00 |
+| `nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27` | `b904306` — 2026-09-27 10:40:01 | `b904306` — 2026-09-27 10:40:01 | 2026-09-27 11:01:38 |
+| `nv12-5k-tile-runs-balanced-checkpoint-2026-09-27` | `7c03537` — 2026-09-27 11:05:38 | `0646020` — 2026-09-27 11:52:18 | 2026-09-27 11:55:57 |
 
 ## Experiment table
 
