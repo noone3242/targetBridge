@@ -82,6 +82,31 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         XCTAssertNil(TBSenderAutomation.parsePreset("NATIVE5K"))
     }
 
+    func testParseVideoTransportModeAliases() {
+        XCTAssertEqual(TBSenderAutomation.parseVideoTransportMode("auto"), .automatic)
+        XCTAssertEqual(TBSenderAutomation.parseVideoTransportMode("bc7"), .bc7Mode6)
+        XCTAssertEqual(
+            TBSenderAutomation.parseVideoTransportMode("bc7-mode6"),
+            .bc7Mode6
+        )
+        XCTAssertEqual(
+            TBSenderAutomation.parseVideoTransportMode("raw-nv12"),
+            .rawNV12
+        )
+        XCTAssertNil(TBSenderAutomation.parseVideoTransportMode("bogus"))
+    }
+
+    func testParseBC7CompressionModeAliases() {
+        XCTAssertEqual(TBSenderAutomation.parseBC7CompressionMode("off"), .off)
+        XCTAssertEqual(TBSenderAutomation.parseBC7CompressionMode("raw"), .off)
+        XCTAssertEqual(TBSenderAutomation.parseBC7CompressionMode("lz4"), .lz4)
+        XCTAssertEqual(
+            TBSenderAutomation.parseBC7CompressionMode("lzfse"),
+            .lzfse
+        )
+        XCTAssertNil(TBSenderAutomation.parseBC7CompressionMode("bogus"))
+    }
+
     func testExperimental5K60UsesIndependent60FPSHEVCSettings() {
         let preset = TBDisplayCapturePreset.native5k60Experimental
 

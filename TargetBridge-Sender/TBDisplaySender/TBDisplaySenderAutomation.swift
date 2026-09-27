@@ -7,7 +7,7 @@ import Foundation
 // separate control daemon: it reuses the existing TBDisplaySenderService / session model.
 //
 // Two equivalent ways in:
-//   • URL scheme:   open "targetbridge://connect?receiver=auto&mode=mirror&preset=native5k"
+//   • URL scheme:   open "targetbridge://connect?receiver=auto&mode=mirror&preset=native5k&codec=bc7&bc7-compression=lz4"
 //                   open "targetbridge://disconnect"
 //   • Launch args:  TargetBridge --connect --receiver auto --mode mirror --preset native5k
 //                   (handy for a login item / LaunchAgent that should connect on launch)
@@ -114,6 +114,23 @@ enum TBSenderAutomation {
         if let presetName = params["preset"] {
             if let preset = parsePreset(presetName) { session.capturePreset = preset }
             else { NSLog("[automation] unknown preset '\(presetName)' (ignored)") }
+        }
+        if let codec = params["codec"] {
+            if let mode = parseVideoTransportMode(codec) {
+                session.videoTransportMode = mode
+            } else {
+                NSLog("[automation] unknown codec '\(codec)' (ignored)")
+            }
+        }
+        if let compression =
+            (params["bc7-compression"] ?? params["bc7compression"]) {
+            if let mode = parseBC7CompressionMode(compression) {
+                session.bc7CompressionMode = mode
+            } else {
+                NSLog(
+                    "[automation] unknown BC7 compression '\(compression)' (ignored)"
+                )
+            }
         }
 
         guard !session.receiverIP.isEmpty else {
@@ -243,6 +260,28 @@ enum TBSenderAutomation {
         case "2160p", "2160p60", "4k", "crisp": return .crisp2160p60
         case "5k60", "native5k60": return .native5k60Experimental
         case "5k", "native", "5120x2880": return .native5k
+        default: return nil
+        }
+    }
+
+    static func parseVideoTransportMode(
+        _ value: String
+    ) -> TBVideoTransportMode? {
+        switch value.lowercased() {
+        case "auto", "automatic", "video": return .automatic
+        case "bc7", "bc7mode6", "bc7-mode6": return .bc7Mode6
+        case "raw", "nv12", "rawnv12", "raw-nv12": return .rawNV12
+        default: return TBVideoTransportMode(rawValue: value)
+        }
+    }
+
+    static func parseBC7CompressionMode(
+        _ value: String
+    ) -> TBBC7CompressionMode? {
+        switch value.lowercased() {
+        case "off", "none", "raw": return .off
+        case "lz4": return .lz4
+        case "lzfse": return .lzfse
         default: return nil
         }
     }
