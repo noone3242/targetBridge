@@ -706,6 +706,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "supportsBC7Mode6", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsBC7TileDelta", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsBC7LZFSE", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
+    TXTRecordSetValue(&txt, "supportsBC7LZ4", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
 
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) == 0) {
@@ -2220,6 +2221,7 @@ static void send_receiver_info(struct app *a) {
         "\"receiverVersion\":\"%s\",\"receiverBuild\":\"%s\",\"receiverCommit\":\"%s\","
         "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsBC7Mode6\":%s,"
         "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
+        "\"supportsBC7LZ4\":%s,"
         "\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
         escaped_name,
         panel_w,
@@ -2232,6 +2234,7 @@ static void send_receiver_info(struct app *a) {
         TB_RECEIVER_BUILD,
         TB_RECEIVER_COMMIT,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
+        tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
@@ -2454,12 +2457,14 @@ int main(int argc, char **argv) {
             "{\"version\":\"%s\",\"build\":\"%s\",\"commit\":\"%s\",\"architecture\":\"%s\","
             "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
             "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
+            "\"supportsBC7LZ4\":%s,"
             "\"supportsRawNV12\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
             TB_RECEIVER_COMMIT,
             architecture,
             metal_device,
+            tb_bc7_renderer_supported() ? "true" : "false",
             tb_bc7_renderer_supported() ? "true" : "false",
             tb_bc7_renderer_supported() ? "true" : "false",
             tb_bc7_renderer_supported() ? "true" : "false"

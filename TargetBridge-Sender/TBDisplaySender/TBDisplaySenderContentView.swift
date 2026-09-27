@@ -733,6 +733,28 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         .disabled(session.isConnected || session.isStreaming)
                     }
 
+                    if session.videoTransportMode == .bc7Mode6 {
+                        settingRow(
+                            service.language == .chinese
+                                ? "BC7 传输压缩"
+                                : "BC7 transport compression",
+                            details: service.language == .chinese
+                                ? "关闭用于原始BC7基线；LZ4优先低延迟；LZFSE优先压缩率。"
+                                : "Off keeps the raw BC7 baseline; LZ4 favors latency; LZFSE favors compression ratio."
+                        ) {
+                            Picker(
+                                "BC7 transport compression",
+                                selection: $session.bc7CompressionMode
+                            ) {
+                                ForEach(TBBC7CompressionMode.allCases) { mode in
+                                    Text(mode.title(service.language)).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .disabled(session.isConnected || session.isStreaming)
+                        }
+                    }
+
                     if session.captureSource == .extendedDesktop {
                         settingRow(renderMatchingTitle, details: renderMatchingDetails) {
                             Toggle("", isOn: $session.matchRenderToStream)

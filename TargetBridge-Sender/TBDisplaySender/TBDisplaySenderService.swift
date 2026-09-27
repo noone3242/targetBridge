@@ -1674,6 +1674,7 @@ struct TBPipelineDiagnosticsSnapshot {
     let bc7CompressionFallbacks: Int
     let bc7RawPacketBytes: UInt64
     let bc7WirePacketBytes: UInt64
+    let bc7CompressionMode: String
     let captureComplete: Int
     let captureStarted: Int
     let captureIdle: Int
@@ -1704,7 +1705,8 @@ struct TBPipelineDiagnosticsSnapshot {
         bc7SendCompletedFrames: 0, bc7SendNanoseconds: 0,
         bc7SendErrors: 0, bc7CompressedPackets: 0,
         bc7CompressionFallbacks: 0, bc7RawPacketBytes: 0,
-        bc7WirePacketBytes: 0, captureComplete: 0, captureStarted: 0,
+        bc7WirePacketBytes: 0, bc7CompressionMode: "off",
+        captureComplete: 0, captureStarted: 0,
         captureIdle: 0, captureBlank: 0, captureSuspended: 0,
         captureStopped: 0, captureUnknown: 0, tileBudget: 0,
         deferredTiles: 0, worstDeferredAge: 0,
@@ -1726,7 +1728,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let usesRawNV12: Bool
     private let usesBC7Mode6: Bool
     private let usesBC7TileDelta: Bool
-    private let usesBC7LZFSE: Bool
+    private let bc7CompressionMode: TBBC7CompressionMode
     private let onFirstFrame: @Sendable (Int, Int) -> Void
 
     // Confined to `queue`.
@@ -1797,7 +1799,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          usesRawNV12: Bool,
          usesBC7Mode6: Bool,
          usesBC7TileDelta: Bool,
-         usesBC7LZFSE: Bool,
+         bc7CompressionMode: TBBC7CompressionMode,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable (Int, Int) -> Void) {
         self.preset = preset
@@ -1808,7 +1810,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.usesRawNV12 = usesRawNV12
         self.usesBC7Mode6 = usesBC7Mode6
         self.usesBC7TileDelta = usesBC7TileDelta
-        self.usesBC7LZFSE = usesBC7LZFSE
+        self.bc7CompressionMode = bc7CompressionMode
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
     }
@@ -1902,6 +1904,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 bc7CompressionFallbacks: _bc7CompressionFallbacks,
                 bc7RawPacketBytes: _bc7RawPacketBytes,
                 bc7WirePacketBytes: _bc7WirePacketBytes,
+                bc7CompressionMode: bc7CompressionMode.rawValue,
                 captureComplete: _captureComplete,
                 captureStarted: _captureStarted,
                 captureIdle: _captureIdle,
@@ -2409,7 +2412,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         )
         let selection = tbSelectBC7WirePacket(
             rawPacket: rawPacket,
-            supportsLZFSE: usesBC7LZFSE
+            compressionMode: bc7CompressionMode
         )
         let packet = selection.packet
         recordBC7Compression(
@@ -2720,6 +2723,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsBC7Mode6Hint = nil
                 receiverSupportsBC7TileDeltaHint = nil
                 receiverSupportsBC7LZFSEHint = nil
+                receiverSupportsBC7LZ4Hint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
             }
@@ -2737,6 +2741,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsBC7Mode6Hint = nil
                 receiverSupportsBC7TileDeltaHint = nil
                 receiverSupportsBC7LZFSEHint = nil
+                receiverSupportsBC7LZ4Hint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
             }
@@ -2790,6 +2795,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var receiverSupportsBC7Mode6Hint: Bool?
     var receiverSupportsBC7TileDeltaHint: Bool?
     var receiverSupportsBC7LZFSEHint: Bool?
+    var receiverSupportsBC7LZ4Hint: Bool?
     var receiverInputMonitoringTrustedHint: Bool?
     var receiverAccessibilityTrustedHint: Bool?
     @Published var senderFPS = 0
@@ -2833,6 +2839,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
         }
     }
+    @Published var bc7CompressionMode: TBBC7CompressionMode = .lz4
     @Published var capturePreset: TBDisplayCapturePreset = .standard1440p {
         didSet {
             if !isStreaming {
@@ -4127,6 +4134,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         receiverSupportsBC7Mode6Hint = profile.supportsBC7Mode6
         receiverSupportsBC7TileDeltaHint = profile.supportsBC7TileDelta
         receiverSupportsBC7LZFSEHint = profile.supportsBC7LZFSE
+        receiverSupportsBC7LZ4Hint = profile.supportsBC7LZ4
         if let inputMonitoringTrusted = profile.inputMonitoringTrusted {
             receiverInputMonitoringTrustedHint = inputMonitoringTrusted
         }
@@ -4300,7 +4308,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 usesRawNV12: usesRawNV12,
                 usesBC7Mode6: usesBC7Mode6,
                 usesBC7TileDelta: usesBC7Mode6 && profile.supportsBC7TileDelta == true,
-                usesBC7LZFSE: usesBC7Mode6 && profile.supportsBC7LZFSE == true,
+                bc7CompressionMode: usesBC7Mode6
+                    ? tbResolveBC7CompressionMode(
+                        requested: self.bc7CompressionMode,
+                        supportsLZ4: profile.supportsBC7LZ4 == true,
+                        supportsLZFSE: profile.supportsBC7LZFSE == true
+                    )
+                    : .off,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] width, height in
                     Task { @MainActor in
@@ -5285,6 +5299,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     "deferredTiles": diagnostics.deferredTiles,
                     "worstDeferredAge": diagnostics.worstDeferredAge,
                     "compressedPackets": diagnostics.bc7CompressedPackets,
+                    "bc7CompressionMode": diagnostics.bc7CompressionMode,
                     "compressionFallbacks": diagnostics.bc7CompressionFallbacks,
                     "rawPacketBytes": diagnostics.bc7RawPacketBytes,
                     "wirePacketBytes": diagnostics.bc7WirePacketBytes,
@@ -5329,7 +5344,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     "metrics captureHz=\(captureHz, format: .fixed(precision: 2), privacy: .public) sentHz=\(sentHz, format: .fixed(precision: 2), privacy: .public) completedHz=\(completedHz, format: .fixed(precision: 2), privacy: .public) pending=\(diagnostics.pending, privacy: .public) dropped=\(diagnostics.dropped, privacy: .public) queueP95Ms=\(Double(diagnostics.queueAge.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) encodeMs=\(encodeMilliseconds, format: .fixed(precision: 2), privacy: .public) planMs=\(planMilliseconds, format: .fixed(precision: 2), privacy: .public) networkGbps=\(bytesPerSecond * 8.0 / 1_000_000_000.0, format: .fixed(precision: 3), privacy: .public)"
                 )
                 TBLog.connection.info(
-                    "compression packets=\(diagnostics.bc7CompressedPackets, privacy: .public) fallback=\(diagnostics.bc7CompressionFallbacks, privacy: .public) rawBytes=\(diagnostics.bc7RawPacketBytes, privacy: .public) wireBytes=\(diagnostics.bc7WirePacketBytes, privacy: .public) splitP95Ms=\(Double(diagnostics.planeSplitTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) compressionP95Ms=\(Double(diagnostics.compressionTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public)"
+                    "compression mode=\(diagnostics.bc7CompressionMode, privacy: .public) packets=\(diagnostics.bc7CompressedPackets, privacy: .public) fallback=\(diagnostics.bc7CompressionFallbacks, privacy: .public) rawBytes=\(diagnostics.bc7RawPacketBytes, privacy: .public) wireBytes=\(diagnostics.bc7WirePacketBytes, privacy: .public) splitP95Ms=\(Double(diagnostics.planeSplitTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) compressionP95Ms=\(Double(diagnostics.compressionTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public)"
                 )
             }
         }

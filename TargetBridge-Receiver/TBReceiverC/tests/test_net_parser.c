@@ -443,8 +443,8 @@ static void test_bc7_delta_validation(void) {
             return;
         }
         wrapper[0] = 1;
-        wrapper[1] = 1;
-        wrapper[2] = 1;
+        wrapper[1] = TB_BC7_COMPRESSION_LZFSE;
+        wrapper[2] = TB_BC7_TRANSFORM_BYTE_PLANES;
         put_be32(wrapper + 4, (uint32_t)sizeof(metadata));
         put_be32(wrapper + 8, (uint32_t)blocks_len);
         put_be32(wrapper + 12, (uint32_t)compressed_len);
@@ -468,6 +468,87 @@ static void test_bc7_delta_validation(void) {
         CHECK(result.compressed_block_bytes == compressed_len,
               "compressed byte count reported");
         tb_bc7_supercompression_result_free(&result);
+
+        uint8_t *lz4_compressed = malloc(blocks_len + 65536u);
+        CHECK(lz4_compressed != NULL, "LZ4 compressed buffer allocated");
+        size_t lz4_compressed_len = lz4_compressed
+            ? compression_encode_buffer(
+            lz4_compressed,
+            blocks_len + 65536u,
+            blocks,
+            blocks_len,
+            NULL,
+            COMPRESSION_LZ4
+        ) : 0;
+        CHECK(lz4_compressed_len > 0 && lz4_compressed_len < blocks_len,
+              "LZ4 compresses repetitive raw BC7");
+        if (lz4_compressed_len > 0) {
+            const size_t lz4_wrapper_len =
+                24u + sizeof(metadata) + lz4_compressed_len;
+            uint8_t *lz4_wrapper = calloc(1, lz4_wrapper_len);
+            CHECK(lz4_wrapper != NULL, "LZ4 frame wrapper allocated");
+            if (lz4_wrapper) {
+                lz4_wrapper[0] = 1;
+                lz4_wrapper[1] = TB_BC7_COMPRESSION_LZ4;
+                lz4_wrapper[2] = TB_BC7_TRANSFORM_RAW;
+                put_be32(lz4_wrapper + 4, (uint32_t)sizeof(metadata));
+                put_be32(lz4_wrapper + 8, (uint32_t)blocks_len);
+                put_be32(lz4_wrapper + 12, (uint32_t)lz4_compressed_len);
+                put_be64(
+                    lz4_wrapper + 16,
+                    tb_bc7_supercompression_checksum(
+                        lz4_compressed,
+                        lz4_compressed_len
+                    )
+                );
+                memcpy(lz4_wrapper + 24, metadata, sizeof(metadata));
+                memcpy(
+                    lz4_wrapper + 24 + sizeof(metadata),
+                    lz4_compressed,
+                    lz4_compressed_len
+                );
+                CHECK(tb_bc7_supercompression_decode_frame(
+                          lz4_wrapper, lz4_wrapper_len, &result) == 0,
+                      "raw BC7 LZ4 frame decodes");
+                CHECK(memcmp(
+                          result.payload + sizeof(metadata),
+                          blocks,
+                          blocks_len) == 0,
+                      "raw BC7 LZ4 blocks preserved");
+                CHECK(result.inverse_transform_ns == 0,
+                      "raw BC7 LZ4 skips inverse transform");
+                tb_bc7_supercompression_result_free(&result);
+                uint8_t *lz4_trailing = malloc(lz4_wrapper_len + 1u);
+                CHECK(lz4_trailing != NULL, "LZ4 trailing fixture allocated");
+                if (lz4_trailing) {
+                    memcpy(lz4_trailing, lz4_wrapper, lz4_wrapper_len);
+                    lz4_trailing[lz4_wrapper_len] = 0xa5;
+                    put_be32(
+                        lz4_trailing + 12,
+                        (uint32_t)lz4_compressed_len + 1u
+                    );
+                    put_be64(
+                        lz4_trailing + 16,
+                        tb_bc7_supercompression_checksum(
+                            lz4_trailing + 24 + sizeof(metadata),
+                            lz4_compressed_len + 1u
+                        )
+                    );
+                    CHECK(tb_bc7_supercompression_decode_frame(
+                              lz4_trailing,
+                              lz4_wrapper_len + 1u,
+                              &result) == -1,
+                          "LZ4 trailing compressed bytes rejected");
+                    free(lz4_trailing);
+                }
+                lz4_wrapper[2] = TB_BC7_TRANSFORM_BYTE_PLANES;
+                CHECK(tb_bc7_supercompression_decode_frame(
+                          lz4_wrapper, lz4_wrapper_len, &result) == -1,
+                      "unsupported LZ4 byte-plane pairing rejected");
+                free(lz4_wrapper);
+            }
+        }
+        free(lz4_compressed);
 
         uint8_t *trailing = malloc(wrapper_len + 1u);
         CHECK(trailing != NULL, "trailing-data fixture allocated");
@@ -524,8 +605,8 @@ static void test_bc7_delta_validation(void) {
                 CHECK(extra_wrapper != NULL, "overlong-output wrapper allocated");
                 if (extra_wrapper) {
                     extra_wrapper[0] = 1;
-                    extra_wrapper[1] = 1;
-                    extra_wrapper[2] = 1;
+                    extra_wrapper[1] = TB_BC7_COMPRESSION_LZFSE;
+                    extra_wrapper[2] = TB_BC7_TRANSFORM_BYTE_PLANES;
                     put_be32(extra_wrapper + 4, (uint32_t)sizeof(metadata));
                     put_be32(extra_wrapper + 8, (uint32_t)blocks_len);
                     put_be32(
@@ -558,8 +639,8 @@ static void test_bc7_delta_validation(void) {
         CHECK(invalid_metadata != NULL, "invalid-metadata fixture allocated");
         if (invalid_metadata) {
             invalid_metadata[0] = 1;
-            invalid_metadata[1] = 1;
-            invalid_metadata[2] = 1;
+            invalid_metadata[1] = TB_BC7_COMPRESSION_LZFSE;
+            invalid_metadata[2] = TB_BC7_TRANSFORM_BYTE_PLANES;
             put_be32(invalid_metadata + 4, (uint32_t)sizeof(metadata) + 1u);
             put_be32(invalid_metadata + 8, (uint32_t)blocks_len);
             put_be32(invalid_metadata + 12, (uint32_t)compressed_len);
@@ -583,7 +664,7 @@ static void test_bc7_delta_validation(void) {
         CHECK(tb_bc7_supercompression_decode_frame(
                   wrapper, wrapper_len, &result) == -1,
               "unknown plane transform rejected");
-        wrapper[2] = 1;
+        wrapper[2] = TB_BC7_TRANSFORM_BYTE_PLANES;
         put_be32(wrapper + 8, (uint32_t)blocks_len - 1u);
         CHECK(tb_bc7_supercompression_decode_frame(
                   wrapper, wrapper_len, &result) == -1,
@@ -619,8 +700,8 @@ static void test_bc7_delta_validation(void) {
         CHECK(delta_wrapper != NULL, "compressed delta wrapper allocated");
         if (delta_wrapper) {
             delta_wrapper[0] = 1;
-            delta_wrapper[1] = 1;
-            delta_wrapper[2] = 1;
+            delta_wrapper[1] = TB_BC7_COMPRESSION_LZFSE;
+            delta_wrapper[2] = TB_BC7_TRANSFORM_BYTE_PLANES;
             put_be32(delta_wrapper + 4, (uint32_t)sizeof(delta_metadata));
             put_be32(delta_wrapper + 8, (uint32_t)blocks_len);
             put_be32(delta_wrapper + 12, (uint32_t)compressed_len);

@@ -141,6 +141,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertNil(profile.supportsBC7Mode6)
         XCTAssertNil(profile.supportsBC7TileDelta)
         XCTAssertNil(profile.supportsBC7LZFSE)
+        XCTAssertNil(profile.supportsBC7LZ4)
         XCTAssertNil(profile.receiverVersion)
         XCTAssertNil(profile.receiverBuild)
         XCTAssertNil(profile.receiverCommit)
@@ -157,6 +158,7 @@ final class TBMonitorProtocolTests: XCTestCase {
           "captureWidth": 5120,
           "captureHeight": 2880,
           "supportsBC7LZFSE": true,
+          "supportsBC7LZ4": true,
           "receiverVersion": "3.3.0",
           "receiverBuild": "dev-20260926163000",
           "receiverCommit": "9b6b092abcde"
@@ -165,6 +167,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         let current = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: currentProfile)
         XCTAssertEqual(current.receiverVersion, "3.3.0")
         XCTAssertEqual(current.supportsBC7LZFSE, true)
+        XCTAssertEqual(current.supportsBC7LZ4, true)
         XCTAssertEqual(current.receiverBuild, "dev-20260926163000")
         XCTAssertEqual(current.receiverCommit, "9b6b092abcde")
 
@@ -631,7 +634,7 @@ final class TBMonitorProtocolTests: XCTestCase {
 
         let unsupported = tbSelectBC7WirePacket(
             rawPacket: raw,
-            supportsLZFSE: false
+            compressionMode: .off
         )
         XCTAssertEqual(unsupported.packet, raw)
         XCTAssertFalse(unsupported.compressionAttempted)
@@ -639,7 +642,7 @@ final class TBMonitorProtocolTests: XCTestCase {
 
         let selection = tbSelectBC7WirePacket(
             rawPacket: raw,
-            supportsLZFSE: true
+            compressionMode: .lzfse
         )
         XCTAssertTrue(selection.compressionAttempted)
         let result = try XCTUnwrap(selection.compressedResult)
@@ -658,6 +661,7 @@ final class TBMonitorProtocolTests: XCTestCase {
             data[offset + 2] = UInt8((value >> 8) & 0xff)
             data[offset + 3] = UInt8(value & 0xff)
         }
+
         func writeBE64(_ value: UInt64, into data: inout Data, at offset: Int) {
             for index in 0..<8 {
                 data[offset + index] = UInt8(
@@ -707,6 +711,78 @@ final class TBMonitorProtocolTests: XCTestCase {
         )
     }
 
+    func testRawBC7LZ4FramePacketReconstructsLegacyPayload() throws {
+        let width = 256
+        let height = 256
+        let bytesPerRow = 1024
+        let blocks = Data(repeating: 0x4C, count: bytesPerRow * height / 4)
+        var payload = Data()
+        payload.append(1)
+        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(bytesPerRow))
+        payload.append(blocks)
+        let raw = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+
+        let selection = tbSelectBC7WirePacket(
+            rawPacket: raw,
+            compressionMode: .lz4
+        )
+        let result = try XCTUnwrap(selection.compressedResult)
+        XCTAssertEqual(result.mode, .lz4)
+        XCTAssertEqual(result.planeSplitNanoseconds, 0)
+        XCTAssertLessThan(result.packet.count, raw.count)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                TBBC7Supercompression.decodeCompressedPacket(result.packet)
+            ),
+            raw
+        )
+    }
+
+    func testBC7CompressionModeCapabilityResolution() {
+        XCTAssertEqual(
+            tbResolveBC7CompressionMode(
+                requested: .off,
+                supportsLZ4: true,
+                supportsLZFSE: true
+            ),
+            .off
+        )
+        XCTAssertEqual(
+            tbResolveBC7CompressionMode(
+                requested: .lz4,
+                supportsLZ4: true,
+                supportsLZFSE: false
+            ),
+            .lz4
+        )
+        XCTAssertEqual(
+            tbResolveBC7CompressionMode(
+                requested: .lz4,
+                supportsLZ4: false,
+                supportsLZFSE: true
+            ),
+            .off
+        )
+        XCTAssertEqual(
+            tbResolveBC7CompressionMode(
+                requested: .lzfse,
+                supportsLZ4: true,
+                supportsLZFSE: true
+            ),
+            .lzfse
+        )
+        XCTAssertEqual(
+            tbResolveBC7CompressionMode(
+                requested: .lzfse,
+                supportsLZ4: true,
+                supportsLZFSE: false
+            ),
+            .off
+        )
+    }
+
     func testBC7LZFSEDeltaPacketReconstructsLegacyPayload() throws {
         let width = 1024
         let height = 256
@@ -738,6 +814,16 @@ final class TBMonitorProtocolTests: XCTestCase {
             try XCTUnwrap(TBBC7Supercompression.decodeCompressedPacket(result.packet)),
             raw
         )
+        let lz4 = try XCTUnwrap(
+            TBBC7Supercompression.makeCompressedPacket(from: raw, mode: .lz4)
+        )
+        XCTAssertEqual(lz4.mode, .lz4)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                TBBC7Supercompression.decodeCompressedPacket(lz4.packet)
+            ),
+            raw
+        )
     }
 
     func testBC7LZFSEFallsBackWhenPacketHasNoNetSavings() {
@@ -756,6 +842,9 @@ final class TBMonitorProtocolTests: XCTestCase {
         payload.append(contentsOf: bytes)
         let raw = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
         XCTAssertNil(TBBC7Supercompression.makeCompressedPacket(from: raw))
+        XCTAssertNil(
+            TBBC7Supercompression.makeCompressedPacket(from: raw, mode: .lz4)
+        )
     }
 
     func testBC7LZFSECompressesRealMode6OutputLosslessly() throws {
@@ -790,6 +879,21 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(
             try XCTUnwrap(
                 TBBC7Supercompression.decodeCompressedPacket(compressed.packet)
+            ),
+            raw
+        )
+        let lz4 = try XCTUnwrap(
+            TBBC7Supercompression.makeCompressedPacket(
+                from: raw,
+                mode: .lz4
+            )
+        )
+        XCTAssertEqual(lz4.mode, .lz4)
+        XCTAssertEqual(lz4.planeSplitNanoseconds, 0)
+        XCTAssertLessThan(lz4.packet.count, raw.count)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                TBBC7Supercompression.decodeCompressedPacket(lz4.packet)
             ),
             raw
         )

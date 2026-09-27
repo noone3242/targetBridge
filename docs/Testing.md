@@ -154,8 +154,12 @@ cd TargetBridge-Receiver/TBReceiverC
 
 BC7 activates only when the Receiver advertises `supportsBC7Mode6=true`.
 LZFSE supercompression activates only when the Receiver also advertises
-`supportsBC7LZFSE=true`. Complete Sender metrics are written beside the app at
-`logs/sender-metrics.jsonl`; OSLog contains only short summaries and errors.
+`supportsBC7LZFSE=true`. Raw-BC7 LZ4 activates only when it advertises
+`supportsBC7LZ4=true`. The Sender exposes three BC7 compression options:
+`Off (raw BC7)`, `LZ4 (low latency)`, and `LZFSE (high compression)`.
+Complete Sender metrics are written beside the app at
+`logs/sender-metrics.jsonl`; each record includes `bc7CompressionMode` so A/B
+results remain attributable. OSLog contains only short summaries and errors.
 
 ### Sender signing and Screen Recording
 

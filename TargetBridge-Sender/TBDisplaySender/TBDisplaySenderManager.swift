@@ -249,6 +249,7 @@ final class TBDisplaySenderService: ObservableObject {
             session.capturePreset = previous.capturePreset
             session.captureSource = previous.captureSource
             session.videoTransportMode = previous.videoTransportMode
+            session.bc7CompressionMode = previous.bc7CompressionMode
             session.transportKind = previous.transportKind
             session.audioEnabled = audioRelayAvailable && previous.audioEnabled
             session.inputGestureMode = previous.inputGestureMode
@@ -298,6 +299,7 @@ final class TBDisplaySenderService: ObservableObject {
         var capturePreset: String
         var captureSource: String
         var videoTransportMode: String?
+        var bc7CompressionMode: String?
         var audioEnabled: Bool
         var brightness: Double
         var inputGestureMode: String
@@ -334,6 +336,7 @@ final class TBDisplaySenderService: ObservableObject {
                 capturePreset: session.capturePreset.rawValue,
                 captureSource: session.captureSource.rawValue,
                 videoTransportMode: session.videoTransportMode.rawValue,
+                bc7CompressionMode: session.bc7CompressionMode.rawValue,
                 audioEnabled: session.audioEnabled,
                 brightness: session.brightness,
                 inputGestureMode: session.inputGestureMode.rawValue,
@@ -403,6 +406,10 @@ final class TBDisplaySenderService: ObservableObject {
            let mode = TBVideoTransportMode(rawValue: modeRaw) {
             session.videoTransportMode = mode
         }
+        if let compressionRaw = config.bc7CompressionMode,
+           let compression = TBBC7CompressionMode(rawValue: compressionRaw) {
+            session.bc7CompressionMode = compression
+        }
         if let gesture = TBInputGestureMode(rawValue: config.inputGestureMode) {
             session.inputGestureMode = gesture
         }
@@ -436,6 +443,7 @@ final class TBDisplaySenderService: ObservableObject {
         session.receiverSupportsBC7Mode6Hint = receiver.supportsBC7Mode6
         session.receiverSupportsBC7TileDeltaHint = receiver.supportsBC7TileDelta
         session.receiverSupportsBC7LZFSEHint = receiver.supportsBC7LZFSE
+        session.receiverSupportsBC7LZ4Hint = receiver.supportsBC7LZ4
         if session.localInterfaceIP.isEmpty {
             session.localInterfaceIP = suggestedInterfaceForNewSession(transportKind: session.transportKind)?.ip
                 ?? availableInterfaces(for: session.transportKind).first?.ip
@@ -456,6 +464,7 @@ final class TBDisplaySenderService: ObservableObject {
             session.receiverSupportsBC7Mode6Hint = receiver.supportsBC7Mode6
             session.receiverSupportsBC7TileDeltaHint = receiver.supportsBC7TileDelta
             session.receiverSupportsBC7LZFSEHint = receiver.supportsBC7LZFSE
+            session.receiverSupportsBC7LZ4Hint = receiver.supportsBC7LZ4
         }
     }
 

@@ -53,6 +53,7 @@ struct TBMonitorDisplayProfile: Codable {
     var supportsBC7Mode6: Bool?
     var supportsBC7TileDelta: Bool?
     var supportsBC7LZFSE: Bool?
+    var supportsBC7LZ4: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
     var receiverVersion: String? = nil

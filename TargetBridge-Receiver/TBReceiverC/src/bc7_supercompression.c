@@ -7,8 +7,6 @@
 #include <time.h>
 
 #define TB_BC7_SUPERCOMPRESSION_VERSION 1u
-#define TB_BC7_SUPERCOMPRESSION_LZFSE 1u
-#define TB_BC7_SUPERCOMPRESSION_BYTE_PLANES 1u
 #define TB_BC7_SUPERCOMPRESSION_HEADER_BYTES 24u
 #define TB_BC7_SUPERCOMPRESSION_MAX_BYTES (64u * 1024u * 1024u)
 
@@ -85,6 +83,8 @@ struct tb_bc7_compressed_wrapper {
     size_t metadata_len;
     size_t blocks_len;
     size_t compressed_len;
+    enum tb_bc7_compression_algorithm algorithm;
+    enum tb_bc7_block_transform transform;
 };
 
 static int parse_wrapper(
@@ -94,9 +94,17 @@ static int parse_wrapper(
     if (!payload || !wrapper ||
         payload_len < TB_BC7_SUPERCOMPRESSION_HEADER_BYTES ||
         payload[0] != TB_BC7_SUPERCOMPRESSION_VERSION ||
-        payload[1] != TB_BC7_SUPERCOMPRESSION_LZFSE ||
-        payload[2] != TB_BC7_SUPERCOMPRESSION_BYTE_PLANES ||
         payload[3] != 0) {
+        return -1;
+    }
+    const enum tb_bc7_compression_algorithm algorithm =
+        (enum tb_bc7_compression_algorithm)payload[1];
+    const enum tb_bc7_block_transform transform =
+        (enum tb_bc7_block_transform)payload[2];
+    if (!((algorithm == TB_BC7_COMPRESSION_LZFSE &&
+           transform == TB_BC7_TRANSFORM_BYTE_PLANES) ||
+          (algorithm == TB_BC7_COMPRESSION_LZ4 &&
+           transform == TB_BC7_TRANSFORM_RAW))) {
         return -1;
     }
 
@@ -119,10 +127,14 @@ static int parse_wrapper(
     }
     wrapper->metadata = payload + TB_BC7_SUPERCOMPRESSION_HEADER_BYTES;
     wrapper->compressed = wrapper->metadata + wrapper->metadata_len;
+    wrapper->algorithm = algorithm;
+    wrapper->transform = transform;
+    const uint8_t expected_marker =
+        algorithm == TB_BC7_COMPRESSION_LZFSE ? 0x78u : 0x34u;
     if (wrapper->compressed_len < 4u ||
         wrapper->compressed[wrapper->compressed_len - 4u] != 0x62u ||
         wrapper->compressed[wrapper->compressed_len - 3u] != 0x76u ||
-        wrapper->compressed[wrapper->compressed_len - 2u] != 0x78u ||
+        wrapper->compressed[wrapper->compressed_len - 2u] != expected_marker ||
         wrapper->compressed[wrapper->compressed_len - 1u] != 0x24u) {
         return -1;
     }
@@ -221,27 +233,31 @@ static int decode_exact(
         wrapper->blocks_len == SIZE_MAX) {
         return -1;
     }
-    uint8_t *planes = malloc(wrapper->blocks_len + 1u);
+    uint8_t *transformed = malloc(wrapper->blocks_len + 1u);
     uint8_t *blocks_copy = malloc(wrapper->blocks_len);
-    if (!planes || !blocks_copy) {
-        free(planes);
+    if (!transformed || !blocks_copy) {
+        free(transformed);
         free(blocks_copy);
         return -1;
     }
+    const compression_algorithm compression_algorithm =
+        wrapper->algorithm == TB_BC7_COMPRESSION_LZFSE
+            ? COMPRESSION_LZFSE
+            : COMPRESSION_LZ4;
 
     compression_stream stream;
     memset(&stream, 0, sizeof(stream));
     if (compression_stream_init(
             &stream,
             COMPRESSION_STREAM_DECODE,
-            COMPRESSION_LZFSE) != COMPRESSION_STATUS_OK) {
-        free(planes);
+            compression_algorithm) != COMPRESSION_STATUS_OK) {
+        free(transformed);
         free(blocks_copy);
         return -1;
     }
     stream.src_ptr = wrapper->compressed;
     stream.src_size = wrapper->compressed_len;
-    stream.dst_ptr = planes;
+    stream.dst_ptr = transformed;
     stream.dst_size = wrapper->blocks_len + 1u;
 
     const uint64_t decode_started = now_ns();
@@ -266,24 +282,28 @@ static int decode_exact(
     if (status != COMPRESSION_STATUS_END ||
         remaining_input != 0 ||
         decoded != wrapper->blocks_len) {
-        free(planes);
+        free(transformed);
         free(blocks_copy);
         return -1;
     }
 
-    const uint64_t inverse_started = decode_finished;
-    if (tb_bc7_plane_unsplit(
-            planes, wrapper->blocks_len, blocks_copy) != 0) {
-        free(planes);
-        free(blocks_copy);
-        return -1;
+    if (wrapper->transform == TB_BC7_TRANSFORM_BYTE_PLANES) {
+        const uint64_t inverse_started = decode_finished;
+        if (tb_bc7_plane_unsplit(
+                transformed, wrapper->blocks_len, blocks_copy) != 0) {
+            free(transformed);
+            free(blocks_copy);
+            return -1;
+        }
+        *inverse_ns = now_ns() - inverse_started;
+    } else {
+        memcpy(blocks_copy, transformed, wrapper->blocks_len);
+        *inverse_ns = 0;
     }
-    const uint64_t inverse_finished = now_ns();
-    free(planes);
+    free(transformed);
 
     *blocks = blocks_copy;
     *decompression_ns = decode_finished - decode_started;
-    *inverse_ns = inverse_finished - inverse_started;
     return 0;
 }
 

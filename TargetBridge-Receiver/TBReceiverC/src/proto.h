@@ -30,8 +30,11 @@
  *   payload = [4 BE uint32 generation][4 BE uint32 width][4 BE uint32 height]
  * type 0x26 = request acknowledgment for the next successfully rendered BC7 frame
  *   payload = [4 BE uint32 generation]
- * type 0x29 = LZFSE-compressed BC7 frame
- * type 0x2a = LZFSE-compressed BC7 tile delta
+ * type 0x29 = supercompressed BC7 frame
+ * type 0x2a = supercompressed BC7 tile delta
+ *   algorithm: 1=LZFSE, 2=LZ4
+ *   transform: 0=raw BC7 blocks, 1=BC7 byte planes
+ *   supported pairs: LZFSE+byte-planes, LZ4+raw
  *   payload = [1 version][1 algorithm][1 transform][1 reserved]
  *             [4 BE metadata length][4 BE raw block length]
  *             [4 BE compressed length][8 BE compressed checksum]

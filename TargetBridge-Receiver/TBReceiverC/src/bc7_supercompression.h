@@ -13,6 +13,16 @@ struct tb_bc7_supercompression_result {
     uint64_t inverse_transform_ns;
 };
 
+enum tb_bc7_compression_algorithm {
+    TB_BC7_COMPRESSION_LZFSE = 1,
+    TB_BC7_COMPRESSION_LZ4 = 2
+};
+
+enum tb_bc7_block_transform {
+    TB_BC7_TRANSFORM_RAW = 0,
+    TB_BC7_TRANSFORM_BYTE_PLANES = 1
+};
+
 int tb_bc7_supercompression_decode_frame(
     const uint8_t *payload,
     size_t payload_len,

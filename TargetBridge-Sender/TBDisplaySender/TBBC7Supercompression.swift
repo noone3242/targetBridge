@@ -1,8 +1,67 @@
 import Compression
 import Foundation
 
+enum TBBC7CompressionMode: String, CaseIterable, Identifiable {
+    case off
+    case lz4
+    case lzfse
+
+    var id: String { rawValue }
+
+    func title(_ language: TBDisplaySenderLanguage) -> String {
+        switch (self, language) {
+        case (.off, .chinese): return "关闭（原始 BC7）"
+        case (.off, _): return "Off (raw BC7)"
+        case (.lz4, .chinese): return "LZ4（低延迟）"
+        case (.lz4, _): return "LZ4 (low latency)"
+        case (.lzfse, .chinese): return "LZFSE（高压缩率）"
+        case (.lzfse, _): return "LZFSE (high compression)"
+        }
+    }
+}
+
+enum TBBC7CompressionAlgorithm: UInt8 {
+    case lzfse = 1
+    case lz4 = 2
+
+    var compressionAlgorithm: compression_algorithm {
+        switch self {
+        case .lzfse: return COMPRESSION_LZFSE
+        case .lz4: return COMPRESSION_LZ4
+        }
+    }
+
+    var endMarkerThirdByte: UInt8 {
+        switch self {
+        case .lzfse: return 0x78
+        case .lz4: return 0x34
+        }
+    }
+}
+
+enum TBBC7BlockTransform: UInt8 {
+    case raw = 0
+    case bytePlanes = 1
+}
+
+func tbResolveBC7CompressionMode(
+    requested: TBBC7CompressionMode,
+    supportsLZ4: Bool,
+    supportsLZFSE: Bool
+) -> TBBC7CompressionMode {
+    switch requested {
+    case .off:
+        return .off
+    case .lz4:
+        return supportsLZ4 ? .lz4 : .off
+    case .lzfse:
+        return supportsLZFSE ? .lzfse : .off
+    }
+}
+
 struct TBBC7CompressedPacketResult {
     let packet: Data
+    let mode: TBBC7CompressionMode
     let rawPacketBytes: Int
     let rawBlockBytes: Int
     let compressedBlockBytes: Int
@@ -18,13 +77,16 @@ struct TBBC7WirePacketSelection {
 
 func tbSelectBC7WirePacket(
     rawPacket: Data,
-    supportsLZFSE: Bool
+    compressionMode: TBBC7CompressionMode
 ) -> TBBC7WirePacketSelection {
     let attempted =
-        supportsLZFSE &&
+        compressionMode != .off &&
         rawPacket.count >= TBBC7Supercompression.minimumBlockBytes + 18
     let result = attempted
-        ? TBBC7Supercompression.makeCompressedPacket(from: rawPacket)
+        ? TBBC7Supercompression.makeCompressedPacket(
+            from: rawPacket,
+            mode: compressionMode
+        )
         : nil
     return TBBC7WirePacketSelection(
         packet: result?.packet ?? rawPacket,
@@ -38,13 +100,13 @@ enum TBBC7Supercompression {
     static let minimumSavingsBytes = 4 * 1024
 
     private static let version: UInt8 = 1
-    private static let algorithmLZFSE: UInt8 = 1
-    private static let transformBytePlanes: UInt8 = 1
     private static let wrapperHeaderBytes = 24
 
     static func makeCompressedPacket(
-        from legacyPacket: Data
+        from legacyPacket: Data,
+        mode: TBBC7CompressionMode = .lzfse
     ) -> TBBC7CompressedPacketResult? {
+        guard mode != .off else { return nil }
         guard legacyPacket.count >= 5,
               TBMonitorProtocol.readBE32(legacyPacket, offset: 0) ==
                 UInt32(legacyPacket.count - 4),
@@ -55,11 +117,34 @@ enum TBBC7Supercompression {
             return nil
         }
 
+        let algorithm: TBBC7CompressionAlgorithm
+        let transform: TBBC7BlockTransform
         let splitStarted = DispatchTime.now().uptimeNanoseconds
-        guard let planes = planeSplit(parts.blocks) else { return nil }
-        let splitFinished = DispatchTime.now().uptimeNanoseconds
-        let compressionStarted = splitFinished
-        guard let compressed = compressLZFSE(planes) else { return nil }
+        let compressionSource: Data
+        let planeSplitNanoseconds: UInt64
+        switch mode {
+        case .off:
+            return nil
+        case .lz4:
+            algorithm = .lz4
+            transform = .raw
+            compressionSource = parts.blocks
+            planeSplitNanoseconds = 0
+        case .lzfse:
+            algorithm = .lzfse
+            transform = .bytePlanes
+            guard let planes = planeSplit(parts.blocks) else { return nil }
+            compressionSource = planes
+            planeSplitNanoseconds =
+                DispatchTime.now().uptimeNanoseconds - splitStarted
+        }
+        let compressionStarted = DispatchTime.now().uptimeNanoseconds
+        guard let compressed = compress(
+            compressionSource,
+            algorithm: algorithm.compressionAlgorithm
+        ) else {
+            return nil
+        }
         let compressionFinished = DispatchTime.now().uptimeNanoseconds
 
         let compressedType: TBMonitorPacketType
@@ -76,8 +161,8 @@ enum TBBC7Supercompression {
             capacity: wrapperHeaderBytes + parts.metadata.count + compressed.count
         )
         payload.append(version)
-        payload.append(algorithmLZFSE)
-        payload.append(transformBytePlanes)
+        payload.append(algorithm.rawValue)
+        payload.append(transform.rawValue)
         payload.append(0)
         TBMonitorProtocol.appendBE32(&payload, UInt32(parts.metadata.count))
         TBMonitorProtocol.appendBE32(&payload, UInt32(parts.blocks.count))
@@ -92,10 +177,11 @@ enum TBBC7Supercompression {
 
         return TBBC7CompressedPacketResult(
             packet: packet,
+            mode: mode,
             rawPacketBytes: legacyPacket.count,
             rawBlockBytes: parts.blocks.count,
             compressedBlockBytes: compressed.count,
-            planeSplitNanoseconds: splitFinished - splitStarted,
+            planeSplitNanoseconds: planeSplitNanoseconds,
             compressionNanoseconds: compressionFinished - compressionStarted
         )
     }
@@ -111,10 +197,15 @@ enum TBBC7Supercompression {
             return nil
         }
         let payload = packet.subdata(in: 5..<packet.count)
+        guard let algorithm = TBBC7CompressionAlgorithm(rawValue: payload[1]),
+              let transform = TBBC7BlockTransform(rawValue: payload[2])
+        else {
+            return nil
+        }
         guard payload[0] == version,
-              payload[1] == algorithmLZFSE,
-              payload[2] == transformBytePlanes,
-              payload[3] == 0
+              payload[3] == 0,
+              (algorithm == .lzfse && transform == .bytePlanes) ||
+              (algorithm == .lz4 && transform == .raw)
         else {
             return nil
         }
@@ -161,17 +252,28 @@ enum TBBC7Supercompression {
         guard compressed.count >= 4,
               compressed[compressed.count - 4] == 0x62,
               compressed[compressed.count - 3] == 0x76,
-              compressed[compressed.count - 2] == 0x78,
+              compressed[compressed.count - 2] ==
+                algorithm.endMarkerThirdByte,
               compressed[compressed.count - 1] == 0x24
         else {
             return nil
         }
         guard checksum(compressed) == compressedChecksum else { return nil }
-        guard let planes = decompressLZFSE(
+        guard let transformed = decompress(
             compressed,
-            uncompressedLength: blockLength
-        ), let blocks = inversePlaneSplit(planes) else {
+            uncompressedLength: blockLength,
+            algorithm: algorithm.compressionAlgorithm
+        ) else {
             return nil
+        }
+        let blocks: Data
+        if transform == .bytePlanes {
+            guard let restored = inversePlaneSplit(transformed) else {
+                return nil
+            }
+            blocks = restored
+        } else {
+            blocks = transformed
         }
 
         let legacyPayload: Data?
@@ -443,10 +545,13 @@ enum TBBC7Supercompression {
         return expectedBlocks == blockLength
     }
 
-    private static func compressLZFSE(_ source: Data) -> Data? {
+    private static func compress(
+        _ source: Data,
+        algorithm: compression_algorithm
+    ) -> Data? {
         let destinationCapacity = source.count + 64 * 1024
         var destination = Data(count: destinationCapacity)
-        let scratchSize = compression_encode_scratch_buffer_size(COMPRESSION_LZFSE)
+        let scratchSize = compression_encode_scratch_buffer_size(algorithm)
         let scratch = UnsafeMutableRawPointer.allocate(
             byteCount: max(1, scratchSize),
             alignment: 64
@@ -468,7 +573,7 @@ enum TBBC7Supercompression {
                     sourceAddress,
                     source.count,
                     scratch,
-                    COMPRESSION_LZFSE
+                    algorithm
                 )
             }
         }
@@ -486,9 +591,10 @@ enum TBBC7Supercompression {
         return hash
     }
 
-    private static func decompressLZFSE(
+    private static func decompress(
         _ source: Data,
-        uncompressedLength: Int
+        uncompressedLength: Int,
+        algorithm: compression_algorithm
     ) -> Data? {
         guard uncompressedLength > 0, uncompressedLength < Int.max else {
             return nil
@@ -513,7 +619,7 @@ enum TBBC7Supercompression {
                 guard compression_stream_init(
                     &stream,
                     COMPRESSION_STREAM_DECODE,
-                    COMPRESSION_LZFSE
+                    algorithm
                 ) != COMPRESSION_STATUS_ERROR else {
                     return false
                 }
