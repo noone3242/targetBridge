@@ -30,6 +30,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreAudio/CoreAudio.h>
+#include <compression.h>
 
 /* kAudioObjectPropertyElementMain is the macOS 12+ SDK spelling; older SDKs
  * only define kAudioObjectPropertyElementMaster (both are numerically 0). */
@@ -703,6 +704,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "version", (uint8_t)strlen(TB_RECEIVER_VERSION), TB_RECEIVER_VERSION);
     TXTRecordSetValue(&txt, "supportsHEVCDecode", 1, tb_dec_supports_hevc_hwdecode() ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsRawNV12", 1, "1");
+    TXTRecordSetValue(&txt, "supportsRawNV12LZ4", 1, "1");
     TXTRecordSetValue(&txt, "supportsBC7Mode6", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsBC7TileDelta", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsBC7LZFSE", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
@@ -1010,6 +1012,51 @@ static void on_frame(const uint8_t *y, int y_stride,
  * Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
  *          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)] */
 static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
+    if (len >= 38 && p[0] == 2) {
+        if (p[1] != 1) return;
+        uint32_t w = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
+                     ((uint32_t)p[4] << 8) | p[5];
+        uint32_t h = ((uint32_t)p[6] << 24) | ((uint32_t)p[7] << 16) |
+                     ((uint32_t)p[8] << 8) | p[9];
+        uint32_t ys = ((uint32_t)p[10] << 24) | ((uint32_t)p[11] << 16) |
+                      ((uint32_t)p[12] << 8) | p[13];
+        uint32_t us = ((uint32_t)p[14] << 24) | ((uint32_t)p[15] << 16) |
+                      ((uint32_t)p[16] << 8) | p[17];
+        uint32_t y_size = ((uint32_t)p[18] << 24) | ((uint32_t)p[19] << 16) |
+                          ((uint32_t)p[20] << 8) | p[21];
+        uint32_t uv_size = ((uint32_t)p[22] << 24) | ((uint32_t)p[23] << 16) |
+                           ((uint32_t)p[24] << 8) | p[25];
+        uint32_t compressed_len =
+            ((uint32_t)p[26] << 24) | ((uint32_t)p[27] << 16) |
+            ((uint32_t)p[28] << 8) | p[29];
+        uint64_t checksum =
+            ((uint64_t)p[30] << 56) | ((uint64_t)p[31] << 48) |
+            ((uint64_t)p[32] << 40) | ((uint64_t)p[33] << 32) |
+            ((uint64_t)p[34] << 24) | ((uint64_t)p[35] << 16) |
+            ((uint64_t)p[36] << 8) | p[37];
+        if (w == 0 || h == 0 || (w & 1) || (h & 1) ||
+            w > 8192 || h > 8192 || ys < w || us < w ||
+            y_size != (size_t)ys * h ||
+            uv_size != (size_t)us * (h / 2) ||
+            compressed_len != len - 38 ||
+            compressed_len < 4 ||
+            p[len - 4] != 0x62 || p[len - 3] != 0x76 ||
+            p[len - 2] != 0x34 || p[len - 1] != 0x24) return;
+        size_t raw_len = (size_t)y_size + uv_size;
+        uint8_t *raw = malloc(raw_len);
+        if (!raw) return;
+        size_t decoded = compression_decode_buffer(
+            raw, raw_len, p + 38, compressed_len, NULL, COMPRESSION_LZ4
+        );
+        if (decoded != raw_len ||
+            tb_bc7_supercompression_checksum(raw, raw_len) != checksum) {
+            free(raw);
+            return;
+        }
+        on_frame(raw, (int)ys, raw + y_size, (int)us, (int)w, (int)h, a);
+        free(raw);
+        return;
+    }
     if (len < 17) return;
     if (p[0] != 1) return; /* only NV12 is supported */
     uint32_t w  = ((uint32_t)p[1]  << 24) | ((uint32_t)p[2]  << 16) | ((uint32_t)p[3]  << 8) | (uint32_t)p[4];
@@ -2219,7 +2266,8 @@ static void send_receiver_info(struct app *a) {
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
         "\"receiverVersion\":\"%s\",\"receiverBuild\":\"%s\",\"receiverCommit\":\"%s\","
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsBC7Mode6\":%s,"
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,"
+        "\"supportsRawNV12LZ4\":true,\"supportsBC7Mode6\":%s,"
         "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
         "\"supportsBC7LZ4\":%s,"
         "\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
@@ -2457,8 +2505,8 @@ int main(int argc, char **argv) {
             "{\"version\":\"%s\",\"build\":\"%s\",\"commit\":\"%s\",\"architecture\":\"%s\","
             "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
             "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
-            "\"supportsBC7LZ4\":%s,"
-            "\"supportsRawNV12\":true}\n",
+            "\"supportsBC7LZ4\":%s,\"supportsRawNV12\":true,"
+            "\"supportsRawNV12LZ4\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
             TB_RECEIVER_COMMIT,

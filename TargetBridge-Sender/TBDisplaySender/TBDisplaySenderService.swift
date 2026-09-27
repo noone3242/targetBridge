@@ -1726,6 +1726,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let displayName: String
     private let displayID: CGDirectDisplayID
     private let usesRawNV12: Bool
+    private let usesRawNV12LZ4: Bool
     private let usesBC7Mode6: Bool
     private let usesBC7TileDelta: Bool
     private let bc7CompressionMode: TBBC7CompressionMode
@@ -1797,6 +1798,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          displayName: String,
          displayID: CGDirectDisplayID,
          usesRawNV12: Bool,
+         usesRawNV12LZ4: Bool,
          usesBC7Mode6: Bool,
          usesBC7TileDelta: Bool,
          bc7CompressionMode: TBBC7CompressionMode,
@@ -1808,6 +1810,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayName = displayName
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
+        self.usesRawNV12LZ4 = usesRawNV12LZ4
         self.usesBC7Mode6 = usesBC7Mode6
         self.usesBC7TileDelta = usesBC7TileDelta
         self.bc7CompressionMode = bc7CompressionMode
@@ -2277,16 +2280,29 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // Send the session ack on the first frame, mirroring the encoded path.
         notifyFirstFrameIfNeeded(width: width, height: height)
 
-        var payload = Data(capacity: 17 + ySize + uvSize)
-        payload.append(1) // format: NV12
-        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
-        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
-        TBMonitorProtocol.appendBE32(&payload, UInt32(yStride))
-        TBMonitorProtocol.appendBE32(&payload, UInt32(uvStride))
-        payload.append(UnsafeBufferPointer(start: yBase.assumingMemoryBound(to: UInt8.self), count: ySize))
-        payload.append(UnsafeBufferPointer(start: uvBase.assumingMemoryBound(to: UInt8.self), count: uvSize))
-
-        let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+        let y = Data(bytes: yBase, count: ySize)
+        let uv = Data(bytes: uvBase, count: uvSize)
+        let packet: Data
+        if usesRawNV12LZ4, let compressed = TBNV12Compression.makePacket(
+            y: y,
+            uv: uv,
+            width: width,
+            height: height,
+            yStride: yStride,
+            uvStride: uvStride
+        ) {
+            packet = compressed
+        } else {
+            var payload = Data(capacity: 17 + ySize + uvSize)
+            payload.append(1)
+            TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(yStride))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(uvStride))
+            payload.append(y)
+            payload.append(uv)
+            packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+        }
         pendingVideoPackets += 1
         connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
             guard let self else { return }
@@ -2720,6 +2736,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             if selectedReceiverID.isEmpty {
                 receiverSupportsHEVCDecodeHint = nil
                 receiverSupportsRawNV12Hint = nil
+                receiverSupportsRawNV12LZ4Hint = nil
                 receiverSupportsBC7Mode6Hint = nil
                 receiverSupportsBC7TileDeltaHint = nil
                 receiverSupportsBC7LZFSEHint = nil
@@ -2738,6 +2755,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             if receiverIP != oldValue {
                 receiverSupportsHEVCDecodeHint = nil
                 receiverSupportsRawNV12Hint = nil
+                receiverSupportsRawNV12LZ4Hint = nil
                 receiverSupportsBC7Mode6Hint = nil
                 receiverSupportsBC7TileDeltaHint = nil
                 receiverSupportsBC7LZFSEHint = nil
@@ -2792,6 +2810,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var audioAddonAvailable = true
     var receiverSupportsHEVCDecodeHint: Bool?
     var receiverSupportsRawNV12Hint: Bool?
+    var receiverSupportsRawNV12LZ4Hint: Bool?
     var receiverSupportsBC7Mode6Hint: Bool?
     var receiverSupportsBC7TileDeltaHint: Bool?
     var receiverSupportsBC7LZFSEHint: Bool?
@@ -4131,6 +4150,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         receiverSupportsRawNV12Hint = profile.supportsRawNV12
+        receiverSupportsRawNV12LZ4Hint = profile.supportsRawNV12LZ4
         receiverSupportsBC7Mode6Hint = profile.supportsBC7Mode6
         receiverSupportsBC7TileDeltaHint = profile.supportsBC7TileDelta
         receiverSupportsBC7LZFSEHint = profile.supportsBC7LZFSE
@@ -4306,6 +4326,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 displayName: session.displayName,
                 displayID: session.displayID,
                 usesRawNV12: usesRawNV12,
+                usesRawNV12LZ4: usesRawNV12 &&
+                    profile.supportsRawNV12LZ4 == true,
                 usesBC7Mode6: usesBC7Mode6,
                 usesBC7TileDelta: usesBC7Mode6 && profile.supportsBC7TileDelta == true,
                 bc7CompressionMode: usesBC7Mode6

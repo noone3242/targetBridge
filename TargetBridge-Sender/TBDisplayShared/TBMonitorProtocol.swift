@@ -50,6 +50,7 @@ struct TBMonitorDisplayProfile: Codable {
     var captureHeight: Int
     var supportsHEVCDecode: Bool?
     var supportsRawNV12: Bool?
+    var supportsRawNV12LZ4: Bool?
     var supportsBC7Mode6: Bool?
     var supportsBC7TileDelta: Bool?
     var supportsBC7LZFSE: Bool?

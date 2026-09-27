@@ -440,6 +440,7 @@ final class TBDisplaySenderService: ObservableObject {
         session.receiverIP = receiver.ip(for: session.transportKind)
         session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
         session.receiverSupportsRawNV12Hint = receiver.supportsRawNV12
+        session.receiverSupportsRawNV12LZ4Hint = receiver.supportsRawNV12LZ4
         session.receiverSupportsBC7Mode6Hint = receiver.supportsBC7Mode6
         session.receiverSupportsBC7TileDeltaHint = receiver.supportsBC7TileDelta
         session.receiverSupportsBC7LZFSEHint = receiver.supportsBC7LZFSE
@@ -461,6 +462,7 @@ final class TBDisplaySenderService: ObservableObject {
             session.receiverIP = receiver.ip(for: session.transportKind)
             session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
             session.receiverSupportsRawNV12Hint = receiver.supportsRawNV12
+            session.receiverSupportsRawNV12LZ4Hint = receiver.supportsRawNV12LZ4
             session.receiverSupportsBC7Mode6Hint = receiver.supportsBC7Mode6
             session.receiverSupportsBC7TileDeltaHint = receiver.supportsBC7TileDelta
             session.receiverSupportsBC7LZFSEHint = receiver.supportsBC7LZFSE

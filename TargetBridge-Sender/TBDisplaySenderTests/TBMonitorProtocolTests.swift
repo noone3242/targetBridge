@@ -138,6 +138,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         """.utf8)
         let profile = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: olderProfile)
         XCTAssertNil(profile.supportsRawNV12)
+        XCTAssertNil(profile.supportsRawNV12LZ4)
         XCTAssertNil(profile.supportsBC7Mode6)
         XCTAssertNil(profile.supportsBC7TileDelta)
         XCTAssertNil(profile.supportsBC7LZFSE)
@@ -159,6 +160,7 @@ final class TBMonitorProtocolTests: XCTestCase {
           "captureHeight": 2880,
           "supportsBC7LZFSE": true,
           "supportsBC7LZ4": true,
+          "supportsRawNV12LZ4": true,
           "receiverVersion": "3.3.0",
           "receiverBuild": "dev-20260926163000",
           "receiverCommit": "9b6b092abcde"
@@ -168,6 +170,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(current.receiverVersion, "3.3.0")
         XCTAssertEqual(current.supportsBC7LZFSE, true)
         XCTAssertEqual(current.supportsBC7LZ4, true)
+        XCTAssertEqual(current.supportsRawNV12LZ4, true)
         XCTAssertEqual(current.receiverBuild, "dev-20260926163000")
         XCTAssertEqual(current.receiverCommit, "9b6b092abcde")
 
@@ -738,6 +741,30 @@ final class TBMonitorProtocolTests: XCTestCase {
             ),
             raw
         )
+    }
+
+    func testNV12LZ4PacketRoundTripsExactly() throws {
+        let width = 256
+        let height = 256
+        let yStride = 256
+        let uvStride = 256
+        let y = Data(repeating: 0x40, count: yStride * height)
+        let uv = Data(repeating: 0x80, count: uvStride * height / 2)
+        let packet = try XCTUnwrap(TBNV12Compression.makePacket(
+            y: y,
+            uv: uv,
+            width: width,
+            height: height,
+            yStride: yStride,
+            uvStride: uvStride
+        ))
+        let decoded = try XCTUnwrap(TBNV12Compression.decodePacket(packet))
+        XCTAssertEqual(decoded.width, width)
+        XCTAssertEqual(decoded.height, height)
+        XCTAssertEqual(decoded.yStride, yStride)
+        XCTAssertEqual(decoded.uvStride, uvStride)
+        XCTAssertEqual(decoded.y, y)
+        XCTAssertEqual(decoded.uv, uv)
     }
 
     func testBC7CompressionModeCapabilityResolution() {
