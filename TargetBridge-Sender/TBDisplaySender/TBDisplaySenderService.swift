@@ -1731,6 +1731,8 @@ struct TBPipelineDiagnosticsSnapshot {
     let nv12DirtyPixels: TBMetricSummary
     let nv12DirtyRectCount: TBMetricSummary
     let nv12OverfetchPermille: TBMetricSummary
+    let nv12TileDetectionTime: TBMetricSummary
+    let nv12RunCount: TBMetricSummary
 
     static let empty = TBPipelineDiagnosticsSnapshot(
         pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
@@ -1755,7 +1757,8 @@ struct TBPipelineDiagnosticsSnapshot {
         nv12CopyTime: .empty, nv12CompressionTime: .empty,
         nv12ChecksumTime: .empty, nv12PacketTime: .empty,
         nv12RegionPixels: .empty, nv12DirtyPixels: .empty,
-        nv12DirtyRectCount: .empty, nv12OverfetchPermille: .empty
+        nv12DirtyRectCount: .empty, nv12OverfetchPermille: .empty,
+        nv12TileDetectionTime: .empty, nv12RunCount: .empty
     )
 }
 
@@ -1769,6 +1772,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let displayID: CGDirectDisplayID
     private let usesRawNV12: Bool
     private let usesRawNV12LZ4: Bool
+    private let usesRawNV12TileRuns: Bool
     private let rawNV12ChecksumPolicy: TBNV12ChecksumPolicy
     private let usesBC7Mode6: Bool
     private let usesBC7TileDelta: Bool
@@ -1797,8 +1801,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var firstFrameNotified = false
     private var running = false
     private var rawNV12HasBaseline = false
+    private var rawNV12Width = 0
+    private var rawNV12Height = 0
     private var rawNV12ObservedDropped = 0
     private var lastRawNV12Frame: TBCapturedFrame?
+    private var rawNV12TileDetector: TBNV12TileDetector?
     private let latestBC7Frame = TBLatestFrameSlot<TBCapturedFrame>()
     private let latestRawNV12Frame = TBLatestFrameSlot<TBCapturedFrame>()
 
@@ -1849,6 +1856,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _nv12DirtyPixelsWindow = TBRollingMetricWindow()
     private var _nv12DirtyRectCountWindow = TBRollingMetricWindow()
     private var _nv12OverfetchPermilleWindow = TBRollingMetricWindow()
+    private var _nv12TileDetectionTimeWindow = TBRollingMetricWindow()
+    private var _nv12RunCountWindow = TBRollingMetricWindow()
     private var _lastCaptureFrameAt = Date()
 
     init(preset: TBDisplayCapturePreset,
@@ -1858,6 +1867,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          displayID: CGDirectDisplayID,
          usesRawNV12: Bool,
          usesRawNV12LZ4: Bool,
+         usesRawNV12TileRuns: Bool,
          usesBC7Mode6: Bool,
          usesBC7TileDelta: Bool,
          bc7CompressionMode: TBBC7CompressionMode,
@@ -1870,6 +1880,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
         self.usesRawNV12LZ4 = usesRawNV12LZ4
+        self.usesRawNV12TileRuns = usesRawNV12TileRuns
         self.rawNV12ChecksumPolicy =
             ProcessInfo.processInfo.environment["TB_NV12_CHECKSUM"] == "1"
                 ? .fnv64
@@ -1898,6 +1909,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 return running
             }
             if usesRawNV12 {
+                if usesRawNV12TileRuns {
+                    rawNV12TileDetector = TBNV12TileDetector()
+                    guard rawNV12TileDetector != nil else { return false }
+                }
                 running = true
                 return true
             }
@@ -1914,6 +1929,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
         queue.sync {
             running = false
             rawNV12HasBaseline = false
+            rawNV12Width = 0
+            rawNV12Height = 0
+            rawNV12TileDetector?.reset()
             rawNV12ObservedDropped = 0
             lastRawNV12Frame = nil
             latestBC7Frame.cancel()
@@ -2007,7 +2025,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 nv12RegionPixels: _nv12RegionPixelsWindow.summary(),
                 nv12DirtyPixels: _nv12DirtyPixelsWindow.summary(),
                 nv12DirtyRectCount: _nv12DirtyRectCountWindow.summary(),
-                nv12OverfetchPermille: _nv12OverfetchPermilleWindow.summary()
+                nv12OverfetchPermille: _nv12OverfetchPermilleWindow.summary(),
+                nv12TileDetectionTime:
+                    _nv12TileDetectionTimeWindow.summary(),
+                nv12RunCount: _nv12RunCountWindow.summary()
             )
         }
     }
@@ -2095,6 +2116,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         _nv12RegionPixelsWindow.record(UInt64(result.regionPixels))
         _nv12DirtyPixelsWindow.record(UInt64(max(0, dirtyPixels)))
         _nv12DirtyRectCountWindow.record(UInt64(max(0, dirtyRectCount)))
+        _nv12RunCountWindow.record(UInt64(max(0, result.runCount)))
         if dirtyPixels > 0 {
             _nv12OverfetchPermilleWindow.record(
                 UInt64(result.regionPixels * 1000 / dirtyPixels)
@@ -2215,6 +2237,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let dropped = taken.droppedCount
         if dropped > rawNV12ObservedDropped {
             rawNV12HasBaseline = false
+            rawNV12TileDetector?.reset()
             rawNV12ObservedDropped = dropped
         }
         guard let capturedFrame = taken.value else {
@@ -2417,14 +2440,52 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
         guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return }
 
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        if width != rawNV12Width || height != rawNV12Height {
+            rawNV12HasBaseline = false
+            rawNV12TileDetector?.reset()
+            rawNV12Width = width
+            rawNV12Height = height
+        }
+        let detectorHadBaseline = rawNV12TileDetector?.hasBaseline == true
+        let detectedTiles: Set<Int>?
+        var shouldCommitTileCandidate = false
+        let tileGeometrySupported =
+            width % TBNV12Compression.tileSize == 0 &&
+            height % TBNV12Compression.tileSize == 0
+        if usesRawNV12TileRuns, tileGeometrySupported {
+            let detectionStarted = DispatchTime.now().uptimeNanoseconds
+            detectedTiles = rawNV12TileDetector?.analyze(
+                pixelBuffer: pixelBuffer
+            )
+            let detectionElapsed =
+                DispatchTime.now().uptimeNanoseconds - detectionStarted
+            lock.lock()
+            _nv12TileDetectionTimeWindow.record(detectionElapsed)
+            lock.unlock()
+            if detectedTiles == nil {
+                rawNV12TileDetector?.reset()
+                rawNV12HasBaseline = false
+            } else {
+                shouldCommitTileCandidate = true
+            }
+            if rawNV12HasBaseline,
+               detectorHadBaseline,
+               detectedTiles?.isEmpty == true {
+                rawNV12TileDetector?.commitCandidate()
+                return
+            }
+        } else {
+            detectedTiles = nil
+        }
+
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
               let uvBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)
         else { return }
-        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
-        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
         let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
         let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
         let uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
@@ -2439,7 +2500,124 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let dirtyRects = Self.dirtyRects(
             from: sampleBuffer, pixelWidth: width, pixelHeight: height
         )
-        if usesRawNV12LZ4, rawNV12HasBaseline,
+
+        let makeFullPacket: () -> Data = {
+            let y = Data(bytes: yBase, count: ySize)
+            let uv = Data(bytes: uvBase, count: uvSize)
+            if self.usesRawNV12LZ4,
+               let result = TBNV12Compression.makePacket(
+                   y: y,
+                   uv: uv,
+                   width: width,
+                   height: height,
+                   yStride: yStride,
+                   uvStride: uvStride,
+                   checksumPolicy: self.rawNV12ChecksumPolicy
+               ) {
+                self.recordNV12Packet(
+                    result,
+                    isRegion: false,
+                    dirtyPixels: width * height
+                )
+                return result.packet
+            }
+            var payload = Data(capacity: 17 + ySize + uvSize)
+            payload.append(1)
+            TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(yStride))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(uvStride))
+            payload.append(y)
+            payload.append(uv)
+            let rawPacket = TBMonitorProtocol.makePacket(
+                type: .rawFrame, payload: payload
+            )
+            self.recordNV12RawBaseline(
+                rawBytes: ySize + uvSize,
+                wireBytes: rawPacket.count
+            )
+            return rawPacket
+        }
+
+        if usesRawNV12TileRuns,
+           tileGeometrySupported,
+           rawNV12HasBaseline,
+           detectorHadBaseline,
+           let detectedTiles {
+            let tilesWide = width / TBNV12Compression.tileSize
+            let tilesHigh = height / TBNV12Compression.tileSize
+            let totalTiles = tilesWide * tilesHigh
+            let tileRunCount = TBNV12Compression.tileRunCount(
+                dirtyTiles: detectedTiles,
+                width: width,
+                height: height
+            )
+            if detectedTiles.count * 4 < totalTiles * 3,
+               let tileRunCount, tileRunCount <= 256,
+               let result = TBNV12Compression.makeTileRunPacket(
+                   yBase: yBase,
+                   uvBase: uvBase,
+                   width: width,
+                   height: height,
+                   yStride: yStride,
+                   uvStride: uvStride,
+                   dirtyTiles: detectedTiles,
+                   checksumPolicy: rawNV12ChecksumPolicy
+               ) {
+                packet = result.packet
+                recordNV12Packet(
+                    result,
+                    isRegion: true,
+                    dirtyPixels: result.regionPixels,
+                    dirtyRectCount: result.runCount
+                )
+            } else {
+                let tileXs = detectedTiles.map { $0 % tilesWide }
+                let tileYs = detectedTiles.map { $0 / tilesWide }
+                let minTileX = tileXs.min() ?? 0
+                let maxTileX = tileXs.max() ?? (tilesWide - 1)
+                let minTileY = tileYs.min() ?? 0
+                let maxTileY = tileYs.max() ?? (tilesHigh - 1)
+                let regionX = minTileX * TBNV12Compression.tileSize
+                let regionY = minTileY * TBNV12Compression.tileSize
+                let regionWidth =
+                    (maxTileX - minTileX + 1) * TBNV12Compression.tileSize
+                let regionHeight =
+                    (maxTileY - minTileY + 1) * TBNV12Compression.tileSize
+                if let result = TBNV12Compression.makeRegionPacket(
+                    yBase: yBase,
+                    uvBase: uvBase,
+                    width: width,
+                    height: height,
+                    yStride: yStride,
+                    uvStride: uvStride,
+                    x: regionX,
+                    y: regionY,
+                    regionWidth: regionWidth,
+                    regionHeight: regionHeight,
+                    checksumPolicy: rawNV12ChecksumPolicy
+                ) {
+                    packet = result.packet
+                    recordNV12Packet(
+                        result,
+                        isRegion: true,
+                        dirtyPixels: detectedTiles.count *
+                            TBNV12Compression.tileSize *
+                            TBNV12Compression.tileSize,
+                        dirtyRectCount: detectedTiles.count
+                    )
+                } else {
+                    rawNV12HasBaseline = false
+                    packet = makeFullPacket()
+                    isFullBaselinePacket = true
+                }
+            }
+        } else if usesRawNV12TileRuns,
+                  tileGeometrySupported,
+                  detectedTiles != nil {
+            packet = makeFullPacket()
+            isFullBaselinePacket = true
+        } else if usesRawNV12LZ4, rawNV12HasBaseline,
            let rects = dirtyRects, rects.isEmpty {
             return
         } else if usesRawNV12LZ4, rawNV12HasBaseline,
@@ -2485,34 +2663,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 )
             }
         } else if usesRawNV12LZ4 {
-            let y = Data(bytes: yBase, count: ySize)
-            let uv = Data(bytes: uvBase, count: uvSize)
-            if let result = TBNV12Compression.makePacket(
-                y: y, uv: uv, width: width, height: height,
-                yStride: yStride, uvStride: uvStride,
-                checksumPolicy: rawNV12ChecksumPolicy
-            ) {
-                packet = result.packet
-                recordNV12Packet(
-                    result, isRegion: false, dirtyPixels: width * height
-                )
-            } else {
-                var payload = Data(capacity: 17 + ySize + uvSize)
-                payload.append(1)
-                TBMonitorProtocol.appendBE32(&payload, UInt32(width))
-                TBMonitorProtocol.appendBE32(&payload, UInt32(height))
-                TBMonitorProtocol.appendBE32(&payload, UInt32(yStride))
-                TBMonitorProtocol.appendBE32(&payload, UInt32(uvStride))
-                payload.append(y)
-                payload.append(uv)
-                packet = TBMonitorProtocol.makePacket(
-                    type: .rawFrame, payload: payload
-                )
-                recordNV12RawBaseline(
-                    rawBytes: ySize + uvSize,
-                    wireBytes: packet.count
-                )
-            }
+            packet = makeFullPacket()
             isFullBaselinePacket = true
         } else {
             let y = Data(bytes: yBase, count: ySize)
@@ -2534,6 +2685,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         pendingVideoPackets += 1
         let sendStarted = DispatchTime.now().uptimeNanoseconds
         let fullBaselinePacket = isFullBaselinePacket
+        let commitTileCandidate = shouldCommitTileCandidate
         connection.send(content: packet, completion: .contentProcessed({ [weak self] error in
             guard let self else { return }
             self.queue.async {
@@ -2548,9 +2700,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     if fullBaselinePacket {
                         self.rawNV12HasBaseline = true
                     }
+                    if commitTileCandidate {
+                        self.rawNV12TileDetector?.commitCandidate()
+                    }
                 } else {
                     self._bc7SendErrors += 1
                     self.rawNV12HasBaseline = false
+                    self.rawNV12TileDetector?.discardCandidate()
+                    self.rawNV12TileDetector?.reset()
                 }
                 self.lock.unlock()
                 self.drainLatestRawNV12Frame()
@@ -2563,6 +2720,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.rawNV12HasBaseline = false
+            self.rawNV12TileDetector?.reset()
             guard let frame = self.lastRawNV12Frame else { return }
             let retry = TBCapturedFrame(
                 sampleBuffer: frame.sampleBuffer,
@@ -2999,6 +3157,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsHEVCDecodeHint = nil
                 receiverSupportsRawNV12Hint = nil
                 receiverSupportsRawNV12LZ4Hint = nil
+                receiverSupportsRawNV12TileRunsHint = nil
                 receiverSupportsBC7Mode6Hint = nil
                 receiverSupportsBC7TileDeltaHint = nil
                 receiverSupportsBC7LZFSEHint = nil
@@ -3018,6 +3177,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsHEVCDecodeHint = nil
                 receiverSupportsRawNV12Hint = nil
                 receiverSupportsRawNV12LZ4Hint = nil
+                receiverSupportsRawNV12TileRunsHint = nil
                 receiverSupportsBC7Mode6Hint = nil
                 receiverSupportsBC7TileDeltaHint = nil
                 receiverSupportsBC7LZFSEHint = nil
@@ -3073,6 +3233,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var receiverSupportsHEVCDecodeHint: Bool?
     var receiverSupportsRawNV12Hint: Bool?
     var receiverSupportsRawNV12LZ4Hint: Bool?
+    var receiverSupportsRawNV12TileRunsHint: Bool?
     var receiverSupportsBC7Mode6Hint: Bool?
     var receiverSupportsBC7TileDeltaHint: Bool?
     var receiverSupportsBC7LZFSEHint: Bool?
@@ -4416,6 +4577,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
         receiverSupportsRawNV12Hint = profile.supportsRawNV12
         receiverSupportsRawNV12LZ4Hint = profile.supportsRawNV12LZ4
+        receiverSupportsRawNV12TileRunsHint =
+            profile.supportsRawNV12TileRuns
         receiverSupportsBC7Mode6Hint = profile.supportsBC7Mode6
         receiverSupportsBC7TileDeltaHint = profile.supportsBC7TileDelta
         receiverSupportsBC7LZFSEHint = profile.supportsBC7LZFSE
@@ -4593,6 +4756,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 usesRawNV12: usesRawNV12,
                 usesRawNV12LZ4: usesRawNV12 &&
                     profile.supportsRawNV12LZ4 == true,
+                usesRawNV12TileRuns: usesRawNV12 &&
+                    profile.supportsRawNV12TileRuns == true,
                 usesBC7Mode6: usesBC7Mode6,
                 usesBC7TileDelta: usesBC7Mode6 && profile.supportsBC7TileDelta == true,
                 bc7CompressionMode: usesBC7Mode6
@@ -5629,7 +5794,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     "nv12OverfetchP50":
                         Double(diagnostics.nv12OverfetchPermille.p50) / 1000.0,
                     "nv12OverfetchP95":
-                        Double(diagnostics.nv12OverfetchPermille.p95) / 1000.0
+                        Double(diagnostics.nv12OverfetchPermille.p95) / 1000.0,
+                    "nv12TileDetectionP50Ms":
+                        Double(diagnostics.nv12TileDetectionTime.p50) /
+                            1_000_000.0,
+                    "nv12TileDetectionP95Ms":
+                        Double(diagnostics.nv12TileDetectionTime.p95) /
+                            1_000_000.0,
+                    "nv12RunCountP50": diagnostics.nv12RunCount.p50,
+                    "nv12RunCountP95": diagnostics.nv12RunCount.p95
                 ]
                 if let receiver = lastReceiverMetrics {
                     metricsJSON["receiver"] = [
@@ -5655,6 +5828,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                             receiver.inverseTransformP95Ms ?? 0,
                         "rawFullFrames": receiver.rawFullFrames ?? 0,
                         "rawRegionFrames": receiver.rawRegionFrames ?? 0,
+                        "rawTileRunFrames":
+                            receiver.rawTileRunFrames ?? 0,
+                        "rawTileRuns": receiver.rawTileRuns ?? 0,
                         "rawShadowCommitP95Ms":
                             receiver.rawShadowCommitP95Ms ?? 0,
                         "rawChecksumP95Ms":

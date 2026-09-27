@@ -18,6 +18,7 @@
 #include "bc7_delta.h"
 #include "bc7_supercompression.h"
 #include "bc7_renderer.h"
+#include "nv12_tile_runs.h"
 #include "decoder.h"
 #include "display.h"
 #include "proto.h"
@@ -134,6 +135,8 @@ struct app {
     struct tb_metric_window bc7_inverse_transform_ns;
     uint64_t raw_full_frames;
     uint64_t raw_region_frames;
+    uint64_t raw_tile_run_frames;
+    uint64_t raw_tile_runs;
     struct tb_metric_window raw_shadow_commit_ns;
     struct tb_metric_window raw_upload_ns;
     struct tb_metric_window raw_checksum_ns;
@@ -717,6 +720,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "supportsHEVCDecode", 1, tb_dec_supports_hevc_hwdecode() ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsRawNV12", 1, "1");
     TXTRecordSetValue(&txt, "supportsRawNV12LZ4", 1, "1");
+    TXTRecordSetValue(&txt, "supportsRawNV12TileRuns", 1, "1");
     TXTRecordSetValue(&txt, "supportsBC7Mode6", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsBC7TileDelta", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsBC7LZFSE", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
@@ -1044,6 +1048,118 @@ static void on_frame(const uint8_t *y, int y_stride,
 static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     const uint64_t apply_started = now_ns();
     record_bc7_packet_arrival(a, apply_started);
+    if (len > 0 && p[0] == TB_NV12_TILE_RUN_FORMAT) {
+        if (!a->raw_has_baseline) {
+            request_raw_keyframe(a, "tile-runs-base");
+            return;
+        }
+        struct tb_nv12_tile_run_frame frame;
+        struct tb_nv12_tile_run runs[TB_NV12_TILE_RUN_MAX_RUNS];
+        if (tb_nv12_tile_run_parse(
+                p, len, &frame, runs, TB_NV12_TILE_RUN_MAX_RUNS) != 0 ||
+            frame.width != a->raw_width ||
+            frame.height != a->raw_height) {
+            request_raw_keyframe(a, "tile-runs-format");
+            return;
+        }
+        if (a->raw_decode_capacity < frame.raw_length) {
+            uint8_t *resized = realloc(
+                a->raw_decode_buffer, frame.raw_length
+            );
+            if (!resized) {
+                request_raw_keyframe(a, "tile-runs-allocation");
+                return;
+            }
+            a->raw_decode_buffer = resized;
+            a->raw_decode_capacity = frame.raw_length;
+        }
+        uint8_t *raw = a->raw_decode_buffer;
+        if (!raw) {
+            request_raw_keyframe(a, "tile-runs-allocation");
+            return;
+        }
+        const uint64_t decode_started = now_ns();
+        const size_t decoded = compression_decode_buffer(
+            raw,
+            frame.raw_length,
+            frame.compressed,
+            frame.compressed_length,
+            NULL,
+            COMPRESSION_LZ4
+        );
+        metric_record(
+            &a->bc7_decompression_ns, now_ns() - decode_started
+        );
+        if (decoded != frame.raw_length) {
+            request_raw_keyframe(a, "tile-runs-decode");
+            return;
+        }
+        if (frame.checksum != 0) {
+            const uint64_t checksum_started = now_ns();
+            const int matches = tb_checksum64_matches_optional(
+                raw, frame.raw_length, frame.checksum
+            );
+            metric_record(
+                &a->raw_checksum_ns, now_ns() - checksum_started
+            );
+            if (!matches) {
+                request_raw_keyframe(a, "tile-runs-checksum");
+                return;
+            }
+        }
+
+        const uint64_t upload_started = now_ns();
+        for (uint32_t index = 0; index < frame.run_count; index++) {
+            const struct tb_nv12_tile_run *run = &runs[index];
+            const uint32_t pixel_width =
+                (uint32_t)run->tile_count_x * TB_NV12_TILE_RUN_SIZE;
+            const uint32_t y_length = pixel_width * run->pixel_height;
+            const uint8_t *run_y = raw + run->data_offset;
+            const uint8_t *run_uv = run_y + y_length;
+            if (tb_disp_update_nv12_region(
+                    a->disp,
+                    run_y,
+                    (int)pixel_width,
+                    run_uv,
+                    (int)pixel_width,
+                    (int)frame.width,
+                    (int)frame.height,
+                    (int)run->tile_x * TB_NV12_TILE_RUN_SIZE,
+                    (int)run->tile_y * TB_NV12_TILE_RUN_SIZE,
+                    (int)pixel_width,
+                    (int)run->pixel_height) != 0) {
+                request_raw_keyframe(a, "tile-runs-upload");
+                return;
+            }
+        }
+        if (tb_disp_present_nv12(a->disp) != 0) {
+            request_raw_keyframe(a, "tile-runs-present");
+            return;
+        }
+        const uint64_t upload_finished = now_ns();
+        metric_record(&a->raw_shadow_commit_ns, 0);
+        metric_record(
+            &a->raw_upload_ns, upload_finished - upload_started
+        );
+        metric_record(
+            &a->bc7_present_ns, upload_finished - upload_started
+        );
+        if (a->bc7_last_present_ns != 0) {
+            metric_record(
+                &a->bc7_present_interval_ns,
+                upload_finished - a->bc7_last_present_ns
+            );
+        }
+        a->bc7_last_present_ns = upload_finished;
+        a->bc7_presented_frames++;
+        a->raw_region_frames++;
+        a->raw_tile_run_frames++;
+        a->raw_tile_runs += frame.run_count;
+        a->have_video_frame = 1;
+        a->frames++;
+        metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
+        return;
+    }
     if (len > 0 && p[0] == 3) {
         if (len < 54 || p[1] != 1 ||
             !a->raw_has_baseline) {
@@ -1390,6 +1506,7 @@ static void request_bc7_keyframe(struct app *a, const char *reason) {
 }
 
 static void request_raw_keyframe(struct app *a, const char *reason) {
+    a->raw_has_baseline = 0;
     const uint64_t now = now_ms();
     if (a->client_fd < 0 || a->raw_keyframe_request_pending ||
         (a->raw_last_keyframe_request_ms != 0 &&
@@ -2510,7 +2627,8 @@ static void send_receiver_info(struct app *a) {
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
         "\"receiverVersion\":\"%s\",\"receiverBuild\":\"%s\",\"receiverCommit\":\"%s\","
         "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,"
-        "\"supportsRawNV12LZ4\":true,\"supportsBC7Mode6\":%s,"
+        "\"supportsRawNV12LZ4\":true,\"supportsRawNV12TileRuns\":true,"
+        "\"supportsBC7Mode6\":%s,"
         "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
         "\"supportsBC7LZ4\":%s,"
         "\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
@@ -2572,7 +2690,7 @@ static void send_receiver_metrics(
         metric_summary(&a->raw_upload_ns);
     const struct tb_metric_summary raw_checksum =
         metric_summary(&a->raw_checksum_ns);
-    char json[2560];
+    char json[3072];
     int json_len = snprintf(
         json,
         sizeof(json),
@@ -2592,7 +2710,8 @@ static void send_receiver_metrics(
         "\"decompressionP95Ms\":%.3f,\"decompressionP99Ms\":%.3f,"
         "\"inverseTransformP50Ms\":%.3f,\"inverseTransformP95Ms\":%.3f,"
         "\"inverseTransformP99Ms\":%.3f,\"rawFullFrames\":%llu,"
-        "\"rawRegionFrames\":%llu,\"rawShadowCommitP50Ms\":%.3f,"
+        "\"rawRegionFrames\":%llu,\"rawTileRunFrames\":%llu,"
+        "\"rawTileRuns\":%llu,\"rawShadowCommitP50Ms\":%.3f,"
         "\"rawShadowCommitP95Ms\":%.3f,\"rawShadowCommitP99Ms\":%.3f,"
         "\"rawUploadP50Ms\":%.3f,\"rawUploadP95Ms\":%.3f,"
         "\"rawUploadP99Ms\":%.3f,\"rawChecksumP50Ms\":%.3f,"
@@ -2637,6 +2756,8 @@ static void send_receiver_metrics(
         ns_to_ms(inverse_transform.p99),
         (unsigned long long)a->raw_full_frames,
         (unsigned long long)a->raw_region_frames,
+        (unsigned long long)a->raw_tile_run_frames,
+        (unsigned long long)a->raw_tile_runs,
         ns_to_ms(raw_shadow.p50),
         ns_to_ms(raw_shadow.p95),
         ns_to_ms(raw_shadow.p99),
@@ -2650,7 +2771,7 @@ static void send_receiver_metrics(
     if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
 
     const size_t packet_len = 5u + (size_t)json_len;
-    uint8_t packet[5 + 2560];
+    uint8_t packet[5 + 3072];
     write_be32(packet, (uint32_t)(1 + json_len));
     packet[4] = TB_PKT_RECEIVER_METRICS;
     memcpy(packet + 5, json, (size_t)json_len);
@@ -2772,7 +2893,7 @@ int main(int argc, char **argv) {
             "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
             "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
             "\"supportsBC7LZ4\":%s,\"supportsRawNV12\":true,"
-            "\"supportsRawNV12LZ4\":true}\n",
+            "\"supportsRawNV12LZ4\":true,\"supportsRawNV12TileRuns\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
             TB_RECEIVER_COMMIT,

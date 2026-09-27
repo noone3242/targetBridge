@@ -52,6 +52,7 @@ struct TBMonitorDisplayProfile: Codable {
     var supportsHEVCDecode: Bool?
     var supportsRawNV12: Bool?
     var supportsRawNV12LZ4: Bool?
+    var supportsRawNV12TileRuns: Bool?
     var supportsBC7Mode6: Bool?
     var supportsBC7TileDelta: Bool?
     var supportsBC7LZFSE: Bool?
@@ -110,6 +111,8 @@ struct TBMonitorReceiverMetrics: Codable, Equatable {
     var inverseTransformP99Ms: Double?
     var rawFullFrames: UInt64?
     var rawRegionFrames: UInt64?
+    var rawTileRunFrames: UInt64?
+    var rawTileRuns: UInt64?
     var rawShadowCommitP50Ms: Double?
     var rawShadowCommitP95Ms: Double?
     var rawShadowCommitP99Ms: Double?

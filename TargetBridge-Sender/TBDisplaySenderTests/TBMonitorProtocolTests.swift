@@ -143,6 +143,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         let profile = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: olderProfile)
         XCTAssertNil(profile.supportsRawNV12)
         XCTAssertNil(profile.supportsRawNV12LZ4)
+        XCTAssertNil(profile.supportsRawNV12TileRuns)
         XCTAssertNil(profile.supportsBC7Mode6)
         XCTAssertNil(profile.supportsBC7TileDelta)
         XCTAssertNil(profile.supportsBC7LZFSE)
@@ -165,6 +166,7 @@ final class TBMonitorProtocolTests: XCTestCase {
           "supportsBC7LZFSE": true,
           "supportsBC7LZ4": true,
           "supportsRawNV12LZ4": true,
+          "supportsRawNV12TileRuns": true,
           "receiverVersion": "3.3.0",
           "receiverBuild": "dev-20260926163000",
           "receiverCommit": "9b6b092abcde"
@@ -175,6 +177,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(current.supportsBC7LZFSE, true)
         XCTAssertEqual(current.supportsBC7LZ4, true)
         XCTAssertEqual(current.supportsRawNV12LZ4, true)
+        XCTAssertEqual(current.supportsRawNV12TileRuns, true)
         XCTAssertEqual(current.receiverBuild, "dev-20260926163000")
         XCTAssertEqual(current.receiverCommit, "9b6b092abcde")
 
@@ -859,6 +862,142 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertNotEqual(TBMonitorProtocol.readBE64(packet, offset: 51), 0)
         packet[58] ^= 1
         XCTAssertNil(TBNV12Compression.decodeRegionPacket(packet))
+    }
+
+    func testNV12LZ4TileRunsRoundTripExactly() throws {
+        let width = 128, height = 128
+        let yStride = 128, uvStride = 128
+        let y = Data((0..<(yStride * height)).map {
+            UInt8(truncatingIfNeeded: $0)
+        })
+        let uv = Data((0..<(uvStride * height / 2)).map {
+            UInt8(truncatingIfNeeded: $0 &* 3)
+        })
+        let packet = try y.withUnsafeBytes { yBytes in
+            try uv.withUnsafeBytes { uvBytes in
+                try XCTUnwrap(TBNV12Compression.makeTileRunPacket(
+                    yBase: try XCTUnwrap(yBytes.baseAddress),
+                    uvBase: try XCTUnwrap(uvBytes.baseAddress),
+                    width: width,
+                    height: height,
+                    yStride: yStride,
+                    uvStride: uvStride,
+                    dirtyTiles: [0, 1, 2]
+                ))
+            }
+        }
+        let decoded = try XCTUnwrap(
+            TBNV12Compression.decodeTileRunPacket(packet.packet)
+        )
+        XCTAssertEqual(decoded.width, width)
+        XCTAssertEqual(decoded.height, height)
+        XCTAssertEqual(decoded.runs.count, 2)
+        XCTAssertEqual(decoded.runs[0].tileX, 0)
+        XCTAssertEqual(decoded.runs[0].tileY, 0)
+        XCTAssertEqual(decoded.runs[0].tileCountX, 2)
+        XCTAssertEqual(decoded.runs[1].tileX, 0)
+        XCTAssertEqual(decoded.runs[1].tileY, 1)
+        XCTAssertEqual(decoded.runs[1].tileCountX, 1)
+        XCTAssertEqual(
+            TBNV12Compression.tileRunCount(
+                dirtyTiles: [0, 1, 2],
+                width: width,
+                height: height
+            ),
+            2
+        )
+
+        var expected = Data()
+        for row in 0..<64 {
+            expected.append(y[(row * yStride)..<(row * yStride + 128)])
+        }
+        for row in 0..<32 {
+            expected.append(uv[(row * uvStride)..<(row * uvStride + 128)])
+        }
+        for row in 64..<128 {
+            expected.append(y[(row * yStride)..<(row * yStride + 64)])
+        }
+        for row in 32..<64 {
+            expected.append(uv[(row * uvStride)..<(row * uvStride + 64)])
+        }
+        XCTAssertEqual(decoded.raw, expected)
+
+        var overlapping = packet.packet
+        overlapping[55] = 0
+        overlapping[56] = 0
+        XCTAssertNil(TBNV12Compression.decodeTileRunPacket(overlapping))
+    }
+
+    func testNV12MetalTileDetectorTracksExactChangedTile() throws {
+        guard let detector = TBNV12TileDetector() else {
+            throw XCTSkip("Metal NV12 tile detector unavailable")
+        }
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+        var optionalBuffer: CVPixelBuffer?
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                128,
+                128,
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                attributes as CFDictionary,
+                &optionalBuffer
+            ),
+            kCVReturnSuccess
+        )
+        let pixelBuffer = try XCTUnwrap(optionalBuffer)
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        memset(
+            try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)),
+            0x40,
+            CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0) * 128
+        )
+        memset(
+            try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)),
+            0x80,
+            CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1) * 64
+        )
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+
+        XCTAssertEqual(
+            try XCTUnwrap(detector.analyze(pixelBuffer: pixelBuffer)),
+            [0, 1, 2, 3]
+        )
+        detector.commitCandidate()
+        XCTAssertEqual(
+            try XCTUnwrap(detector.analyze(pixelBuffer: pixelBuffer)),
+            []
+        )
+        detector.commitCandidate()
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let yBase = try XCTUnwrap(
+            CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
+        ).assumingMemoryBound(to: UInt8.self)
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        yBase[yStride + 65] ^= 1
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        XCTAssertEqual(
+            try XCTUnwrap(detector.analyze(pixelBuffer: pixelBuffer)),
+            [1]
+        )
+        detector.discardCandidate()
+        XCTAssertEqual(
+            try XCTUnwrap(detector.analyze(pixelBuffer: pixelBuffer)),
+            [1]
+        )
+        detector.commitCandidate()
+        XCTAssertEqual(
+            try XCTUnwrap(detector.analyze(pixelBuffer: pixelBuffer)),
+            []
+        )
+        detector.reset()
+        XCTAssertEqual(
+            try XCTUnwrap(detector.analyze(pixelBuffer: pixelBuffer)),
+            [0, 1, 2, 3]
+        )
     }
 
     func testBC7CompressionModeCapabilityResolution() {

@@ -11,6 +11,7 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
     let supportsHEVCDecode: Bool
     let supportsRawNV12: Bool
     let supportsRawNV12LZ4: Bool
+    let supportsRawNV12TileRuns: Bool
     let supportsBC7Mode6: Bool
     let supportsBC7TileDelta: Bool
     let supportsBC7LZFSE: Bool
@@ -30,6 +31,7 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
         supportsHEVCDecode: Bool,
         supportsRawNV12: Bool = false,
         supportsRawNV12LZ4: Bool = false,
+        supportsRawNV12TileRuns: Bool = false,
         supportsBC7Mode6: Bool = false,
         supportsBC7TileDelta: Bool = false,
         supportsBC7LZFSE: Bool = false,
@@ -46,6 +48,7 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
         self.supportsHEVCDecode = supportsHEVCDecode
         self.supportsRawNV12 = supportsRawNV12
         self.supportsRawNV12LZ4 = supportsRawNV12LZ4
+        self.supportsRawNV12TileRuns = supportsRawNV12TileRuns
         self.supportsBC7Mode6 = supportsBC7Mode6
         self.supportsBC7TileDelta = supportsBC7TileDelta
         self.supportsBC7LZFSE = supportsBC7LZFSE
@@ -159,6 +162,8 @@ final class TBReceiverDiscovery: NSObject, ObservableObject {
         let supportsHEVCDecode = stringValue("supportsHEVCDecode") == "1"
         let supportsRawNV12 = stringValue("supportsRawNV12") == "1"
         let supportsRawNV12LZ4 = stringValue("supportsRawNV12LZ4") == "1"
+        let supportsRawNV12TileRuns =
+            stringValue("supportsRawNV12TileRuns") == "1"
         let supportsBC7Mode6 = stringValue("supportsBC7Mode6") == "1"
         let supportsBC7TileDelta = stringValue("supportsBC7TileDelta") == "1"
         let supportsBC7LZFSE = stringValue("supportsBC7LZFSE") == "1"
@@ -186,6 +191,7 @@ final class TBReceiverDiscovery: NSObject, ObservableObject {
             supportsHEVCDecode: supportsHEVCDecode,
             supportsRawNV12: supportsRawNV12,
             supportsRawNV12LZ4: supportsRawNV12LZ4,
+            supportsRawNV12TileRuns: supportsRawNV12TileRuns,
             supportsBC7Mode6: supportsBC7Mode6,
             supportsBC7TileDelta: supportsBC7TileDelta,
             supportsBC7LZFSE: supportsBC7LZFSE,

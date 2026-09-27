@@ -54,6 +54,7 @@
 		E9F7A263085592067562F768 /* TBDisplaySenderStatusItemController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AC1AF99431D4889F947CE1B /* TBDisplaySenderStatusItemController.swift */; };
 		F2274C924BAC479635B44A47 /* TBDisplaySenderManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4644CFB05098C895378B648A /* TBDisplaySenderManager.swift */; };
 		F50C677CB3566D555405ACC9 /* TBNV12Compression.swift in Sources */ = {isa = PBXBuildFile; fileRef = 714DBBD3785DF2779F4CFB46 /* TBNV12Compression.swift */; };
+		FC53D9EFC09629BCE1EA5233 /* TBNV12TileDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2D100C2B2A13875D037941E /* TBNV12TileDetector.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -113,6 +114,7 @@
 		DA01317B43B46B1B323A7008 /* TBMonitorProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBMonitorProtocol.swift; sourceTree = "<group>"; };
 		DD33D06A2FA6BA7E075A9E46 /* TBDisplaySenderSurfaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBDisplaySenderSurfaceViews.swift; sourceTree = "<group>"; };
 		DFB8219C144AA88D16BB4F59 /* TBDisplaySenderTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TBDisplaySenderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		E2D100C2B2A13875D037941E /* TBNV12TileDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBNV12TileDetector.swift; sourceTree = "<group>"; };
 		ED08E3D2FCC8194F8B8185C9 /* TBSenderAutomationParsingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBSenderAutomationParsingTests.swift; sourceTree = "<group>"; };
 		EF17070AC1C6F9E9F3B4DFDF /* TBInjectedClickStateTrackerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBInjectedClickStateTrackerTests.swift; sourceTree = "<group>"; };
 		FD6EB41D253E67E350F5E25D /* TBConnectionDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBConnectionDiagnostics.swift; sourceTree = "<group>"; };
@@ -153,6 +155,7 @@
 				7E3DC447E3E8E522565E725B /* TBInputRelayController.swift */,
 				D8CE593AAB77769B1B9DBCE7 /* TBMetricsFileLogger.swift */,
 				714DBBD3785DF2779F4CFB46 /* TBNV12Compression.swift */,
+				E2D100C2B2A13875D037941E /* TBNV12TileDetector.swift */,
 				06BABA1447D1E8DD50A6C2F0 /* TBReceiverDiscovery.swift */,
 				6630386DB9C3D210849E6211 /* TBVirtualDisplayModeMemory.swift */,
 			);
@@ -406,6 +409,7 @@
 				78B845D016638661C3D52988 /* TBMetricsFileLogger.swift in Sources */,
 				C2CCAB017BC3CAB1DCFA5CCC /* TBMonitorProtocol.swift in Sources */,
 				F50C677CB3566D555405ACC9 /* TBNV12Compression.swift in Sources */,
+				FC53D9EFC09629BCE1EA5233 /* TBNV12TileDetector.swift in Sources */,
 				06E4F7B33C77762A5E2CB616 /* TBReceiverDiscovery.swift in Sources */,
 				58980FE95A48D8F8EDB42055 /* TBVirtualDisplayModeMemory.swift in Sources */,
 			);

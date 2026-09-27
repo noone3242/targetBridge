@@ -11,6 +11,7 @@
 #include "../src/bc7_delta.h"
 #include "../src/bc7_supercompression.h"
 #include "../src/bc7_cursor.h"
+#include "../src/nv12_tile_runs.h"
 
 #include <compression.h>
 #include <stdio.h>
@@ -865,6 +866,79 @@ static void test_bc7_cursor_policy(void) {
           "redraw throttle handles tick wraparound");
 }
 
+static void test_nv12_tile_run_validation(void) {
+    uint8_t payload[
+        TB_NV12_TILE_RUN_HEADER_BYTES +
+        2u * TB_NV12_TILE_RUN_DESCRIPTOR_BYTES + 4u
+    ] = {0};
+    payload[0] = TB_NV12_TILE_RUN_FORMAT;
+    payload[1] = TB_NV12_TILE_RUN_COMPRESSION_LZ4;
+    put_be16(payload + 2, TB_NV12_TILE_RUN_SIZE);
+    put_be32(payload + 4, 128);
+    put_be32(payload + 8, 64);
+    put_be32(payload + 12, 2);
+    put_be32(payload + 16, 12288);
+    put_be32(payload + 20, 4);
+    put_be64(payload + 24, 0);
+
+    uint8_t *run0 = payload + TB_NV12_TILE_RUN_HEADER_BYTES;
+    put_be16(run0, 0);
+    put_be16(run0 + 2, 0);
+    put_be16(run0 + 4, 1);
+    put_be16(run0 + 6, 64);
+    put_be32(run0 + 8, 0);
+    put_be32(run0 + 12, 6144);
+    uint8_t *run1 = run0 + TB_NV12_TILE_RUN_DESCRIPTOR_BYTES;
+    put_be16(run1, 1);
+    put_be16(run1 + 2, 0);
+    put_be16(run1 + 4, 1);
+    put_be16(run1 + 6, 64);
+    put_be32(run1 + 8, 6144);
+    put_be32(run1 + 12, 6144);
+    uint8_t *compressed =
+        payload + TB_NV12_TILE_RUN_HEADER_BYTES +
+        2u * TB_NV12_TILE_RUN_DESCRIPTOR_BYTES;
+    compressed[0] = 0x62;
+    compressed[1] = 0x76;
+    compressed[2] = 0x34;
+    compressed[3] = 0x24;
+
+    struct tb_nv12_tile_run_frame frame;
+    struct tb_nv12_tile_run runs[2];
+    CHECK(tb_nv12_tile_run_parse(
+              payload, sizeof(payload), &frame, runs, 2) == 0,
+          "NV12 tile-run frame accepted");
+    CHECK(frame.width == 128 && frame.height == 64,
+          "NV12 tile-run dimensions parsed");
+    CHECK(frame.run_count == 2 && frame.raw_length == 12288,
+          "NV12 tile-run lengths parsed");
+    CHECK(runs[1].tile_x == 1 && runs[1].data_offset == 6144,
+          "NV12 tile-run descriptor parsed");
+
+    put_be16(run1, 0);
+    CHECK(tb_nv12_tile_run_parse(
+              payload, sizeof(payload), &frame, runs, 2) == -1,
+          "overlapping NV12 tile runs rejected");
+    put_be16(run1, 1);
+
+    put_be32(run1 + 8, 6143);
+    CHECK(tb_nv12_tile_run_parse(
+              payload, sizeof(payload), &frame, runs, 2) == -1,
+          "non-contiguous NV12 tile data rejected");
+    put_be32(run1 + 8, 6144);
+
+    compressed[2] = 0;
+    CHECK(tb_nv12_tile_run_parse(
+              payload, sizeof(payload), &frame, runs, 2) == -1,
+          "NV12 tile-run stream without LZ4 EOS rejected");
+    compressed[2] = 0x34;
+
+    put_be32(payload + 12, 3);
+    CHECK(tb_nv12_tile_run_parse(
+              payload, sizeof(payload), &frame, runs, 2) == -1,
+          "NV12 tile-run count exceeding capacity rejected");
+}
+
 int main(void) {
     test_single_packet_whole_feed();
     test_byte_by_byte_feed();
@@ -878,6 +952,7 @@ int main(void) {
     test_bc7_sequenced_keyframe_validation();
     test_bc7_delta_validation();
     test_bc7_cursor_policy();
+    test_nv12_tile_run_validation();
 
     if (g_failures == 0) {
         printf("net parser tests: %d checks passed\n", g_checks);

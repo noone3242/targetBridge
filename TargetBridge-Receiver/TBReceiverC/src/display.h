@@ -79,6 +79,12 @@ int tb_disp_render_nv12_region(struct tb_display *d,
                                const uint8_t *uv, int uv_stride,
                                int texture_w, int texture_h,
                                int x, int y_pos, int w, int h);
+int tb_disp_update_nv12_region(struct tb_display *d,
+                               const uint8_t *y, int y_stride,
+                               const uint8_t *uv, int uv_stride,
+                               int texture_w, int texture_h,
+                               int x, int y_pos, int w, int h);
+int tb_disp_present_nv12(struct tb_display *d);
 
 /* Report whether the active Metal device can sample BC7 textures. */
 int tb_disp_supports_bc7(struct tb_display *d);

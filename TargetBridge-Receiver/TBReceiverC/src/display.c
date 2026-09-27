@@ -1154,7 +1154,7 @@ int tb_disp_render_nv12(struct tb_display *d,
     return 0;
 }
 
-int tb_disp_render_nv12_region(struct tb_display *d,
+int tb_disp_update_nv12_region(struct tb_display *d,
                                const uint8_t *y, int y_stride,
                                const uint8_t *uv, int uv_stride,
                                int texture_w, int texture_h,
@@ -1171,8 +1171,26 @@ int tb_disp_render_nv12_region(struct tb_display *d,
         return -1;
     }
     d->last_video_frame_time = SDL_GetTicks();
+    return 0;
+}
+
+int tb_disp_present_nv12(struct tb_display *d) {
+    if (!d || !d->tex) return -1;
     tb_disp_render_current(d);
     return 0;
+}
+
+int tb_disp_render_nv12_region(struct tb_display *d,
+                               const uint8_t *y, int y_stride,
+                               const uint8_t *uv, int uv_stride,
+                               int texture_w, int texture_h,
+                               int x, int y_pos, int w, int h) {
+    if (tb_disp_update_nv12_region(
+            d, y, y_stride, uv, uv_stride,
+            texture_w, texture_h, x, y_pos, w, h) != 0) {
+        return -1;
+    }
+    return tb_disp_present_nv12(d);
 }
 
 int tb_disp_supports_bc7(struct tb_display *d) {
