@@ -36,6 +36,7 @@ fba7473  BC7 stable baseline
                                  └─ b3f4161 pipeline metrics
                                     └─ b904306 checksum disabled
                                        └─ tag: nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27
+                                       └─ 7c03537 GPU-detected NV12 tile runs
 ```
 
 ## Frozen checkpoints
@@ -62,6 +63,7 @@ fba7473  BC7 stable baseline
 | `f492b1e82950` | Recoverable NV12 region | No tag | 37 | 0.431 Gbit/s | 0.515 Gbit/s | Sender 26.98 Hz; Receiver 29.11 FPS; Sender LZ4 p95 7.65 ms; Receiver apply p95 23.23 ms |
 | `b3f416150a39` | NV12 pipeline breakdown | No tag | No valid paired deployment | Not available | Not available | Instrumentation, reusable decode scratch, and shadow-state changes; Receiver was not deployed at the same commit |
 | `b90430696861` | NV12 checksum disabled | `nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27` | 80 | 1.133 Gbit/s | 3.074 Gbit/s | Sender 51.72 Hz; Receiver 51.79 FPS; selected intervals reached 55–58 FPS |
+| `7c03537705c4` | GPU-detected NV12 64×64 tile runs | No tag | 18 initial high-load windows | 0.691 Gbit/s | 1.166 Gbit/s | Sender 55.06 Hz; Receiver 54.73 FPS; tile detection p95 snapshot average 2.86 ms; no protocol or render errors |
 
 ## Stage measurements
 
@@ -132,13 +134,39 @@ snapshots from 1.45x to 17.16x and Sender LZ4 p95 snapshots up to about 26 ms.
 This explains why the same commit varies from about 55–58 FPS in localized
 motion to about 51–52 FPS over the broader high-load sample set.
 
+### `7c03537` GPU-detected NV12 tile runs
+
+Initial run after deploying format 4. The sample set contains 18 windows with
+`networkGbps >= 0.3`.
+
+```text
+Sender capture/sent:          55.61 / 55.06 Hz
+Receiver present:             54.73 FPS
+network average/peak:         0.691 / 1.166 Gbit/s
+GPU tile detection p95 avg:   2.86 ms
+run count p95 avg/max:        82 / 88
+Sender run copy p95 avg:      2.44 ms
+Sender LZ4 p95 avg:           6.46 ms
+Sender send p95 avg:          0.862 ms
+Receiver decompress p95 avg:  3.06 ms
+Receiver upload p95 avg:      2.08 ms
+Receiver apply p95 avg:       5.04 ms
+invalid/render/key requests:  0 / 0 / 0
+```
+
+Compared with the broader `b904306` high-load sample set, observed average
+bandwidth decreased from 1.133 to 0.691 Gbit/s (39.0%), while Sender/Receiver
+rates increased from 51.72/51.79 to 55.06/54.73 FPS. The workloads and sample
+counts were not identical, so this is an initial hardware result rather than a
+controlled benchmark.
+
 ## Branch heads
 
 | Branch | Head |
 |---|---|
 | `2026-09-26_intel-bc7-debug` | `52b4ece57f1a` |
 | `2026-09-26_adaptive-5k-90hz` | `ab38756` |
-| `2026-09-27_raw-nv12-low-latency` | `b90430696861` at the time of the last validated checkpoint |
+| `2026-09-27_raw-nv12-low-latency` | `729d9f4` after tile runs and stable local signing |
 
 The active Raw NV12 branch may advance beyond `b904306`; use the checkpoint
 tag rather than the moving branch name when reproducing its measured behavior.
