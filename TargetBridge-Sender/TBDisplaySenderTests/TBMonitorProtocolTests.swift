@@ -965,6 +965,36 @@ final class TBMonitorProtocolTests: XCTestCase {
             try XCTUnwrap(detector.analyze(pixelBuffer: pixelBuffer)),
             [0, 1, 2, 3]
         )
+        let runs = try XCTUnwrap(TBNV12Compression.tileRuns(
+            dirtyTiles: [0, 1, 2],
+            width: 128,
+            height: 128
+        ))
+        let packed = try XCTUnwrap(
+            detector.pack(pixelBuffer: pixelBuffer, runs: runs)
+        )
+        var expectedPacked = Data(repeating: 0x40, count: 128 * 64)
+        expectedPacked.append(Data(repeating: 0x80, count: 128 * 32))
+        expectedPacked.append(Data(repeating: 0x40, count: 64 * 64))
+        expectedPacked.append(Data(repeating: 0x80, count: 64 * 32))
+        XCTAssertEqual(
+            Data(bytes: packed.buffer.contents(), count: packed.length),
+            expectedPacked
+        )
+        let packedPacket = try XCTUnwrap(
+            TBNV12Compression.makeTileRunPacket(
+                packedBytes: packed.buffer.contents(),
+                packedLength: packed.length,
+                width: 128,
+                height: 128,
+                runs: runs,
+                packingNanoseconds: packed.packingNanoseconds
+            )
+        )
+        XCTAssertEqual(
+            TBNV12Compression.decodeTileRunPacket(packedPacket.packet)?.raw,
+            expectedPacked
+        )
         detector.commitCandidate()
         XCTAssertEqual(
             try XCTUnwrap(detector.analyze(pixelBuffer: pixelBuffer)),

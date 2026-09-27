@@ -65,13 +65,14 @@ enum TBNV12Compression {
         let runs: [TileRun]
     }
 
-    static func tileRunCount(
+    static func tileRuns(
         dirtyTiles: Set<Int>,
         width: Int,
         height: Int
-    ) -> Int? {
+    ) -> [TileRun]? {
         guard width > 0, height > 0,
-              width % tileSize == 0, height % tileSize == 0
+              width % tileSize == 0, height % tileSize == 0,
+              !dirtyTiles.isEmpty
         else {
             return nil
         }
@@ -82,7 +83,8 @@ enum TBNV12Compression {
         }) else {
             return nil
         }
-        var count = 0
+        var runs: [TileRun] = []
+        var dataOffset = 0
         for tileY in 0..<tilesHigh {
             var tileX = 0
             while tileX < tilesWide {
@@ -90,14 +92,41 @@ enum TBNV12Compression {
                     tileX += 1
                     continue
                 }
-                count += 1
+                let startX = tileX
                 while tileX < tilesWide,
                       dirtyTiles.contains(tileY * tilesWide + tileX) {
                     tileX += 1
                 }
+                let tileCountX = tileX - startX
+                let dataLength =
+                    tileCountX * tileSize * tileSize * 3 / 2
+                runs.append(
+                    TileRun(
+                        tileX: startX,
+                        tileY: tileY,
+                        tileCountX: tileCountX,
+                        pixelHeight: tileSize,
+                        dataOffset: dataOffset,
+                        dataLength: dataLength
+                    )
+                )
+                dataOffset += dataLength
+                guard runs.count <= maxTileRuns else { return nil }
             }
         }
-        return count
+        return runs.isEmpty ? nil : runs
+    }
+
+    static func tileRunCount(
+        dirtyTiles: Set<Int>,
+        width: Int,
+        height: Int
+    ) -> Int? {
+        tileRuns(
+            dirtyTiles: dirtyTiles,
+            width: width,
+            height: height
+        )?.count
     }
 
     static func makePacket(
@@ -281,6 +310,7 @@ enum TBNV12Compression {
         else {
             return nil
         }
+
         let tilesWide = width / tileSize
         let tilesHigh = height / tileSize
         guard dirtyTiles.allSatisfy({
@@ -399,6 +429,88 @@ enum TBNV12Compression {
             checksumNanoseconds: checksumFinished - checksumStarted,
             packetNanoseconds: packetFinished - packetStarted,
             regionPixels: dirtyTiles.count * tileSize * tileSize,
+            runCount: runs.count
+        )
+    }
+
+    static func makeTileRunPacket(
+        packedBytes: UnsafeRawPointer,
+        packedLength: Int,
+        width: Int,
+        height: Int,
+        runs: [TileRun],
+        packingNanoseconds: UInt64,
+        checksumPolicy: TBNV12ChecksumPolicy = .disabled
+    ) -> PacketResult? {
+        guard packedLength > 0,
+              packedLength == runs.reduce(0, { $0 + $1.dataLength }),
+              !runs.isEmpty,
+              runs.count <= maxTileRuns
+        else {
+            return nil
+        }
+        let capacity = packedLength + 64 * 1024
+        var compressed = Data(count: capacity)
+        let compressionStarted = DispatchTime.now().uptimeNanoseconds
+        let size = compressed.withUnsafeMutableBytes { destination in
+            guard let dst = destination.baseAddress?
+                .assumingMemoryBound(to: UInt8.self)
+            else {
+                return 0
+            }
+            return compression_encode_buffer(
+                dst,
+                capacity,
+                packedBytes.assumingMemoryBound(to: UInt8.self),
+                packedLength,
+                nil,
+                COMPRESSION_LZ4
+            )
+        }
+        let compressionFinished = DispatchTime.now().uptimeNanoseconds
+        guard size > 0 else { return nil }
+        compressed.count = size
+        let checksumStarted = compressionFinished
+        let checksumValue = checksumPolicy == .fnv64
+            ? TBChecksum64(packedBytes, packedLength)
+            : 0
+        let checksumFinished = DispatchTime.now().uptimeNanoseconds
+        let packetStarted = checksumFinished
+        var payload = Data(capacity: 32 + runs.count * 16 + size)
+        payload.append(4)
+        payload.append(1)
+        TBMonitorProtocol.appendBE16(&payload, UInt16(tileSize))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(runs.count))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(packedLength))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(size))
+        TBMonitorProtocol.appendBE64(&payload, checksumValue)
+        for run in runs {
+            TBMonitorProtocol.appendBE16(&payload, UInt16(run.tileX))
+            TBMonitorProtocol.appendBE16(&payload, UInt16(run.tileY))
+            TBMonitorProtocol.appendBE16(&payload, UInt16(run.tileCountX))
+            TBMonitorProtocol.appendBE16(&payload, UInt16(run.pixelHeight))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(run.dataOffset))
+            TBMonitorProtocol.appendBE32(&payload, UInt32(run.dataLength))
+        }
+        payload.append(compressed)
+        let packet = TBMonitorProtocol.makePacket(
+            type: .rawFrame, payload: payload
+        )
+        let packetFinished = DispatchTime.now().uptimeNanoseconds
+        let regionPixels = runs.reduce(0) {
+            $0 + $1.pixelWidth * $1.pixelHeight
+        }
+        return PacketResult(
+            packet: packet,
+            rawBytes: packedLength,
+            wireBytes: packet.count,
+            copyNanoseconds: packingNanoseconds,
+            compressionNanoseconds: compressionFinished - compressionStarted,
+            checksumNanoseconds: checksumFinished - checksumStarted,
+            packetNanoseconds: packetFinished - packetStarted,
+            regionPixels: regionPixels,
             runCount: runs.count
         )
     }

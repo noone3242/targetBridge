@@ -2547,21 +2547,24 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let tilesWide = width / TBNV12Compression.tileSize
             let tilesHigh = height / TBNV12Compression.tileSize
             let totalTiles = tilesWide * tilesHigh
-            let tileRunCount = TBNV12Compression.tileRunCount(
+            let tileRuns = TBNV12Compression.tileRuns(
                 dirtyTiles: detectedTiles,
                 width: width,
                 height: height
             )
             if detectedTiles.count * 4 < totalTiles * 3,
-               let tileRunCount, tileRunCount <= 256,
+               let tileRuns, tileRuns.count <= 256,
+               let packed = rawNV12TileDetector?.pack(
+                   pixelBuffer: pixelBuffer,
+                   runs: tileRuns
+               ),
                let result = TBNV12Compression.makeTileRunPacket(
-                   yBase: yBase,
-                   uvBase: uvBase,
+                   packedBytes: packed.buffer.contents(),
+                   packedLength: packed.length,
                    width: width,
                    height: height,
-                   yStride: yStride,
-                   uvStride: uvStride,
-                   dirtyTiles: detectedTiles,
+                   runs: tileRuns,
+                   packingNanoseconds: packed.packingNanoseconds,
                    checksumPolicy: rawNV12ChecksumPolicy
                ) {
                 packet = result.packet

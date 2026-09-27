@@ -1,18 +1,29 @@
 import CoreVideo
 import Metal
 
+struct TBNV12PackedRuns {
+    let buffer: MTLBuffer
+    let length: Int
+    let packingNanoseconds: UInt64
+}
+
 final class TBNV12TileDetector {
     static let tileSize = 64
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
+    private let packingPipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
     private var committedY: MTLTexture?
     private var committedUV: MTLTexture?
     private var candidateY: MTLTexture?
     private var candidateUV: MTLTexture?
     private var dirtyBuffer: MTLBuffer?
+    private var runDescriptorBuffer: MTLBuffer?
+    private var packedBuffer: MTLBuffer?
+    private var runDescriptorCapacity = 0
+    private var packedCapacity = 0
     private var width = 0
     private var height = 0
     private var tileCount = 0
@@ -79,6 +90,60 @@ final class TBNV12TileDetector {
                 atomic_load_explicit(&changed, memory_order_relaxed);
         }
     }
+
+    struct NV12RunDescriptor {
+        ushort tile_x;
+        ushort tile_y;
+        ushort tile_count_x;
+        ushort pixel_height;
+        uint data_offset;
+        uint data_length;
+    };
+
+    kernel void nv12_pack_runs(
+        texture2d<float, access::read> current_y [[texture(0)]],
+        texture2d<float, access::read> current_uv [[texture(1)]],
+        device const NV12RunDescriptor *runs [[buffer(0)]],
+        device uchar *packed [[buffer(1)]],
+        uint thread_index [[thread_index_in_threadgroup]],
+        uint run_index [[threadgroup_position_in_grid]]
+    ) {
+        constexpr uint tile_size = 64u;
+        constexpr uint threads_per_run = 64u;
+        NV12RunDescriptor run = runs[run_index];
+        uint origin_x = uint(run.tile_x) * tile_size;
+        uint origin_y = uint(run.tile_y) * tile_size;
+        uint pixel_width = uint(run.tile_count_x) * tile_size;
+        uint pixel_height = uint(run.pixel_height);
+        uint y_pixels = pixel_width * pixel_height;
+        for (uint index = thread_index; index < y_pixels;
+             index += threads_per_run) {
+            uint x = origin_x + index % pixel_width;
+            uint y = origin_y + index / pixel_width;
+            packed[run.data_offset + index] = uchar(clamp(
+                round(current_y.read(uint2(x, y)).r * 255.0f),
+                0.0f,
+                255.0f
+            ));
+        }
+
+        uint uv_width = pixel_width / 2u;
+        uint uv_height = pixel_height / 2u;
+        uint uv_texels = uv_width * uv_height;
+        uint uv_offset = run.data_offset + y_pixels;
+        for (uint index = thread_index; index < uv_texels;
+             index += threads_per_run) {
+            uint x = origin_x / 2u + index % uv_width;
+            uint y = origin_y / 2u + index / uv_width;
+            float2 value = current_uv.read(uint2(x, y)).rg;
+            packed[uv_offset + index * 2u] = uchar(clamp(
+                round(value.x * 255.0f), 0.0f, 255.0f
+            ));
+            packed[uv_offset + index * 2u + 1u] = uchar(clamp(
+                round(value.y * 255.0f), 0.0f, 255.0f
+            ));
+        }
+    }
     """
 
     init?() {
@@ -89,11 +154,16 @@ final class TBNV12TileDetector {
         }
         do {
             let library = try device.makeLibrary(source: Self.source, options: nil)
-            guard let function = library.makeFunction(name: "nv12_tile_compare")
+            guard let function = library.makeFunction(name: "nv12_tile_compare"),
+                  let packingFunction =
+                    library.makeFunction(name: "nv12_pack_runs")
             else {
                 return nil
             }
             pipeline = try device.makeComputePipelineState(function: function)
+            packingPipeline = try device.makeComputePipelineState(
+                function: packingFunction
+            )
         } catch {
             NSLog(
                 "TargetBridge: unable to compile NV12 tile detector: %@",
@@ -255,8 +325,117 @@ final class TBNV12TileDetector {
         hasStagedCandidate = false
     }
 
+    func pack(
+        pixelBuffer: CVPixelBuffer,
+        runs: [TBNV12Compression.TileRun]
+    ) -> TBNV12PackedRuns? {
+        guard !runs.isEmpty,
+              CVPixelBufferGetPlaneCount(pixelBuffer) >= 2,
+              let textureCache
+        else {
+            return nil
+        }
+        let lumaWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let lumaHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let uvWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 1)
+        let uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
+        var yReference: CVMetalTexture?
+        var uvReference: CVMetalTexture?
+        guard CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, textureCache, pixelBuffer, nil,
+            .r8Unorm, lumaWidth, lumaHeight, 0, &yReference
+        ) == kCVReturnSuccess,
+        CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, textureCache, pixelBuffer, nil,
+            .rg8Unorm, uvWidth, uvHeight, 1, &uvReference
+        ) == kCVReturnSuccess,
+        let yReference,
+        let uvReference,
+        let sourceY = CVMetalTextureGetTexture(yReference),
+        let sourceUV = CVMetalTextureGetTexture(uvReference)
+        else {
+            return nil
+        }
+
+        let packedLength = runs.reduce(0) { $0 + $1.dataLength }
+        let descriptorLength =
+            runs.count * MemoryLayout<MetalRunDescriptor>.stride
+        if runDescriptorBuffer == nil ||
+            runDescriptorCapacity < descriptorLength {
+            runDescriptorBuffer = device.makeBuffer(
+                length: descriptorLength,
+                options: .storageModeShared
+            )
+            runDescriptorCapacity = descriptorLength
+        }
+        if packedBuffer == nil || packedCapacity < packedLength {
+            packedBuffer = device.makeBuffer(
+                length: packedLength,
+                options: .storageModeShared
+            )
+            packedCapacity = packedLength
+        }
+        guard let runDescriptorBuffer,
+              let packedBuffer,
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            return nil
+        }
+        let descriptors = runDescriptorBuffer.contents()
+            .assumingMemoryBound(to: MetalRunDescriptor.self)
+        for (index, run) in runs.enumerated() {
+            descriptors[index] = MetalRunDescriptor(
+                tileX: UInt16(run.tileX),
+                tileY: UInt16(run.tileY),
+                tileCountX: UInt16(run.tileCountX),
+                pixelHeight: UInt16(run.pixelHeight),
+                dataOffset: UInt32(run.dataOffset),
+                dataLength: UInt32(run.dataLength)
+            )
+        }
+
+        let started = DispatchTime.now().uptimeNanoseconds
+        encoder.setComputePipelineState(packingPipeline)
+        encoder.setTexture(sourceY, index: 0)
+        encoder.setTexture(sourceUV, index: 1)
+        encoder.setBuffer(runDescriptorBuffer, offset: 0, index: 0)
+        encoder.setBuffer(packedBuffer, offset: 0, index: 1)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: runs.count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else {
+            if let error = commandBuffer.error {
+                NSLog(
+                    "TargetBridge: NV12 tile packing failed: %@",
+                    error.localizedDescription
+                )
+            }
+            return nil
+        }
+        return TBNV12PackedRuns(
+            buffer: packedBuffer,
+            length: packedLength,
+            packingNanoseconds:
+                DispatchTime.now().uptimeNanoseconds - started
+        )
+    }
+
     func discardCandidate() {
         hasStagedCandidate = false
+    }
+
+    private struct MetalRunDescriptor {
+        var tileX: UInt16
+        var tileY: UInt16
+        var tileCountX: UInt16
+        var pixelHeight: UInt16
+        var dataOffset: UInt32
+        var dataLength: UInt32
     }
 
     func reset() {
