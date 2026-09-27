@@ -306,6 +306,31 @@ static void tb_disp_fill_rounded_rect(CGContextRef ctx,
     CGPathRelease(path);
 }
 
+static void tb_disp_draw_card(CGContextRef ctx,
+                              CGFloat x,
+                              CGFloat y,
+                              CGFloat w,
+                              CGFloat h,
+                              CGFloat radius) {
+    CGPathRef path = CGPathCreateWithRoundedRect(
+        CGRectMake(x, y, w, h),
+        radius,
+        radius,
+        NULL
+    );
+    if (!path) return;
+
+    CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+    CGContextAddPath(ctx, path);
+    CGContextFillPath(ctx);
+
+    CGContextSetRGBStrokeColor(ctx, 0.87, 0.88, 0.90, 1.0);
+    CGContextSetLineWidth(ctx, 1.0);
+    CGContextAddPath(ctx, path);
+    CGContextStrokePath(ctx);
+    CGPathRelease(path);
+}
+
 static void tb_disp_draw_brand_icon(CGContextRef ctx, CGFloat x, CGFloat y, CGFloat size) {
     const CGFloat inset = size * 0.22;
     const CGFloat monitor_w = size * 0.56;
@@ -313,8 +338,8 @@ static void tb_disp_draw_brand_icon(CGContextRef ctx, CGFloat x, CGFloat y, CGFl
     const CGFloat monitor_x = x + (size - monitor_w) / 2.0;
     const CGFloat monitor_y = y + size * 0.25;
 
-    tb_disp_fill_rounded_rect(ctx, x, y, size, size, size * 0.22, 0.13, 0.34, 0.24, 1.0);
-    CGContextSetRGBStrokeColor(ctx, 0.94, 0.98, 0.96, 1.0);
+    tb_disp_fill_rounded_rect(ctx, x, y, size, size, size * 0.28, 0.82, 0.95, 0.89, 1.0);
+    CGContextSetRGBStrokeColor(ctx, 0.98, 1.0, 0.99, 1.0);
     CGContextSetLineWidth(ctx, size * 0.045);
     CGContextStrokeRect(ctx, CGRectMake(monitor_x, monitor_y, monitor_w, monitor_h));
     CGContextMoveToPoint(ctx, monitor_x + monitor_w * 0.5, monitor_y + monitor_h);
@@ -389,6 +414,11 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
         free(pixels);
         return;
     }
+    CGContextSetShouldAntialias(ctx, true);
+    CGContextSetShouldSmoothFonts(ctx, true);
+    CGContextSetAllowsFontSmoothing(ctx, true);
+    CGContextSetShouldSubpixelPositionFonts(ctx, true);
+    CGContextSetShouldSubpixelQuantizeFonts(ctx, true);
 
     CGContextTranslateCTM(ctx, 0, (CGFloat)drawable_h);
     CGContextScaleCTM(ctx, 1.0, -1.0);
@@ -443,81 +473,138 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
     } else {
 
     tb_disp_fill_rect(ctx, 0, 0, (CGFloat)drawable_w, (CGFloat)drawable_h, 0.96, 0.97, 0.98, 1.0);
-    CGFloat layout_scale_x = (CGFloat)drawable_w / 1920.0;
-    CGFloat layout_scale_y = (CGFloat)drawable_h / 1080.0;
-    CGFloat layout_scale =
-        layout_scale_x < layout_scale_y ? layout_scale_x : layout_scale_y;
-    layout_scale *= 1.15;
-    if (layout_scale < 0.92) layout_scale = 0.92;
-    if (layout_scale > 1.50) layout_scale = 1.50;
-    const CGFloat text_scale = layout_scale * 1.20;
 
-    const CGFloat group_h = 820.0 * layout_scale;
-    const CGFloat group_y =
-        ((CGFloat)drawable_h - group_h) / 2.0 > 28.0
-            ? ((CGFloat)drawable_h - group_h) / 2.0
-            : 28.0;
-    const CGFloat max_outer_w = 1500.0 * layout_scale;
-    const CGFloat available_w =
-        (CGFloat)drawable_w - 96.0 * layout_scale;
-    const CGFloat outer_w =
-        available_w < max_outer_w ? available_w : max_outer_w;
-    const CGFloat outer_x = ((CGFloat)drawable_w - outer_w) / 2.0;
-    const CGFloat card_gap = 24.0 * layout_scale;
-    const CGFloat card_w = (outer_w - card_gap) / 2.0;
+    int window_w = 0;
+    int window_h = 0;
+    SDL_GetWindowSize(d->win, &window_w, &window_h);
+    CGFloat point_scale =
+        window_w > 0 ? (CGFloat)drawable_w / (CGFloat)window_w : 1.0;
+    if (window_h > 0) {
+        const CGFloat vertical_scale = (CGFloat)drawable_h / (CGFloat)window_h;
+        if (vertical_scale < point_scale) point_scale = vertical_scale;
+    }
+    if (point_scale < 1.0) point_scale = 1.0;
+    if (point_scale > 3.0) point_scale = 3.0;
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.title"), title_font, 38 * text_scale, outer_x, group_y + 42.0 * layout_scale, 0.12, 0.13, 0.15);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.subtitle"), body_font, 21 * text_scale, outer_x, group_y + 82.0 * layout_scale, 0.42, 0.44, 0.49);
-    tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_bold_font, 18 * text_scale, outer_x + outer_w - 250.0 * layout_scale, group_y + 28.0 * layout_scale, 0.30, 0.32, 0.36);
-    tb_disp_draw_text(ctx, "build " TB_RECEIVER_BUILD, mono_font, 14 * text_scale, outer_x + outer_w - 250.0 * layout_scale, group_y + 56.0 * layout_scale, 0.45, 0.47, 0.52);
-    tb_disp_draw_text(ctx, "commit " TB_RECEIVER_COMMIT, mono_font, 14 * text_scale, outer_x + outer_w - 250.0 * layout_scale, group_y + 84.0 * layout_scale, 0.45, 0.47, 0.52);
+    const CGFloat canvas_w = (CGFloat)drawable_w / point_scale;
+    const CGFloat canvas_h = (CGFloat)drawable_h / point_scale;
+    const CGFloat content_h = 560.0;
+    const CGFloat top =
+        (canvas_h - content_h) / 2.0 > 20.0
+            ? (canvas_h - content_h) / 2.0
+            : 20.0;
+    const CGFloat margin = 24.0;
+    const CGFloat gap = 14.0;
+    const CGFloat outer_x = margin * point_scale;
+    const CGFloat outer_w = (canvas_w - 2.0 * margin) * point_scale;
+    const CGFloat card_radius = 18.0 * point_scale;
 
-    const CGFloat banner_y = group_y + 112.0 * layout_scale;
+    const CGFloat header_y = top * point_scale;
+    const CGFloat header_h = 86.0 * point_scale;
+    tb_disp_draw_card(ctx, outer_x, header_y, outer_w, header_h, card_radius);
+    tb_disp_draw_brand_icon(
+        ctx,
+        outer_x + 18.0 * point_scale,
+        header_y + 17.0 * point_scale,
+        52.0 * point_scale
+    );
+    tb_disp_draw_text(
+        ctx,
+        tb_i18n_get("receiver.ui.title"),
+        title_font,
+        25.0 * point_scale,
+        outer_x + 86.0 * point_scale,
+        header_y + 39.0 * point_scale,
+        0.12, 0.13, 0.15
+    );
+    tb_disp_draw_text(
+        ctx,
+        tb_i18n_get("receiver.ui.subtitle"),
+        body_font,
+        15.0 * point_scale,
+        outer_x + 86.0 * point_scale,
+        header_y + 65.0 * point_scale,
+        0.42, 0.44, 0.49
+    );
+    const CGFloat chip_w = 112.0 * point_scale;
+    const CGFloat chip_x = outer_x + outer_w - chip_w - 18.0 * point_scale;
+    const CGFloat chip_y = header_y + 27.0 * point_scale;
+    tb_disp_fill_rounded_rect(
+        ctx,
+        chip_x,
+        chip_y,
+        chip_w,
+        32.0 * point_scale,
+        16.0 * point_scale,
+        0.94, 0.95, 0.96, 1.0
+    );
+    tb_disp_draw_text(
+        ctx,
+        status,
+        section_font,
+        13.0 * point_scale,
+        chip_x + 15.0 * point_scale,
+        chip_y + 22.0 * point_scale,
+        0.34, 0.36, 0.40
+    );
+
+    const CGFloat banner_y = (top + 100.0) * point_scale;
     tb_disp_fill_rounded_rect(
         ctx,
         outer_x,
         banner_y,
         outer_w,
-        106.0 * layout_scale,
-        20.0 * layout_scale,
+        72.0 * point_scale,
+        card_radius,
         0.92, 0.98, 0.94, 1.0
     );
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 18 * text_scale, outer_x + 22.0 * layout_scale, banner_y + 32.0 * layout_scale, 0.30, 0.37, 0.34);
-    tb_disp_draw_text(ctx, ip, mono_bold_font, 35 * text_scale, outer_x + 22.0 * layout_scale, banner_y + 78.0 * layout_scale, 0.08, 0.55, 0.30);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 12.0 * point_scale, outer_x + 18.0 * point_scale, banner_y + 25.0 * point_scale, 0.30, 0.37, 0.34);
+    tb_disp_draw_text(ctx, ip, mono_bold_font, 20.0 * point_scale, outer_x + 18.0 * point_scale, banner_y + 56.0 * point_scale, 0.08, 0.55, 0.30);
 
-    const CGFloat info_y = group_y + 240.0 * layout_scale;
-    const CGFloat info_h = 184.0 * layout_scale;
-    tb_disp_fill_rounded_rect(ctx, outer_x, info_y, card_w, info_h, 20.0 * layout_scale, 1.0, 1.0, 1.0, 1.0);
-    tb_disp_fill_rounded_rect(ctx, outer_x + card_w + card_gap, info_y, card_w, info_h, 20.0 * layout_scale, 1.0, 1.0, 1.0, 1.0);
+    const CGFloat info_y = (top + 186.0) * point_scale;
+    const CGFloat info_h = 128.0 * point_scale;
+    const CGFloat card_gap = gap * point_scale;
+    const CGFloat card_w = (outer_w - card_gap) / 2.0;
+    tb_disp_draw_card(ctx, outer_x, info_y, card_w, info_h, card_radius);
+    tb_disp_draw_card(ctx, outer_x + card_w + card_gap, info_y, card_w, info_h, card_radius);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.status"), section_font, 18 * text_scale, outer_x + 20.0 * layout_scale, info_y + 34.0 * layout_scale, 0.42, 0.44, 0.49);
-    tb_disp_draw_text(ctx, status, body_font, 28 * text_scale, outer_x + 20.0 * layout_scale, info_y + 76.0 * layout_scale, 0.12, 0.13, 0.15);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.sender"), section_font, 17 * text_scale, outer_x + 20.0 * layout_scale, info_y + 124.0 * layout_scale, 0.42, 0.44, 0.49);
-    tb_disp_draw_text(ctx, sender, body_font, 24 * text_scale, outer_x + 20.0 * layout_scale, info_y + 158.0 * layout_scale, 0.12, 0.13, 0.15);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.status"), section_font, 12.0 * point_scale, outer_x + 18.0 * point_scale, info_y + 25.0 * point_scale, 0.42, 0.44, 0.49);
+    tb_disp_draw_text(ctx, status, body_font, 18.0 * point_scale, outer_x + 18.0 * point_scale, info_y + 56.0 * point_scale, 0.12, 0.13, 0.15);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.sender"), section_font, 12.0 * point_scale, outer_x + 18.0 * point_scale, info_y + 87.0 * point_scale, 0.42, 0.44, 0.49);
+    tb_disp_draw_text(ctx, sender, body_font, 16.0 * point_scale, outer_x + 18.0 * point_scale, info_y + 114.0 * point_scale, 0.12, 0.13, 0.15);
 
-    const CGFloat display_x =
-        outer_x + card_w + card_gap + 20.0 * layout_scale;
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.display"), section_font, 18 * text_scale, display_x, info_y + 34.0 * layout_scale, 0.42, 0.44, 0.49);
-    tb_disp_draw_text(ctx, panel, zh ? body_font : mono_font, 24 * text_scale, display_x, info_y + 76.0 * layout_scale, 0.12, 0.13, 0.15);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.stream_profile"), section_font, 17 * text_scale, display_x, info_y + 124.0 * layout_scale, 0.42, 0.44, 0.49);
-    tb_disp_draw_text(ctx, mode, zh ? body_font : mono_font, 24 * text_scale, display_x, info_y + 158.0 * layout_scale, 0.12, 0.13, 0.15);
+    const CGFloat display_x = outer_x + card_w + card_gap + 18.0 * point_scale;
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.display"), section_font, 12.0 * point_scale, display_x, info_y + 25.0 * point_scale, 0.42, 0.44, 0.49);
+    tb_disp_draw_text(ctx, panel, zh ? body_font : mono_font, 15.0 * point_scale, display_x, info_y + 56.0 * point_scale, 0.12, 0.13, 0.15);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.stream_profile"), section_font, 12.0 * point_scale, display_x, info_y + 87.0 * point_scale, 0.42, 0.44, 0.49);
+    tb_disp_draw_text(ctx, mode, zh ? body_font : mono_font, 15.0 * point_scale, display_x, info_y + 114.0 * point_scale, 0.12, 0.13, 0.15);
 
-    const CGFloat permission_y = group_y + 446.0 * layout_scale;
-    const CGFloat permission_h = 132.0 * layout_scale;
-    tb_disp_fill_rounded_rect(ctx, outer_x, permission_y, outer_w, permission_h, 20.0 * layout_scale, 1.0, 1.0, 1.0, 1.0);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.permissions"), section_font, 18 * text_scale, outer_x + 20.0 * layout_scale, permission_y + 34.0 * layout_scale, 0.42, 0.44, 0.49);
-    tb_disp_draw_text(ctx, permissions, body_font, 24 * text_scale, outer_x + 20.0 * layout_scale, permission_y + 76.0 * layout_scale, 0.12, 0.13, 0.15);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.language"), section_font, 17 * text_scale, outer_x + outer_w - 280.0 * layout_scale, permission_y + 34.0 * layout_scale, 0.42, 0.44, 0.49);
-    tb_disp_draw_text(ctx, language, body_font, 22 * text_scale, outer_x + outer_w - 280.0 * layout_scale, permission_y + 76.0 * layout_scale, 0.12, 0.13, 0.15);
+    const CGFloat permission_y = (top + 328.0) * point_scale;
+    const CGFloat permission_h = 88.0 * point_scale;
+    tb_disp_draw_card(ctx, outer_x, permission_y, outer_w, permission_h, card_radius);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.permissions"), section_font, 12.0 * point_scale, outer_x + 18.0 * point_scale, permission_y + 28.0 * point_scale, 0.42, 0.44, 0.49);
+    tb_disp_draw_text(ctx, permissions, body_font, 16.0 * point_scale, outer_x + 18.0 * point_scale, permission_y + 62.0 * point_scale, 0.12, 0.13, 0.15);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.language"), section_font, 12.0 * point_scale, outer_x + outer_w - 205.0 * point_scale, permission_y + 28.0 * point_scale, 0.42, 0.44, 0.49);
+    tb_disp_draw_text(ctx, language, body_font, 15.0 * point_scale, outer_x + outer_w - 205.0 * point_scale, permission_y + 62.0 * point_scale, 0.12, 0.13, 0.15);
 
-    const CGFloat help_y = group_y + 618.0 * layout_scale;
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_1"), body_font, 20 * text_scale, outer_x, help_y, 0.34, 0.36, 0.41);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_2"), body_font, 20 * text_scale, outer_x, help_y + 34.0 * layout_scale, 0.34, 0.36, 0.41);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_4"), body_font, 20 * text_scale, outer_x, help_y + 68.0 * layout_scale, 0.34, 0.36, 0.41);
+    const CGFloat help_y = (top + 430.0) * point_scale;
+    tb_disp_draw_card(ctx, outer_x, help_y, outer_w, 74.0 * point_scale, card_radius);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_1"), body_font, 13.0 * point_scale, outer_x + 18.0 * point_scale, help_y + 24.0 * point_scale, 0.34, 0.36, 0.41);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_2"), body_font, 13.0 * point_scale, outer_x + 18.0 * point_scale, help_y + 44.0 * point_scale, 0.34, 0.36, 0.41);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_4"), body_font, 13.0 * point_scale, outer_x + 18.0 * point_scale, help_y + 64.0 * point_scale, 0.34, 0.36, 0.41);
 
-    tb_disp_fill_rect(ctx, outer_x, group_y + 740.0 * layout_scale, outer_w, 1.0, 0.82, 0.83, 0.85, 1.0);
-    tb_disp_draw_text(ctx, "TARGETBRIDGE", mono_bold_font, 22 * text_scale, outer_x, group_y + 790.0 * layout_scale, 0.12, 0.13, 0.15);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.title"), title_font, 27 * text_scale, outer_x + 220.0 * layout_scale, group_y + 790.0 * layout_scale, 0.12, 0.13, 0.15);
+    const CGFloat footer_y = (top + 532.0) * point_scale;
+    tb_disp_draw_text(ctx, "TARGETBRIDGE", mono_bold_font, 13.0 * point_scale, outer_x, footer_y, 0.12, 0.13, 0.15);
+    char build_identity[128];
+    snprintf(
+        build_identity,
+        sizeof(build_identity),
+        "%s · build %s · commit %s",
+        TB_RECEIVER_VERSION,
+        TB_RECEIVER_BUILD,
+        TB_RECEIVER_COMMIT
+    );
+    tb_disp_draw_text(ctx, build_identity, mono_font, 10.5 * point_scale, outer_x + outer_w - 390.0 * point_scale, footer_y, 0.45, 0.47, 0.52);
     }
 
     CGContextRelease(ctx);
@@ -619,6 +706,7 @@ struct tb_display *tb_disp_create(int fullscreen) {
         fprintf(stderr, "[disp] CreateWindow: %s\n", SDL_GetError());
         free(d); return NULL;
     }
+    SDL_SetWindowMinimumSize(d->win, 780, 560);
 
     /* No VSYNC: lets us present as fast as decode produces frames.
      * On Intel iMac with Radeon Pro 570 + 5K display, VSYNC at 60Hz combined
@@ -671,6 +759,7 @@ struct tb_display *tb_disp_create(int fullscreen) {
 
 void tb_disp_destroy(struct tb_display *d) {
     if (!d) return;
+    tb_native_status_destroy();
     if (d->system_cursor_hidden) {
         CGDisplayShowCursor(CGMainDisplayID());
         d->system_cursor_hidden = 0;
@@ -1510,6 +1599,7 @@ static void tb_disp_set_stream_state(struct tb_display *d, int connected, int co
 
 void tb_disp_set_connection_state(struct tb_display *d, int connected) {
     tb_disp_set_stream_state(d, connected ? 1 : 0, 0);
+    if (connected) tb_native_status_hide();
 }
 
 static void tb_disp_set_connecting_state(struct tb_display *d, int connecting) {
@@ -1604,6 +1694,19 @@ void tb_disp_render_status(struct tb_display *d,
     SDL_RenderClear(d->ren);
     if (d->status_tex) SDL_RenderCopy(d->ren, d->status_tex, NULL, NULL);
     SDL_RenderPresent(d->ren);
+    tb_native_status_show(
+        d->win,
+        ip,
+        status,
+        sender,
+        panel,
+        mode,
+        language,
+        permissions,
+        0,
+        "",
+        ""
+    );
 }
 
 void tb_disp_render_connecting(struct tb_display *d) {
@@ -1636,6 +1739,19 @@ void tb_disp_render_connecting(struct tb_display *d) {
     if (d->status_tex) SDL_RenderCopy(d->ren, d->status_tex, NULL, NULL);
     tb_disp_draw_connecting_spinner(d, drawable_w, drawable_h);
     SDL_RenderPresent(d->ren);
+    tb_native_status_show(
+        d->win,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        1,
+        tb_i18n_get("receiver.splash.connecting"),
+        tb_i18n_get("receiver.splash.waiting_first_frame")
+    );
 }
 
 void tb_disp_set_brightness(struct tb_display *d, double level) {
