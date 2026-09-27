@@ -765,12 +765,37 @@ final class TBMonitorProtocolTests: XCTestCase {
         let decoded = try XCTUnwrap(
             TBNV12Compression.decodePacket(packet.packet)
         )
+        XCTAssertEqual(
+            TBMonitorProtocol.readBE64(packet.packet, offset: 35),
+            0
+        )
         XCTAssertEqual(decoded.width, width)
         XCTAssertEqual(decoded.height, height)
         XCTAssertEqual(decoded.yStride, yStride)
         XCTAssertEqual(decoded.uvStride, uvStride)
         XCTAssertEqual(decoded.y, y)
         XCTAssertEqual(decoded.uv, uv)
+    }
+
+    func testNV12LZ4ChecksumRejectsCorruptChecksumWhenEnabled() throws {
+        let width = 256
+        let height = 256
+        let yStride = 256
+        let uvStride = 256
+        let y = Data(repeating: 0x40, count: yStride * height)
+        let uv = Data(repeating: 0x80, count: uvStride * height / 2)
+        var packet = try XCTUnwrap(TBNV12Compression.makePacket(
+            y: y,
+            uv: uv,
+            width: width,
+            height: height,
+            yStride: yStride,
+            uvStride: uvStride,
+            checksumPolicy: .fnv64
+        )).packet
+        XCTAssertNotEqual(TBMonitorProtocol.readBE64(packet, offset: 35), 0)
+        packet[42] ^= 1
+        XCTAssertNil(TBNV12Compression.decodePacket(packet))
     }
 
     func testNV12LZ4RegionPacketCopiesOnlyAlignedRegion() throws {
@@ -796,6 +821,10 @@ final class TBMonitorProtocolTests: XCTestCase {
         let decoded = try XCTUnwrap(
             TBNV12Compression.decodeRegionPacket(packet.packet)
         )
+        XCTAssertEqual(
+            TBMonitorProtocol.readBE64(packet.packet, offset: 51),
+            0
+        )
         XCTAssertEqual(decoded.x, 32)
         XCTAssertEqual(decoded.y, 16)
         XCTAssertEqual(decoded.regionWidth, 64)
@@ -808,6 +837,28 @@ final class TBMonitorProtocolTests: XCTestCase {
             expected.append(uv[(row * uvStride + 32)..<(row * uvStride + 96)])
         }
         XCTAssertEqual(decoded.raw, expected)
+    }
+
+    func testNV12LZ4RegionChecksumRejectsCorruptChecksumWhenEnabled() throws {
+        let width = 128, height = 64
+        let yStride = 128, uvStride = 128
+        let y = Data(repeating: 0x40, count: yStride * height)
+        let uv = Data(repeating: 0x80, count: uvStride * height / 2)
+        var packet = try y.withUnsafeBytes { yBytes in
+            try uv.withUnsafeBytes { uvBytes in
+                try XCTUnwrap(TBNV12Compression.makeRegionPacket(
+                    yBase: try XCTUnwrap(yBytes.baseAddress),
+                    uvBase: try XCTUnwrap(uvBytes.baseAddress),
+                    width: width, height: height,
+                    yStride: yStride, uvStride: uvStride,
+                    x: 32, y: 16, regionWidth: 64, regionHeight: 32,
+                    checksumPolicy: .fnv64
+                )).packet
+            }
+        }
+        XCTAssertNotEqual(TBMonitorProtocol.readBE64(packet, offset: 51), 0)
+        packet[58] ^= 1
+        XCTAssertNil(TBNV12Compression.decodeRegionPacket(packet))
     }
 
     func testBC7CompressionModeCapabilityResolution() {

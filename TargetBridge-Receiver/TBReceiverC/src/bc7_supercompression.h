@@ -45,5 +45,9 @@ int tb_bc7_plane_unsplit(
 uint64_t tb_bc7_supercompression_checksum(
     const uint8_t *data,
     size_t length);
+int tb_checksum64_matches_optional(
+    const uint8_t *data,
+    size_t length,
+    uint64_t expected_checksum);
 
 #endif

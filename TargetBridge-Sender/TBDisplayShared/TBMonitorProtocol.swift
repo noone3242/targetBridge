@@ -116,6 +116,9 @@ struct TBMonitorReceiverMetrics: Codable, Equatable {
     var rawUploadP50Ms: Double?
     var rawUploadP95Ms: Double?
     var rawUploadP99Ms: Double?
+    var rawChecksumP50Ms: Double?
+    var rawChecksumP95Ms: Double?
+    var rawChecksumP99Ms: Double?
 }
 
 struct TBMonitorUILanguageUpdate: Codable {

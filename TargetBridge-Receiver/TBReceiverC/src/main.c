@@ -136,6 +136,7 @@ struct app {
     uint64_t raw_region_frames;
     struct tb_metric_window raw_shadow_commit_ns;
     struct tb_metric_window raw_upload_ns;
+    struct tb_metric_window raw_checksum_ns;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      debug_enabled;
@@ -1099,10 +1100,19 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         size_t decoded=compression_decode_buffer(
             raw,raw_len,p+54,clen,NULL,COMPRESSION_LZ4);
         metric_record(&a->bc7_decompression_ns, now_ns() - decode_started);
-        if(decoded!=raw_len ||
-           tb_bc7_supercompression_checksum(raw,raw_len)!=checksum){
-            request_raw_keyframe(a, "region-checksum");
+        if(decoded!=raw_len){
+            request_raw_keyframe(a, "region-decode");
             return;
+        }
+        if(checksum!=0){
+            const uint64_t checksum_started = now_ns();
+            const int checksum_matches =
+                tb_checksum64_matches_optional(raw,raw_len,checksum);
+            metric_record(&a->raw_checksum_ns, now_ns() - checksum_started);
+            if(!checksum_matches){
+                request_raw_keyframe(a, "region-checksum");
+                return;
+            }
         }
         uint8_t *uv=raw+ylen;
         const uint64_t present_started = now_ns();
@@ -1188,10 +1198,19 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             raw, raw_len, p + 38, compressed_len, NULL, COMPRESSION_LZ4
         );
         metric_record(&a->bc7_decompression_ns, now_ns() - decode_started);
-        if (decoded != raw_len ||
-            tb_bc7_supercompression_checksum(raw, raw_len) != checksum) {
-            request_raw_keyframe(a, "full-checksum");
+        if (decoded != raw_len) {
+            request_raw_keyframe(a, "full-decode");
             return;
+        }
+        if (checksum != 0) {
+            const uint64_t checksum_started = now_ns();
+            const int checksum_matches =
+                tb_checksum64_matches_optional(raw, raw_len, checksum);
+            metric_record(&a->raw_checksum_ns, now_ns() - checksum_started);
+            if (!checksum_matches) {
+                request_raw_keyframe(a, "full-checksum");
+                return;
+            }
         }
         const uint64_t upload_started = now_ns();
         if (tb_disp_render_nv12(
@@ -2551,6 +2570,8 @@ static void send_receiver_metrics(
         metric_summary(&a->raw_shadow_commit_ns);
     const struct tb_metric_summary raw_upload =
         metric_summary(&a->raw_upload_ns);
+    const struct tb_metric_summary raw_checksum =
+        metric_summary(&a->raw_checksum_ns);
     char json[2560];
     int json_len = snprintf(
         json,
@@ -2574,7 +2595,8 @@ static void send_receiver_metrics(
         "\"rawRegionFrames\":%llu,\"rawShadowCommitP50Ms\":%.3f,"
         "\"rawShadowCommitP95Ms\":%.3f,\"rawShadowCommitP99Ms\":%.3f,"
         "\"rawUploadP50Ms\":%.3f,\"rawUploadP95Ms\":%.3f,"
-        "\"rawUploadP99Ms\":%.3f}",
+        "\"rawUploadP99Ms\":%.3f,\"rawChecksumP50Ms\":%.3f,"
+        "\"rawChecksumP95Ms\":%.3f,\"rawChecksumP99Ms\":%.3f}",
         fps,
         present_fps,
         gbps,
@@ -2620,7 +2642,10 @@ static void send_receiver_metrics(
         ns_to_ms(raw_shadow.p99),
         ns_to_ms(raw_upload.p50),
         ns_to_ms(raw_upload.p95),
-        ns_to_ms(raw_upload.p99)
+        ns_to_ms(raw_upload.p99),
+        ns_to_ms(raw_checksum.p50),
+        ns_to_ms(raw_checksum.p95),
+        ns_to_ms(raw_checksum.p99)
     );
     if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
 
@@ -2958,6 +2983,7 @@ int main(int argc, char **argv) {
                 memset(&a.bc7_inverse_transform_ns, 0, sizeof(a.bc7_inverse_transform_ns));
                 memset(&a.raw_shadow_commit_ns, 0, sizeof(a.raw_shadow_commit_ns));
                 memset(&a.raw_upload_ns, 0, sizeof(a.raw_upload_ns));
+                memset(&a.raw_checksum_ns, 0, sizeof(a.raw_checksum_ns));
                 snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();

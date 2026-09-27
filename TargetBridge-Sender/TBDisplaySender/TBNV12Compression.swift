@@ -1,6 +1,11 @@
 import Compression
 import Foundation
 
+enum TBNV12ChecksumPolicy {
+    case disabled
+    case fnv64
+}
+
 enum TBNV12Compression {
     struct PacketResult {
         let packet: Data
@@ -38,7 +43,8 @@ enum TBNV12Compression {
         width: Int,
         height: Int,
         yStride: Int,
-        uvStride: Int
+        uvStride: Int,
+        checksumPolicy: TBNV12ChecksumPolicy = .disabled
     ) -> PacketResult? {
         guard width > 0, height > 0, width % 2 == 0, height % 2 == 0,
               y.count == yStride * height,
@@ -66,7 +72,7 @@ enum TBNV12Compression {
         guard size > 0 else { return nil }
         compressed.count = size
         let checksumStarted = DispatchTime.now().uptimeNanoseconds
-        let checksumValue = checksum(raw)
+        let checksumValue = checksumPolicy == .fnv64 ? checksum(raw) : 0
         let checksumFinished = DispatchTime.now().uptimeNanoseconds
         let packetStarted = checksumFinished
         var payload = Data(capacity: 38 + size)
@@ -99,7 +105,8 @@ enum TBNV12Compression {
     static func makeRegionPacket(
         yBase: UnsafeRawPointer, uvBase: UnsafeRawPointer,
         width: Int, height: Int, yStride: Int, uvStride: Int,
-        x: Int, y: Int, regionWidth: Int, regionHeight: Int
+        x: Int, y: Int, regionWidth: Int, regionHeight: Int,
+        checksumPolicy: TBNV12ChecksumPolicy = .disabled
     ) -> PacketResult? {
         guard x >= 0, y >= 0, regionWidth > 0, regionHeight > 0,
               x % 2 == 0, y % 2 == 0, regionWidth % 2 == 0,
@@ -139,7 +146,7 @@ enum TBNV12Compression {
         guard size > 0 else { return nil }
         compressed.count = size
         let checksumStarted = DispatchTime.now().uptimeNanoseconds
-        let checksumValue = checksum(raw)
+        let checksumValue = checksumPolicy == .fnv64 ? checksum(raw) : 0
         let checksumFinished = DispatchTime.now().uptimeNanoseconds
         let packetStarted = checksumFinished
         var payload = Data(capacity: 54 + size)
@@ -191,7 +198,10 @@ enum TBNV12Compression {
                 )
             }
         }
-        guard decoded == rawLength, checksum(raw) == checksumValue else { return nil }
+        guard decoded == rawLength,
+              checksumValue == 0 || checksum(raw) == checksumValue else {
+            return nil
+        }
         return DecodedRegion(
             raw: raw, width: values[0], height: values[1],
             yStride: values[2], uvStride: values[3],
@@ -234,7 +244,8 @@ enum TBNV12Compression {
                 )
             }
         }
-        guard decoded == rawLength, checksum(raw) == expectedChecksum else {
+        guard decoded == rawLength,
+              expectedChecksum == 0 || checksum(raw) == expectedChecksum else {
             return nil
         }
         return Decoded(

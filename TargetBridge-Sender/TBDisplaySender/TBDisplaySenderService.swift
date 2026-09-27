@@ -1769,6 +1769,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let displayID: CGDirectDisplayID
     private let usesRawNV12: Bool
     private let usesRawNV12LZ4: Bool
+    private let rawNV12ChecksumPolicy: TBNV12ChecksumPolicy
     private let usesBC7Mode6: Bool
     private let usesBC7TileDelta: Bool
     private let bc7CompressionMode: TBBC7CompressionMode
@@ -1869,6 +1870,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
         self.usesRawNV12LZ4 = usesRawNV12LZ4
+        self.rawNV12ChecksumPolicy =
+            ProcessInfo.processInfo.environment["TB_NV12_CHECKSUM"] == "1"
+                ? .fnv64
+                : .disabled
         self.usesBC7Mode6 = usesBC7Mode6
         self.usesBC7TileDelta = usesBC7TileDelta
         self.bc7CompressionMode = bc7CompressionMode
@@ -2448,7 +2453,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 yBase: yBase, uvBase: uvBase,
                 width: width, height: height,
                 yStride: yStride, uvStride: uvStride,
-                x: x, y: y, regionWidth: maxX - x, regionHeight: maxY - y
+                x: x, y: y, regionWidth: maxX - x, regionHeight: maxY - y,
+                checksumPolicy: rawNV12ChecksumPolicy
             ) {
                 packet = result.packet
                 let dirtyPixels = rects.reduce(0) {
@@ -2483,7 +2489,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let uv = Data(bytes: uvBase, count: uvSize)
             if let result = TBNV12Compression.makePacket(
                 y: y, uv: uv, width: width, height: height,
-                yStride: yStride, uvStride: uvStride
+                yStride: yStride, uvStride: uvStride,
+                checksumPolicy: rawNV12ChecksumPolicy
             ) {
                 packet = result.packet
                 recordNV12Packet(
@@ -5650,6 +5657,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                         "rawRegionFrames": receiver.rawRegionFrames ?? 0,
                         "rawShadowCommitP95Ms":
                             receiver.rawShadowCommitP95Ms ?? 0,
+                        "rawChecksumP95Ms":
+                            receiver.rawChecksumP95Ms ?? 0,
                         "rawUploadPresentP95Ms":
                             receiver.rawUploadP95Ms ?? 0,
                         "invalid": receiver.bc7Invalid,

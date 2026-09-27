@@ -77,6 +77,14 @@ uint64_t tb_bc7_supercompression_checksum(
     return hash;
 }
 
+int tb_checksum64_matches_optional(
+    const uint8_t *data,
+    size_t length,
+    uint64_t expected_checksum) {
+    return expected_checksum == 0 ||
+        tb_bc7_supercompression_checksum(data, length) == expected_checksum;
+}
+
 struct tb_bc7_compressed_wrapper {
     const uint8_t *metadata;
     const uint8_t *compressed;

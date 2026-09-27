@@ -386,6 +386,21 @@ static void test_bc7_delta_validation(void) {
         frame.runs[index].data_length = 1;
     }
 
+    const uint8_t checksum_fixture[] = {0x10, 0x20, 0x30, 0x40};
+    const uint64_t fixture_checksum = tb_bc7_supercompression_checksum(
+        checksum_fixture, sizeof(checksum_fixture)
+    );
+    CHECK(tb_checksum64_matches_optional(
+              checksum_fixture, sizeof(checksum_fixture), 0),
+          "zero optional checksum skips validation");
+    CHECK(tb_checksum64_matches_optional(
+              checksum_fixture, sizeof(checksum_fixture), fixture_checksum),
+          "matching optional checksum accepted");
+    CHECK(!tb_checksum64_matches_optional(
+              checksum_fixture, sizeof(checksum_fixture),
+              fixture_checksum ^ UINT64_C(1)),
+          "mismatching optional checksum rejected");
+
     {
         const size_t blocks_len = 64u * 1024u;
         uint8_t *blocks = malloc(blocks_len);
