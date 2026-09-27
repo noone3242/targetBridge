@@ -12,6 +12,7 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
     let supportsRawNV12: Bool
     let supportsBC7Mode6: Bool
     let supportsBC7TileDelta: Bool
+    let supportsBC7LZFSE: Bool
     let hostName: String?
 
     var id: String { "\(serviceName)|\(preferredIP)" }
@@ -28,6 +29,7 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
         supportsRawNV12: Bool = false,
         supportsBC7Mode6: Bool = false,
         supportsBC7TileDelta: Bool = false,
+        supportsBC7LZFSE: Bool = false,
         hostName: String?
     ) {
         self.serviceName = serviceName
@@ -41,6 +43,7 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
         self.supportsRawNV12 = supportsRawNV12
         self.supportsBC7Mode6 = supportsBC7Mode6
         self.supportsBC7TileDelta = supportsBC7TileDelta
+        self.supportsBC7LZFSE = supportsBC7LZFSE
         self.hostName = hostName
     }
 
@@ -151,6 +154,7 @@ final class TBReceiverDiscovery: NSObject, ObservableObject {
         let supportsRawNV12 = stringValue("supportsRawNV12") == "1"
         let supportsBC7Mode6 = stringValue("supportsBC7Mode6") == "1"
         let supportsBC7TileDelta = stringValue("supportsBC7TileDelta") == "1"
+        let supportsBC7LZFSE = stringValue("supportsBC7LZFSE") == "1"
 
         let panelSummary: String
         if !panelWidth.isEmpty, !panelHeight.isEmpty, !panelName.isEmpty {
@@ -175,6 +179,7 @@ final class TBReceiverDiscovery: NSObject, ObservableObject {
             supportsRawNV12: supportsRawNV12,
             supportsBC7Mode6: supportsBC7Mode6,
             supportsBC7TileDelta: supportsBC7TileDelta,
+            supportsBC7LZFSE: supportsBC7LZFSE,
             hostName: service.hostName
         )
 

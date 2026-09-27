@@ -9,8 +9,10 @@
 #include "../src/proto.h"
 #include "../src/bc7_frame.h"
 #include "../src/bc7_delta.h"
+#include "../src/bc7_supercompression.h"
 #include "../src/bc7_cursor.h"
 
+#include <compression.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -382,6 +384,311 @@ static void test_bc7_delta_validation(void) {
     frame.run_count = 9;
     for (uint16_t index = 1; index < frame.run_count; index++) {
         frame.runs[index].data_length = 1;
+    }
+
+    {
+        const size_t blocks_len = 64u * 1024u;
+        uint8_t *blocks = malloc(blocks_len);
+        uint8_t *planes = malloc(blocks_len);
+        uint8_t *compressed = malloc(blocks_len + 65536u);
+        CHECK(blocks && planes && compressed, "supercompression buffers allocated");
+        if (!blocks || !planes || !compressed) {
+            free(blocks);
+            free(planes);
+            free(compressed);
+            return;
+        }
+        memset(blocks, 0x5a, blocks_len);
+        CHECK(tb_bc7_plane_split(blocks, blocks_len, planes) == 0,
+              "BC7 byte planes split");
+        uint8_t *roundtrip = malloc(blocks_len);
+        CHECK(roundtrip != NULL, "plane roundtrip allocated");
+        if (roundtrip) {
+            CHECK(tb_bc7_plane_unsplit(planes, blocks_len, roundtrip) == 0,
+                  "BC7 byte planes unsplit");
+            CHECK(memcmp(roundtrip, blocks, blocks_len) == 0,
+                  "BC7 byte planes round trip exactly");
+        }
+        free(roundtrip);
+
+        size_t compressed_len = compression_encode_buffer(
+            compressed,
+            blocks_len + 65536u,
+            planes,
+            blocks_len,
+            NULL,
+            COMPRESSION_LZFSE
+        );
+        CHECK(compressed_len > 0 && compressed_len < blocks_len,
+              "LZFSE compresses repetitive BC7 planes");
+        if (compressed_len == 0) {
+            free(blocks);
+            free(planes);
+            free(compressed);
+            return;
+        }
+
+        uint8_t metadata[13] = {0};
+        metadata[0] = 1;
+        put_be32(metadata + 1, 256);
+        put_be32(metadata + 5, 256);
+        put_be32(metadata + 9, 1024);
+        const size_t wrapper_len = 24u + sizeof(metadata) + compressed_len;
+        uint8_t *wrapper = calloc(1, wrapper_len);
+        CHECK(wrapper != NULL, "compressed frame wrapper allocated");
+        if (!wrapper) {
+            free(blocks);
+            free(planes);
+            free(compressed);
+            return;
+        }
+        wrapper[0] = 1;
+        wrapper[1] = 1;
+        wrapper[2] = 1;
+        put_be32(wrapper + 4, (uint32_t)sizeof(metadata));
+        put_be32(wrapper + 8, (uint32_t)blocks_len);
+        put_be32(wrapper + 12, (uint32_t)compressed_len);
+        put_be64(
+            wrapper + 16,
+            tb_bc7_supercompression_checksum(compressed, compressed_len)
+        );
+        memcpy(wrapper + 24, metadata, sizeof(metadata));
+        memcpy(wrapper + 24 + sizeof(metadata), compressed, compressed_len);
+
+        struct tb_bc7_supercompression_result result;
+        CHECK(tb_bc7_supercompression_decode_frame(
+                  wrapper, wrapper_len, &result) == 0,
+              "compressed BC7 frame decodes");
+        CHECK(result.payload_len == sizeof(metadata) + blocks_len,
+              "decoded frame has legacy payload length");
+        CHECK(memcmp(result.payload, metadata, sizeof(metadata)) == 0,
+              "decoded frame metadata preserved");
+        CHECK(memcmp(result.payload + sizeof(metadata), blocks, blocks_len) == 0,
+              "decoded frame BC7 blocks preserved");
+        CHECK(result.compressed_block_bytes == compressed_len,
+              "compressed byte count reported");
+        tb_bc7_supercompression_result_free(&result);
+
+        uint8_t *trailing = malloc(wrapper_len + 1u);
+        CHECK(trailing != NULL, "trailing-data fixture allocated");
+        if (trailing) {
+            memcpy(trailing, wrapper, wrapper_len);
+            trailing[wrapper_len] = 0xa5;
+            put_be32(trailing + 12, (uint32_t)compressed_len + 1u);
+            CHECK(tb_bc7_supercompression_decode_frame(
+                      trailing, wrapper_len + 1u, &result) == -1,
+                  "trailing compressed bytes rejected by checksum");
+            put_be64(
+                trailing + 16,
+                tb_bc7_supercompression_checksum(
+                    trailing + 24 + sizeof(metadata),
+                    compressed_len + 1u
+                )
+            );
+            CHECK(tb_bc7_supercompression_decode_frame(
+                      trailing, wrapper_len + 1u, &result) == -1,
+                  "trailing compressed bytes rejected after checksum recompute");
+            free(trailing);
+        }
+        uint8_t *bad_checksum = malloc(wrapper_len);
+        CHECK(bad_checksum != NULL, "bad-checksum fixture allocated");
+        if (bad_checksum) {
+            memcpy(bad_checksum, wrapper, wrapper_len);
+            bad_checksum[16] ^= 1u;
+            CHECK(tb_bc7_supercompression_decode_frame(
+                      bad_checksum, wrapper_len, &result) == -1,
+                  "compressed checksum mismatch rejected");
+            free(bad_checksum);
+        }
+
+        const size_t extra_planes_len = blocks_len + 16u;
+        uint8_t *extra_planes = malloc(extra_planes_len);
+        uint8_t *extra_compressed = malloc(extra_planes_len + 65536u);
+        CHECK(extra_planes && extra_compressed, "overlong-output fixture allocated");
+        if (extra_planes && extra_compressed) {
+            memcpy(extra_planes, planes, blocks_len);
+            memset(extra_planes + blocks_len, 0x7c, 16u);
+            const size_t extra_compressed_len = compression_encode_buffer(
+                extra_compressed,
+                extra_planes_len + 65536u,
+                extra_planes,
+                extra_planes_len,
+                NULL,
+                COMPRESSION_LZFSE
+            );
+            CHECK(extra_compressed_len > 0, "overlong planes compressed");
+            if (extra_compressed_len > 0) {
+                const size_t extra_wrapper_len =
+                    24u + sizeof(metadata) + extra_compressed_len;
+                uint8_t *extra_wrapper = calloc(1, extra_wrapper_len);
+                CHECK(extra_wrapper != NULL, "overlong-output wrapper allocated");
+                if (extra_wrapper) {
+                    extra_wrapper[0] = 1;
+                    extra_wrapper[1] = 1;
+                    extra_wrapper[2] = 1;
+                    put_be32(extra_wrapper + 4, (uint32_t)sizeof(metadata));
+                    put_be32(extra_wrapper + 8, (uint32_t)blocks_len);
+                    put_be32(
+                        extra_wrapper + 12,
+                        (uint32_t)extra_compressed_len
+                    );
+                    put_be64(
+                        extra_wrapper + 16,
+                        tb_bc7_supercompression_checksum(
+                            extra_compressed,
+                            extra_compressed_len
+                        )
+                    );
+                    memcpy(extra_wrapper + 24, metadata, sizeof(metadata));
+                    memcpy(
+                        extra_wrapper + 24 + sizeof(metadata),
+                        extra_compressed,
+                        extra_compressed_len
+                    );
+                    CHECK(tb_bc7_supercompression_decode_frame(
+                              extra_wrapper, extra_wrapper_len, &result) == -1,
+                          "decompressed output beyond declared length rejected");
+                    free(extra_wrapper);
+                }
+            }
+        }
+        free(extra_planes);
+        free(extra_compressed);
+        uint8_t *invalid_metadata = calloc(1, wrapper_len + 1u);
+        CHECK(invalid_metadata != NULL, "invalid-metadata fixture allocated");
+        if (invalid_metadata) {
+            invalid_metadata[0] = 1;
+            invalid_metadata[1] = 1;
+            invalid_metadata[2] = 1;
+            put_be32(invalid_metadata + 4, (uint32_t)sizeof(metadata) + 1u);
+            put_be32(invalid_metadata + 8, (uint32_t)blocks_len);
+            put_be32(invalid_metadata + 12, (uint32_t)compressed_len);
+            put_be64(
+                invalid_metadata + 16,
+                tb_bc7_supercompression_checksum(compressed, compressed_len)
+            );
+            memcpy(invalid_metadata + 24, metadata, sizeof(metadata));
+            memcpy(
+                invalid_metadata + 24 + sizeof(metadata) + 1u,
+                compressed,
+                compressed_len
+            );
+            CHECK(tb_bc7_supercompression_decode_frame(
+                      invalid_metadata, wrapper_len + 1u, &result) == -1,
+                  "invalid frame metadata rejected before decode");
+            free(invalid_metadata);
+        }
+
+        wrapper[2] = 2;
+        CHECK(tb_bc7_supercompression_decode_frame(
+                  wrapper, wrapper_len, &result) == -1,
+              "unknown plane transform rejected");
+        wrapper[2] = 1;
+        put_be32(wrapper + 8, (uint32_t)blocks_len - 1u);
+        CHECK(tb_bc7_supercompression_decode_frame(
+                  wrapper, wrapper_len, &result) == -1,
+              "non-block-aligned decoded length rejected");
+    put_be32(wrapper + 8, (uint32_t)blocks_len);
+
+        uint8_t delta_metadata[49] = {0};
+        delta_metadata[0] = 1;
+        put_be64(delta_metadata + 1, 2);
+        put_be64(delta_metadata + 9, 1);
+        uint64_t delta_checksum = 0;
+        for (uint32_t tile_index = 0; tile_index < 16u; tile_index++) {
+            delta_checksum ^= tb_bc7_tile_checksum(
+                blocks + (size_t)tile_index * 256u,
+                4096,
+                16,
+                tile_index
+            );
+        }
+        put_be64(delta_metadata + 17, delta_checksum);
+        put_be32(delta_metadata + 25, 1024);
+        put_be32(delta_metadata + 29, 64);
+        put_be16(delta_metadata + 33, 64);
+        put_be16(delta_metadata + 35, 1);
+        put_be16(delta_metadata + 37, 0);
+        put_be16(delta_metadata + 39, 0);
+        put_be16(delta_metadata + 41, 16);
+        put_be16(delta_metadata + 43, 64);
+        put_be32(delta_metadata + 45, (uint32_t)blocks_len);
+        const size_t delta_wrapper_len =
+            24u + sizeof(delta_metadata) + compressed_len;
+        uint8_t *delta_wrapper = calloc(1, delta_wrapper_len);
+        CHECK(delta_wrapper != NULL, "compressed delta wrapper allocated");
+        if (delta_wrapper) {
+            delta_wrapper[0] = 1;
+            delta_wrapper[1] = 1;
+            delta_wrapper[2] = 1;
+            put_be32(delta_wrapper + 4, (uint32_t)sizeof(delta_metadata));
+            put_be32(delta_wrapper + 8, (uint32_t)blocks_len);
+            put_be32(delta_wrapper + 12, (uint32_t)compressed_len);
+            put_be64(
+                delta_wrapper + 16,
+                tb_bc7_supercompression_checksum(compressed, compressed_len)
+            );
+            memcpy(delta_wrapper + 24, delta_metadata, sizeof(delta_metadata));
+            memcpy(
+                delta_wrapper + 24 + sizeof(delta_metadata),
+                compressed,
+                compressed_len
+            );
+            CHECK(tb_bc7_supercompression_decode_delta(
+                      delta_wrapper, delta_wrapper_len, &result) == 0,
+                  "compressed BC7 delta decodes");
+            struct tb_bc7_delta_frame delta_frame;
+            CHECK(tb_bc7_delta_parse(
+                      result.payload, result.payload_len, &delta_frame) == 0,
+                  "decoded compressed delta reconstructs legacy payload");
+            CHECK(delta_frame.run_count == 1 &&
+                  delta_frame.runs[0].data_length == blocks_len,
+                  "decoded compressed delta run preserved");
+            CHECK(memcmp(delta_frame.runs[0].data, blocks, blocks_len) == 0,
+                  "decoded compressed delta blocks preserved");
+            uint8_t shadow[64u * 1024u] = {0};
+            uint64_t tile_checksums[16] = {0};
+            uint64_t applied_checksum = 0;
+            CHECK(tb_bc7_delta_apply_to_shadow(
+                      &delta_frame,
+                      shadow,
+                      sizeof(shadow),
+                      4096,
+                      tile_checksums,
+                      16,
+                      &applied_checksum) == 0,
+                  "reconstructed compressed delta passes legacy checksum guard");
+            CHECK(applied_checksum == delta_checksum,
+                  "reconstructed compressed delta checksum preserved");
+            result.payload[17] ^= 1u;
+            CHECK(tb_bc7_delta_parse(
+                      result.payload, result.payload_len, &delta_frame) == 0,
+                  "checksum-mutated reconstructed delta still parses");
+            memset(shadow, 0, sizeof(shadow));
+            memset(tile_checksums, 0, sizeof(tile_checksums));
+            CHECK(tb_bc7_delta_apply_to_shadow(
+                      &delta_frame,
+                      shadow,
+                      sizeof(shadow),
+                      4096,
+                      tile_checksums,
+                      16,
+                      &applied_checksum) == -1,
+                  "legacy checksum guard rejects corrupted reconstructed delta");
+            CHECK(shadow[0] == 0,
+                  "rejected reconstructed delta does not mutate live shadow");
+            tb_bc7_supercompression_result_free(&result);
+            put_be16(delta_wrapper + 24 + 35, 257);
+            CHECK(tb_bc7_supercompression_decode_delta(
+                      delta_wrapper, delta_wrapper_len, &result) == -1,
+                  "compressed delta run count above protocol limit rejected");
+            free(delta_wrapper);
+        }
+
+        free(wrapper);
+        free(blocks);
+        free(planes);
+        free(compressed);
     }
     CHECK(!tb_bc7_delta_prefers_full_upload(&frame, 1u << 20),
           "many tiny runs stay as regional uploads");

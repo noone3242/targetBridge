@@ -119,6 +119,8 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(TBMonitorPacketType.bc7RenderAckRequest.rawValue, 0x26)
         XCTAssertEqual(TBMonitorPacketType.bc7TileDelta.rawValue, 0x27)
         XCTAssertEqual(TBMonitorPacketType.bc7KeyframeRequest.rawValue, 0x28)
+        XCTAssertEqual(TBMonitorPacketType.bc7CompressedFrame.rawValue, 0x29)
+        XCTAssertEqual(TBMonitorPacketType.bc7CompressedDelta.rawValue, 0x2A)
         XCTAssertEqual(TBMonitorPacketType.receiverMetrics.rawValue, 0x14)
 
         let olderProfile = Data("""
@@ -138,6 +140,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertNil(profile.supportsRawNV12)
         XCTAssertNil(profile.supportsBC7Mode6)
         XCTAssertNil(profile.supportsBC7TileDelta)
+        XCTAssertNil(profile.supportsBC7LZFSE)
         XCTAssertNil(profile.receiverVersion)
         XCTAssertNil(profile.receiverBuild)
         XCTAssertNil(profile.receiverCommit)
@@ -153,6 +156,7 @@ final class TBMonitorProtocolTests: XCTestCase {
           "hiDPI": true,
           "captureWidth": 5120,
           "captureHeight": 2880,
+          "supportsBC7LZFSE": true,
           "receiverVersion": "3.3.0",
           "receiverBuild": "dev-20260926163000",
           "receiverCommit": "9b6b092abcde"
@@ -160,6 +164,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         """.utf8)
         let current = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: currentProfile)
         XCTAssertEqual(current.receiverVersion, "3.3.0")
+        XCTAssertEqual(current.supportsBC7LZFSE, true)
         XCTAssertEqual(current.receiverBuild, "dev-20260926163000")
         XCTAssertEqual(current.receiverCommit, "9b6b092abcde")
 
@@ -594,6 +599,200 @@ final class TBMonitorProtocolTests: XCTestCase {
             expected.append(current[start..<(start + 512)])
         }
         XCTAssertEqual(packet.subdata(in: 54..<packet.count), expected)
+    }
+
+    func testBC7BytePlaneTransformRoundTripsExactly() throws {
+        let blocks = Data((0..<(16 * 257)).map {
+            UInt8(truncatingIfNeeded: $0 &* 37 &+ $0 / 16)
+        })
+        let planes = try XCTUnwrap(TBBC7Supercompression.planeSplit(blocks))
+        XCTAssertNotEqual(planes, blocks)
+        XCTAssertEqual(
+            try XCTUnwrap(TBBC7Supercompression.inversePlaneSplit(planes)),
+            blocks
+        )
+        XCTAssertNil(TBBC7Supercompression.planeSplit(Data(repeating: 0, count: 17)))
+    }
+
+    func testBC7LZFSEFramePacketReconstructsLegacyPayload() throws {
+        let width = 256
+        let height = 256
+        let bytesPerRow = 1024
+        let blocks = Data(repeating: 0x6D, count: bytesPerRow * height / 4)
+        var payload = Data(capacity: 29 + blocks.count)
+        payload.append(2)
+        TBMonitorProtocol.appendBE64(&payload, 7)
+        TBMonitorProtocol.appendBE64(&payload, 0x1122_3344_5566_7788)
+        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(bytesPerRow))
+        payload.append(blocks)
+        let raw = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+
+        let unsupported = tbSelectBC7WirePacket(
+            rawPacket: raw,
+            supportsLZFSE: false
+        )
+        XCTAssertEqual(unsupported.packet, raw)
+        XCTAssertFalse(unsupported.compressionAttempted)
+        XCTAssertNil(unsupported.compressedResult)
+
+        let selection = tbSelectBC7WirePacket(
+            rawPacket: raw,
+            supportsLZFSE: true
+        )
+        XCTAssertTrue(selection.compressionAttempted)
+        let result = try XCTUnwrap(selection.compressedResult)
+        XCTAssertEqual(selection.packet, result.packet)
+        XCTAssertEqual(result.packet[4], TBMonitorPacketType.bc7CompressedFrame.rawValue)
+        XCTAssertLessThan(result.packet.count, raw.count)
+        XCTAssertEqual(result.rawBlockBytes, blocks.count)
+        XCTAssertEqual(
+            try XCTUnwrap(TBBC7Supercompression.decodeCompressedPacket(result.packet)),
+            raw
+        )
+
+        func writeBE32(_ value: UInt32, into data: inout Data, at offset: Int) {
+            data[offset] = UInt8((value >> 24) & 0xff)
+            data[offset + 1] = UInt8((value >> 16) & 0xff)
+            data[offset + 2] = UInt8((value >> 8) & 0xff)
+            data[offset + 3] = UInt8(value & 0xff)
+        }
+        func writeBE64(_ value: UInt64, into data: inout Data, at offset: Int) {
+            for index in 0..<8 {
+                data[offset + index] = UInt8(
+                    (value >> UInt64((7 - index) * 8)) & 0xff
+                )
+            }
+        }
+        func checksum(_ data: Data) -> UInt64 {
+            var hash = UInt64(14_695_981_039_346_656_037)
+            for byte in data {
+                hash ^= UInt64(byte)
+                hash &*= 1_099_511_628_211
+            }
+            return hash
+        }
+        var trailing = result.packet
+        let compressedLength = TBMonitorProtocol.readBE32(trailing, offset: 17)
+        let metadataLength = Int(
+            TBMonitorProtocol.readBE32(trailing, offset: 9)
+        )
+        trailing.append(0xA5)
+        writeBE32(UInt32(trailing.count - 4), into: &trailing, at: 0)
+        writeBE32(compressedLength + 1, into: &trailing, at: 17)
+        XCTAssertNil(TBBC7Supercompression.decodeCompressedPacket(trailing))
+        let compressedStart = 5 + 24 + metadataLength
+        writeBE64(
+            checksum(trailing.subdata(in: compressedStart..<trailing.count)),
+            into: &trailing,
+            at: 21
+        )
+        XCTAssertNil(TBBC7Supercompression.decodeCompressedPacket(trailing))
+
+        var invalidChecksum = result.packet
+        invalidChecksum[21] ^= 1
+        XCTAssertNil(
+            TBBC7Supercompression.decodeCompressedPacket(invalidChecksum)
+        )
+
+        var invalidBlockLength = result.packet
+        writeBE32(
+            UInt32(blocks.count - 16),
+            into: &invalidBlockLength,
+            at: 13
+        )
+        XCTAssertNil(
+            TBBC7Supercompression.decodeCompressedPacket(invalidBlockLength)
+        )
+    }
+
+    func testBC7LZFSEDeltaPacketReconstructsLegacyPayload() throws {
+        let width = 1024
+        let height = 256
+        let bytesPerRow = 4096
+        let current = Data(repeating: 0x22, count: bytesPerRow * height / 4)
+        let raw = try XCTUnwrap(tbMakeBC7DeltaPacket(
+            current: current,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            sequence: 2,
+            baseSequence: 1,
+            checksum: 0xAABB_CCDD_EEFF_0011,
+            runs: [
+                TBBC7DeltaRun(
+                    tileX: 0,
+                    tileY: 0,
+                    tileCountX: 16,
+                    pixelHeight: 64
+                )
+            ]
+        ))
+
+        let result = try XCTUnwrap(
+            TBBC7Supercompression.makeCompressedPacket(from: raw)
+        )
+        XCTAssertEqual(result.packet[4], TBMonitorPacketType.bc7CompressedDelta.rawValue)
+        XCTAssertEqual(
+            try XCTUnwrap(TBBC7Supercompression.decodeCompressedPacket(result.packet)),
+            raw
+        )
+    }
+
+    func testBC7LZFSEFallsBackWhenPacketHasNoNetSavings() {
+        var state = UInt64(0x0123_4567_89AB_CDEF)
+        let bytes = (0..<(64 * 1024)).map { _ -> UInt8 in
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            return UInt8(truncatingIfNeeded: state)
+        }
+        var payload = Data()
+        payload.append(1)
+        TBMonitorProtocol.appendBE32(&payload, 256)
+        TBMonitorProtocol.appendBE32(&payload, 256)
+        TBMonitorProtocol.appendBE32(&payload, 1024)
+        payload.append(contentsOf: bytes)
+        let raw = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+        XCTAssertNil(TBBC7Supercompression.makeCompressedPacket(from: raw))
+    }
+
+    func testBC7LZFSECompressesRealMode6OutputLosslessly() throws {
+        let width = 512
+        let height = 512
+        let pixelBuffer = try makeBGRAPixelBuffer(
+            width: width,
+            height: height
+        ) { x, y in
+            let stripe = UInt8((x / 32 + y / 32) % 4)
+            let base = UInt8(truncatingIfNeeded: x / 2 + y / 3)
+            return (
+                base,
+                UInt8(truncatingIfNeeded: Int(base) + Int(stripe) * 24),
+                UInt8(truncatingIfNeeded: 220 - Int(base) / 2),
+                255
+            )
+        }
+        let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+        let encoded = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+        var payload = Data()
+        payload.append(1)
+        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(encoded.bytesPerRow))
+        payload.append(encoded.data)
+        let raw = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+        let compressed = try XCTUnwrap(
+            TBBC7Supercompression.makeCompressedPacket(from: raw)
+        )
+        XCTAssertLessThan(compressed.packet.count, raw.count)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                TBBC7Supercompression.decodeCompressedPacket(compressed.packet)
+            ),
+            raw
+        )
     }
 
     func testNative5KRequiresNativeSourceFramebuffer() {

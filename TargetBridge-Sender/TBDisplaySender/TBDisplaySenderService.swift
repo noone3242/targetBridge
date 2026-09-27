@@ -1670,6 +1670,10 @@ struct TBPipelineDiagnosticsSnapshot {
     let bc7SendCompletedFrames: Int
     let bc7SendNanoseconds: UInt64
     let bc7SendErrors: Int
+    let bc7CompressedPackets: Int
+    let bc7CompressionFallbacks: Int
+    let bc7RawPacketBytes: UInt64
+    let bc7WirePacketBytes: UInt64
     let captureComplete: Int
     let captureStarted: Int
     let captureIdle: Int
@@ -1688,6 +1692,8 @@ struct TBPipelineDiagnosticsSnapshot {
     let sendTime: TBMetricSummary
     let packetBytes: TBMetricSummary
     let dirtyTiles: TBMetricSummary
+    let planeSplitTime: TBMetricSummary
+    let compressionTime: TBMetricSummary
 
     static let empty = TBPipelineDiagnosticsSnapshot(
         pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
@@ -1696,13 +1702,16 @@ struct TBPipelineDiagnosticsSnapshot {
         bc7EncodeNanoseconds: 0, bc7PlanNanoseconds: 0,
         bc7PacketNanoseconds: 0, bc7GPUAnalyzedFrames: 0,
         bc7SendCompletedFrames: 0, bc7SendNanoseconds: 0,
-        bc7SendErrors: 0, captureComplete: 0, captureStarted: 0,
+        bc7SendErrors: 0, bc7CompressedPackets: 0,
+        bc7CompressionFallbacks: 0, bc7RawPacketBytes: 0,
+        bc7WirePacketBytes: 0, captureComplete: 0, captureStarted: 0,
         captureIdle: 0, captureBlank: 0, captureSuspended: 0,
         captureStopped: 0, captureUnknown: 0, tileBudget: 0,
         deferredTiles: 0, worstDeferredAge: 0,
         captureInterval: .empty, queueAge: .empty, encodeTime: .empty,
         planTime: .empty, packetTime: .empty, sendTime: .empty,
-        packetBytes: .empty, dirtyTiles: .empty
+        packetBytes: .empty, dirtyTiles: .empty,
+        planeSplitTime: .empty, compressionTime: .empty
     )
 }
 
@@ -1717,6 +1726,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let usesRawNV12: Bool
     private let usesBC7Mode6: Bool
     private let usesBC7TileDelta: Bool
+    private let usesBC7LZFSE: Bool
     private let onFirstFrame: @Sendable (Int, Int) -> Void
 
     // Confined to `queue`.
@@ -1755,6 +1765,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _bc7SendCompletedFrames = 0
     private var _bc7SendNanoseconds: UInt64 = 0
     private var _bc7SendErrors = 0
+    private var _bc7CompressedPackets = 0
+    private var _bc7CompressionFallbacks = 0
+    private var _bc7RawPacketBytes: UInt64 = 0
+    private var _bc7WirePacketBytes: UInt64 = 0
     private var _captureComplete = 0
     private var _captureStarted = 0
     private var _captureIdle = 0
@@ -1771,6 +1785,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _sendTimeWindow = TBRollingMetricWindow()
     private var _packetBytesWindow = TBRollingMetricWindow()
     private var _dirtyTilesWindow = TBRollingMetricWindow()
+    private var _planeSplitTimeWindow = TBRollingMetricWindow()
+    private var _compressionTimeWindow = TBRollingMetricWindow()
     private var _lastCaptureFrameAt = Date()
 
     init(preset: TBDisplayCapturePreset,
@@ -1781,6 +1797,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          usesRawNV12: Bool,
          usesBC7Mode6: Bool,
          usesBC7TileDelta: Bool,
+         usesBC7LZFSE: Bool,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable (Int, Int) -> Void) {
         self.preset = preset
@@ -1791,6 +1808,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.usesRawNV12 = usesRawNV12
         self.usesBC7Mode6 = usesBC7Mode6
         self.usesBC7TileDelta = usesBC7TileDelta
+        self.usesBC7LZFSE = usesBC7LZFSE
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
     }
@@ -1880,6 +1898,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 bc7SendCompletedFrames: _bc7SendCompletedFrames,
                 bc7SendNanoseconds: _bc7SendNanoseconds,
                 bc7SendErrors: _bc7SendErrors,
+                bc7CompressedPackets: _bc7CompressedPackets,
+                bc7CompressionFallbacks: _bc7CompressionFallbacks,
+                bc7RawPacketBytes: _bc7RawPacketBytes,
+                bc7WirePacketBytes: _bc7WirePacketBytes,
                 captureComplete: _captureComplete,
                 captureStarted: _captureStarted,
                 captureIdle: _captureIdle,
@@ -1897,7 +1919,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 packetTime: _packetTimeWindow.summary(),
                 sendTime: _sendTimeWindow.summary(),
                 packetBytes: _packetBytesWindow.summary(),
-                dirtyTiles: _dirtyTilesWindow.summary()
+                dirtyTiles: _dirtyTilesWindow.summary(),
+                planeSplitTime: _planeSplitTimeWindow.summary(),
+                compressionTime: _compressionTimeWindow.summary()
             )
         }
     }
@@ -1945,6 +1969,25 @@ private final class TBVideoPipeline: @unchecked Sendable {
         _packetTimeWindow.record(packetNanoseconds)
         if usedGPUAnalysis {
             _bc7GPUAnalyzedFrames += 1
+        }
+        lock.unlock()
+    }
+
+    private func recordBC7Compression(
+        result: TBBC7CompressedPacketResult?,
+        rawPacketBytes: Int,
+        wirePacketBytes: Int,
+        attempted: Bool
+    ) {
+        lock.lock()
+        _bc7RawPacketBytes &+= UInt64(rawPacketBytes)
+        _bc7WirePacketBytes &+= UInt64(wirePacketBytes)
+        if let result {
+            _bc7CompressedPackets += 1
+            _planeSplitTimeWindow.record(result.planeSplitNanoseconds)
+            _compressionTimeWindow.record(result.compressionNanoseconds)
+        } else if attempted {
+            _bc7CompressionFallbacks += 1
         }
         lock.unlock()
     }
@@ -2314,7 +2357,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
         let planFinished = DispatchTime.now().uptimeNanoseconds
         let packetStarted = planFinished
-        let packet: Data
+        let rawPacket: Data
         if let plan {
             switch plan {
             case let .keyframe(sequence, checksum, data):
@@ -2327,7 +2370,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 TBMonitorProtocol.appendBE32(&payload, UInt32(height))
                 TBMonitorProtocol.appendBE32(&payload, UInt32(encoded.bytesPerRow))
                 payload.append(data)
-                packet = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+                rawPacket = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
             case let .delta(sequence, baseSequence, checksum, runs, dirtyTiles, _):
                 bc7DeltaFrames += 1
                 bc7DirtyTiles += dirtyTiles
@@ -2345,7 +2388,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     TBLog.connection.error("Unable to serialize BC7 delta packet")
                     return
                 }
-                packet = deltaPacket
+                rawPacket = deltaPacket
             }
         } else {
             bc7Keyframes += 1
@@ -2355,7 +2398,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
             TBMonitorProtocol.appendBE32(&payload, UInt32(height))
             TBMonitorProtocol.appendBE32(&payload, UInt32(encoded.bytesPerRow))
             payload.append(encoded.data)
-            packet = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
+            rawPacket = TBMonitorProtocol.makePacket(type: .bc7Frame, payload: payload)
         }
         let packetFinished = DispatchTime.now().uptimeNanoseconds
         recordBC7Timing(
@@ -2363,6 +2406,17 @@ private final class TBVideoPipeline: @unchecked Sendable {
             planNanoseconds: planFinished - planStarted,
             packetNanoseconds: packetFinished - packetStarted,
             usedGPUAnalysis: encoded.tileAnalysis != nil
+        )
+        let selection = tbSelectBC7WirePacket(
+            rawPacket: rawPacket,
+            supportsLZFSE: usesBC7LZFSE
+        )
+        let packet = selection.packet
+        recordBC7Compression(
+            result: selection.compressedResult,
+            rawPacketBytes: rawPacket.count,
+            wirePacketBytes: packet.count,
+            attempted: selection.compressionAttempted
         )
         pendingVideoPackets += 1
         let sendStarted = DispatchTime.now().uptimeNanoseconds
@@ -2665,6 +2719,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsRawNV12Hint = nil
                 receiverSupportsBC7Mode6Hint = nil
                 receiverSupportsBC7TileDeltaHint = nil
+                receiverSupportsBC7LZFSEHint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
             }
@@ -2681,6 +2736,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsRawNV12Hint = nil
                 receiverSupportsBC7Mode6Hint = nil
                 receiverSupportsBC7TileDeltaHint = nil
+                receiverSupportsBC7LZFSEHint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
             }
@@ -2733,6 +2789,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var receiverSupportsRawNV12Hint: Bool?
     var receiverSupportsBC7Mode6Hint: Bool?
     var receiverSupportsBC7TileDeltaHint: Bool?
+    var receiverSupportsBC7LZFSEHint: Bool?
     var receiverInputMonitoringTrustedHint: Bool?
     var receiverAccessibilityTrustedHint: Bool?
     @Published var senderFPS = 0
@@ -4069,6 +4126,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         receiverSupportsRawNV12Hint = profile.supportsRawNV12
         receiverSupportsBC7Mode6Hint = profile.supportsBC7Mode6
         receiverSupportsBC7TileDeltaHint = profile.supportsBC7TileDelta
+        receiverSupportsBC7LZFSEHint = profile.supportsBC7LZFSE
         if let inputMonitoringTrusted = profile.inputMonitoringTrusted {
             receiverInputMonitoringTrustedHint = inputMonitoringTrusted
         }
@@ -4173,20 +4231,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             return
         }
         receiverMetricsText = String(
-            format: "apply fps=%.2f · present fps=%.2f · %.3f Gbit/s · seq=%llu · frames=%llu · presented=%llu · coalesced=%llu · packet p95=%.2f ms · apply p95=%.2f ms · upload p95=%.2f ms · present p95=%.2f ms · cadence p95=%.2f ms · invalid=%llu · render failures=%llu · keyframe requests=%llu",
+            format: "apply fps=%.2f · present fps=%.2f · %.3f Gbit/s · seq=%llu · frames=%llu · compressed=%llu · ratio=%.3f · decompress p95=%.2f ms · packet p95=%.2f ms · apply p95=%.2f ms · upload p95=%.2f ms · present p95=%.2f ms · cadence p95=%.2f ms · invalid=%llu · decompress failures=%llu · render failures=%llu · keyframe requests=%llu",
             metrics.fps,
             metrics.presentFPS ?? 0,
             metrics.networkGbps,
             metrics.appliedSequence,
             metrics.bc7Frames,
-            metrics.presentedFrames ?? 0,
-            metrics.coalescedFrames ?? 0,
+            metrics.compressedPackets ?? 0,
+            (metrics.rawBlockBytes ?? 0) > 0
+                ? Double(metrics.compressedBlockBytes ?? 0) /
+                    Double(metrics.rawBlockBytes ?? 1)
+                : 1,
+            metrics.decompressionP95Ms ?? 0,
             metrics.packetIntervalP95Ms ?? 0,
             metrics.applyP95Ms ?? 0,
             metrics.uploadP95Ms ?? 0,
             metrics.presentP95Ms ?? 0,
             metrics.presentIntervalP95Ms ?? 0,
             metrics.bc7Invalid,
+            metrics.decompressionFailures ?? 0,
             metrics.renderFailures,
             metrics.keyframeRequests
         )
@@ -4237,6 +4300,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 usesRawNV12: usesRawNV12,
                 usesBC7Mode6: usesBC7Mode6,
                 usesBC7TileDelta: usesBC7Mode6 && profile.supportsBC7TileDelta == true,
+                usesBC7LZFSE: usesBC7Mode6 && profile.supportsBC7LZFSE == true,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] width, height in
                     Task { @MainActor in
@@ -5172,8 +5236,100 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     Double(diagnostics.sendTime.p95) / 1_000_000.0,
                     bytesPerSecond * 8.0 / 1_000_000_000.0
                 )
+                var metricsJSON: [String: Any] = [
+                    "timestampMs": Int64(now.timeIntervalSince1970 * 1000.0),
+                    "commit": TBDisplaySenderBuildInfo.gitCommit,
+                    "preset": capturePreset.rawValue,
+                    "captureHz": captureHz,
+                    "sentHz": sentHz,
+                    "completedHz": completedHz,
+                    "networkGbps": bytesPerSecond * 8.0 / 1_000_000_000.0,
+                    "pending": diagnostics.pending,
+                    "dropped": diagnostics.dropped,
+                    "processedFrames": processedFrames,
+                    "gpuAnalyzedFrames": gpuAnalyzedFrames,
+                    "captureComplete": diagnostics.captureComplete,
+                    "captureIdle": diagnostics.captureIdle,
+                    "captureIntervalP50Ms":
+                        Double(diagnostics.captureInterval.p50) / 1_000_000.0,
+                    "captureIntervalP95Ms":
+                        Double(diagnostics.captureInterval.p95) / 1_000_000.0,
+                    "captureIntervalP99Ms":
+                        Double(diagnostics.captureInterval.p99) / 1_000_000.0,
+                    "queueAgeP50Ms":
+                        Double(diagnostics.queueAge.p50) / 1_000_000.0,
+                    "queueAgeP95Ms":
+                        Double(diagnostics.queueAge.p95) / 1_000_000.0,
+                    "queueAgeP99Ms":
+                        Double(diagnostics.queueAge.p99) / 1_000_000.0,
+                    "encodeAvgMs": encodeMilliseconds,
+                    "encodeP95Ms":
+                        Double(diagnostics.encodeTime.p95) / 1_000_000.0,
+                    "planAvgMs": planMilliseconds,
+                    "planP95Ms":
+                        Double(diagnostics.planTime.p95) / 1_000_000.0,
+                    "packetAvgMs": packetMilliseconds,
+                    "packetP95Ms":
+                        Double(diagnostics.packetTime.p95) / 1_000_000.0,
+                    "sendAvgMs": sendMilliseconds,
+                    "sendP50Ms":
+                        Double(diagnostics.sendTime.p50) / 1_000_000.0,
+                    "sendP95Ms":
+                        Double(diagnostics.sendTime.p95) / 1_000_000.0,
+                    "sendP99Ms":
+                        Double(diagnostics.sendTime.p99) / 1_000_000.0,
+                    "packetBytesP50": diagnostics.packetBytes.p50,
+                    "packetBytesP95": diagnostics.packetBytes.p95,
+                    "dirtyTilesP95": diagnostics.dirtyTiles.p95,
+                    "tileBudget": diagnostics.tileBudget,
+                    "deferredTiles": diagnostics.deferredTiles,
+                    "worstDeferredAge": diagnostics.worstDeferredAge,
+                    "compressedPackets": diagnostics.bc7CompressedPackets,
+                    "compressionFallbacks": diagnostics.bc7CompressionFallbacks,
+                    "rawPacketBytes": diagnostics.bc7RawPacketBytes,
+                    "wirePacketBytes": diagnostics.bc7WirePacketBytes,
+                    "planeSplitP50Ms":
+                        Double(diagnostics.planeSplitTime.p50) / 1_000_000.0,
+                    "planeSplitP95Ms":
+                        Double(diagnostics.planeSplitTime.p95) / 1_000_000.0,
+                    "compressionP50Ms":
+                        Double(diagnostics.compressionTime.p50) / 1_000_000.0,
+                    "compressionP95Ms":
+                        Double(diagnostics.compressionTime.p95) / 1_000_000.0
+                ]
+                if let receiver = lastReceiverMetrics {
+                    metricsJSON["receiver"] = [
+                        "applyFPS": receiver.fps,
+                        "presentFPS": receiver.presentFPS ?? 0,
+                        "networkGbps": receiver.networkGbps,
+                        "packetIntervalP95Ms":
+                            receiver.packetIntervalP95Ms ?? 0,
+                        "applyP95Ms": receiver.applyP95Ms ?? 0,
+                        "uploadP95Ms": receiver.uploadP95Ms ?? 0,
+                        "presentP95Ms": receiver.presentP95Ms ?? 0,
+                        "presentIntervalP95Ms":
+                            receiver.presentIntervalP95Ms ?? 0,
+                        "compressedPackets": receiver.compressedPackets ?? 0,
+                        "decompressionFailures":
+                            receiver.decompressionFailures ?? 0,
+                        "rawBlockBytes": receiver.rawBlockBytes ?? 0,
+                        "compressedBlockBytes":
+                            receiver.compressedBlockBytes ?? 0,
+                        "decompressionP95Ms":
+                            receiver.decompressionP95Ms ?? 0,
+                        "inverseTransformP95Ms":
+                            receiver.inverseTransformP95Ms ?? 0,
+                        "invalid": receiver.bc7Invalid,
+                        "renderFailures": receiver.renderFailures,
+                        "keyframeRequests": receiver.keyframeRequests
+                    ]
+                }
+                TBMetricsFileLogger.shared.append(metricsJSON)
                 TBLog.connection.info(
-                    "metrics intervalMs=\(intervalSeconds * 1000.0, format: .fixed(precision: 1), privacy: .public) captureHz=\(captureHz, format: .fixed(precision: 2), privacy: .public) sentHz=\(sentHz, format: .fixed(precision: 2), privacy: .public) completedHz=\(completedHz, format: .fixed(precision: 2), privacy: .public) captureStatus=\(diagnostics.captureComplete, privacy: .public)/\(diagnostics.captureStarted, privacy: .public)/\(diagnostics.captureIdle, privacy: .public)/\(diagnostics.captureBlank, privacy: .public)/\(diagnostics.captureSuspended, privacy: .public)/\(diagnostics.captureStopped, privacy: .public)/\(diagnostics.captureUnknown, privacy: .public) captureIntervalMs=\(Double(diagnostics.captureInterval.p50) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public)/\(Double(diagnostics.captureInterval.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public)/\(Double(diagnostics.captureInterval.p99) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) queueAgeMs=\(Double(diagnostics.queueAge.p50) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public)/\(Double(diagnostics.queueAge.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public)/\(Double(diagnostics.queueAge.p99) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) gpuAnalyzed=\(gpuAnalyzedFrames, privacy: .public)/\(processedFrames, privacy: .public) pending=\(diagnostics.pending, privacy: .public) inFlight=\(diagnostics.inFlight, privacy: .public) dropped=\(diagnostics.dropped, privacy: .public) sendErrors=\(diagnostics.bc7SendErrors, privacy: .public) key=\(diagnostics.bc7Keyframes, privacy: .public) delta=\(diagnostics.bc7DeltaFrames, privacy: .public) dirty=\(diagnostics.bc7DirtyTiles, privacy: .public) dirtyP95=\(diagnostics.dirtyTiles.p95, privacy: .public) budget=\(diagnostics.tileBudget, privacy: .public) deferred=\(diagnostics.deferredTiles, privacy: .public) worstAge=\(diagnostics.worstDeferredAge, privacy: .public) fallback=\(diagnostics.bc7FullEncodeFallbacks, privacy: .public) encodeMs=\(encodeMilliseconds, format: .fixed(precision: 2), privacy: .public) encodeP95Ms=\(Double(diagnostics.encodeTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) planMs=\(planMilliseconds, format: .fixed(precision: 2), privacy: .public) planP95Ms=\(Double(diagnostics.planTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) packetMs=\(packetMilliseconds, format: .fixed(precision: 2), privacy: .public) packetP95Ms=\(Double(diagnostics.packetTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) packetBytesP50=\(diagnostics.packetBytes.p50, privacy: .public) packetBytesP95=\(diagnostics.packetBytes.p95, privacy: .public) sendMs=\(sendMilliseconds, format: .fixed(precision: 2), privacy: .public) sendP50Ms=\(Double(diagnostics.sendTime.p50) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) sendP95Ms=\(Double(diagnostics.sendTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) sendP99Ms=\(Double(diagnostics.sendTime.p99) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) networkGbps=\(bytesPerSecond * 8.0 / 1_000_000_000.0, format: .fixed(precision: 3), privacy: .public)"
+                    "metrics captureHz=\(captureHz, format: .fixed(precision: 2), privacy: .public) sentHz=\(sentHz, format: .fixed(precision: 2), privacy: .public) completedHz=\(completedHz, format: .fixed(precision: 2), privacy: .public) pending=\(diagnostics.pending, privacy: .public) dropped=\(diagnostics.dropped, privacy: .public) queueP95Ms=\(Double(diagnostics.queueAge.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) encodeMs=\(encodeMilliseconds, format: .fixed(precision: 2), privacy: .public) planMs=\(planMilliseconds, format: .fixed(precision: 2), privacy: .public) networkGbps=\(bytesPerSecond * 8.0 / 1_000_000_000.0, format: .fixed(precision: 3), privacy: .public)"
+                )
+                TBLog.connection.info(
+                    "compression packets=\(diagnostics.bc7CompressedPackets, privacy: .public) fallback=\(diagnostics.bc7CompressionFallbacks, privacy: .public) rawBytes=\(diagnostics.bc7RawPacketBytes, privacy: .public) wireBytes=\(diagnostics.bc7WirePacketBytes, privacy: .public) splitP95Ms=\(Double(diagnostics.planeSplitTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public) compressionP95Ms=\(Double(diagnostics.compressionTime.p95) / 1_000_000.0, format: .fixed(precision: 2), privacy: .public)"
                 )
             }
         }

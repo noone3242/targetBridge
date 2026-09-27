@@ -30,6 +30,12 @@
  *   payload = [4 BE uint32 generation][4 BE uint32 width][4 BE uint32 height]
  * type 0x26 = request acknowledgment for the next successfully rendered BC7 frame
  *   payload = [4 BE uint32 generation]
+ * type 0x29 = LZFSE-compressed BC7 frame
+ * type 0x2a = LZFSE-compressed BC7 tile delta
+ *   payload = [1 version][1 algorithm][1 transform][1 reserved]
+ *             [4 BE metadata length][4 BE raw block length]
+ *             [4 BE compressed length][8 BE compressed checksum]
+ *             [metadata][compressed byte planes]
  *
  * type 0x30 = heartbeat (JSON)
  * type 0x31 = teardown (JSON)
@@ -63,6 +69,8 @@
 #define TB_PKT_BC7_ACK_REQUEST  0x26
 #define TB_PKT_BC7_TILE_DELTA   0x27
 #define TB_PKT_BC7_KEYFRAME_REQUEST 0x28
+#define TB_PKT_BC7_COMPRESSED_FRAME 0x29
+#define TB_PKT_BC7_COMPRESSED_DELTA 0x2A
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31
 #define TB_PKT_CURSOR           0x32

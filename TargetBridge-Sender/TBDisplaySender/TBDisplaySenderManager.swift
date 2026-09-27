@@ -435,6 +435,7 @@ final class TBDisplaySenderService: ObservableObject {
         session.receiverSupportsRawNV12Hint = receiver.supportsRawNV12
         session.receiverSupportsBC7Mode6Hint = receiver.supportsBC7Mode6
         session.receiverSupportsBC7TileDeltaHint = receiver.supportsBC7TileDelta
+        session.receiverSupportsBC7LZFSEHint = receiver.supportsBC7LZFSE
         if session.localInterfaceIP.isEmpty {
             session.localInterfaceIP = suggestedInterfaceForNewSession(transportKind: session.transportKind)?.ip
                 ?? availableInterfaces(for: session.transportKind).first?.ip
@@ -454,6 +455,7 @@ final class TBDisplaySenderService: ObservableObject {
             session.receiverSupportsRawNV12Hint = receiver.supportsRawNV12
             session.receiverSupportsBC7Mode6Hint = receiver.supportsBC7Mode6
             session.receiverSupportsBC7TileDeltaHint = receiver.supportsBC7TileDelta
+            session.receiverSupportsBC7LZFSEHint = receiver.supportsBC7LZFSE
         }
     }
 

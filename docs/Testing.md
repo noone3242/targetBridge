@@ -153,6 +153,9 @@ cd TargetBridge-Receiver/TBReceiverC
 ```
 
 BC7 activates only when the Receiver advertises `supportsBC7Mode6=true`.
+LZFSE supercompression activates only when the Receiver also advertises
+`supportsBC7LZFSE=true`. Complete Sender metrics are written beside the app at
+`logs/sender-metrics.jsonl`; OSLog contains only short summaries and errors.
 The Diagnostics **Start BC7 Test** action runs a real 1440p BC7 session and
 reports success only after the Receiver completes a Metal render command and
 returns the matching generation acknowledgment.

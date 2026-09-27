@@ -16,6 +16,7 @@
 #include "net.h"
 #include "bc7_frame.h"
 #include "bc7_delta.h"
+#include "bc7_supercompression.h"
 #include "bc7_renderer.h"
 #include "decoder.h"
 #include "display.h"
@@ -91,6 +92,10 @@ struct app {
     uint64_t bc7_ack_requests;
     uint64_t bc7_acks_sent;
     uint64_t bc7_delta_frames;
+    uint64_t bc7_compressed_packets;
+    uint64_t bc7_decompression_failures;
+    uint64_t bc7_compressed_block_bytes;
+    uint64_t bc7_raw_block_bytes;
     uint64_t bc7_keyframe_requests;
     uint64_t bc7_applied_sequence;
     uint64_t bc7_checksum;
@@ -117,6 +122,8 @@ struct app {
     struct tb_metric_window bc7_upload_ns;
     struct tb_metric_window bc7_present_ns;
     struct tb_metric_window bc7_present_interval_ns;
+    struct tb_metric_window bc7_decompression_ns;
+    struct tb_metric_window bc7_inverse_transform_ns;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      debug_enabled;
@@ -698,6 +705,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "supportsRawNV12", 1, "1");
     TXTRecordSetValue(&txt, "supportsBC7Mode6", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsBC7TileDelta", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
+    TXTRecordSetValue(&txt, "supportsBC7LZFSE", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
 
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) == 0) {
@@ -1416,6 +1424,44 @@ static void handle_bc7_delta(struct app *a, const uint8_t *p, size_t len) {
     metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
 }
 
+static void record_bc7_supercompression(
+    struct app *a,
+    const struct tb_bc7_supercompression_result *result) {
+    a->bc7_compressed_packets++;
+    a->bc7_raw_block_bytes += result->raw_block_bytes;
+    a->bc7_compressed_block_bytes += result->compressed_block_bytes;
+    metric_record(&a->bc7_decompression_ns, result->decompression_ns);
+    metric_record(&a->bc7_inverse_transform_ns, result->inverse_transform_ns);
+}
+
+static void handle_bc7_compressed_frame(
+    struct app *a, const uint8_t *p, size_t len) {
+    struct tb_bc7_supercompression_result result;
+    if (tb_bc7_supercompression_decode_frame(p, len, &result) != 0) {
+        a->bc7_invalid_frames++;
+        a->bc7_decompression_failures++;
+        request_bc7_keyframe(a, "keyframe-supercompression");
+        return;
+    }
+    record_bc7_supercompression(a, &result);
+    handle_bc7_frame(a, result.payload, result.payload_len);
+    tb_bc7_supercompression_result_free(&result);
+}
+
+static void handle_bc7_compressed_delta(
+    struct app *a, const uint8_t *p, size_t len) {
+    struct tb_bc7_supercompression_result result;
+    if (tb_bc7_supercompression_decode_delta(p, len, &result) != 0) {
+        a->bc7_invalid_frames++;
+        a->bc7_decompression_failures++;
+        request_bc7_keyframe(a, "delta-supercompression");
+        return;
+    }
+    record_bc7_supercompression(a, &result);
+    handle_bc7_delta(a, result.payload, result.payload_len);
+    tb_bc7_supercompression_result_free(&result);
+}
+
 static void ring_read(struct app *a, Uint8 *dst, int len) {
     int first = AUDIO_BUF_CAP - a->audio_buf_tail;
     if (first >= len) {
@@ -1573,6 +1619,14 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
     case TB_PKT_BC7_TILE_DELTA:
         a->session_active = 1;
         handle_bc7_delta(a, payload, len);
+        break;
+    case TB_PKT_BC7_COMPRESSED_FRAME:
+        a->session_active = 1;
+        handle_bc7_compressed_frame(a, payload, len);
+        break;
+    case TB_PKT_BC7_COMPRESSED_DELTA:
+        a->session_active = 1;
+        handle_bc7_compressed_delta(a, payload, len);
         break;
     case TB_PKT_BC7_ACK_REQUEST:
         if (len == 4) {
@@ -2165,7 +2219,7 @@ static void send_receiver_info(struct app *a) {
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
         "\"receiverVersion\":\"%s\",\"receiverBuild\":\"%s\",\"receiverCommit\":\"%s\","
         "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsBC7Mode6\":%s,"
-        "\"supportsBC7TileDelta\":%s,"
+        "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
         "\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
         escaped_name,
         panel_w,
@@ -2178,6 +2232,7 @@ static void send_receiver_info(struct app *a) {
         TB_RECEIVER_BUILD,
         TB_RECEIVER_COMMIT,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
+        tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
@@ -2213,7 +2268,11 @@ static void send_receiver_metrics(
     const struct tb_metric_summary present = metric_summary(&a->bc7_present_ns);
     const struct tb_metric_summary present_interval =
         metric_summary(&a->bc7_present_interval_ns);
-    char json[1536];
+    const struct tb_metric_summary decompression =
+        metric_summary(&a->bc7_decompression_ns);
+    const struct tb_metric_summary inverse_transform =
+        metric_summary(&a->bc7_inverse_transform_ns);
+    char json[2048];
     int json_len = snprintf(
         json,
         sizeof(json),
@@ -2227,7 +2286,12 @@ static void send_receiver_metrics(
         "\"presentP50Ms\":%.3f,\"presentP95Ms\":%.3f,\"presentP99Ms\":%.3f,"
         "\"presentIntervalP50Ms\":%.3f,\"presentIntervalP95Ms\":%.3f,"
         "\"presentIntervalP99Ms\":%.3f,\"presentedFrames\":%llu,"
-        "\"coalescedFrames\":%llu}",
+        "\"coalescedFrames\":%llu,\"compressedPackets\":%llu,"
+        "\"decompressionFailures\":%llu,\"rawBlockBytes\":%llu,"
+        "\"compressedBlockBytes\":%llu,\"decompressionP50Ms\":%.3f,"
+        "\"decompressionP95Ms\":%.3f,\"decompressionP99Ms\":%.3f,"
+        "\"inverseTransformP50Ms\":%.3f,\"inverseTransformP95Ms\":%.3f,"
+        "\"inverseTransformP99Ms\":%.3f}",
         fps,
         present_fps,
         gbps,
@@ -2255,12 +2319,22 @@ static void send_receiver_metrics(
         ns_to_ms(present_interval.p95),
         ns_to_ms(present_interval.p99),
         (unsigned long long)a->bc7_presented_frames,
-        (unsigned long long)a->bc7_coalesced_frames
+        (unsigned long long)a->bc7_coalesced_frames,
+        (unsigned long long)a->bc7_compressed_packets,
+        (unsigned long long)a->bc7_decompression_failures,
+        (unsigned long long)a->bc7_raw_block_bytes,
+        (unsigned long long)a->bc7_compressed_block_bytes,
+        ns_to_ms(decompression.p50),
+        ns_to_ms(decompression.p95),
+        ns_to_ms(decompression.p99),
+        ns_to_ms(inverse_transform.p50),
+        ns_to_ms(inverse_transform.p95),
+        ns_to_ms(inverse_transform.p99)
     );
     if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
 
     const size_t packet_len = 5u + (size_t)json_len;
-    uint8_t packet[5 + 1536];
+    uint8_t packet[5 + 2048];
     write_be32(packet, (uint32_t)(1 + json_len));
     packet[4] = TB_PKT_RECEIVER_METRICS;
     memcpy(packet + 5, json, (size_t)json_len);
@@ -2379,12 +2453,14 @@ int main(int argc, char **argv) {
         printf(
             "{\"version\":\"%s\",\"build\":\"%s\",\"commit\":\"%s\",\"architecture\":\"%s\","
             "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
-            "\"supportsBC7TileDelta\":%s,\"supportsRawNV12\":true}\n",
+            "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
+            "\"supportsRawNV12\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
             TB_RECEIVER_COMMIT,
             architecture,
             metal_device,
+            tb_bc7_renderer_supported() ? "true" : "false",
             tb_bc7_renderer_supported() ? "true" : "false",
             tb_bc7_renderer_supported() ? "true" : "false"
         );
@@ -2565,6 +2641,10 @@ int main(int argc, char **argv) {
                 a.bc7_ack_requests = 0;
                 a.bc7_acks_sent = 0;
                 a.bc7_delta_frames = 0;
+                a.bc7_compressed_packets = 0;
+                a.bc7_decompression_failures = 0;
+                a.bc7_compressed_block_bytes = 0;
+                a.bc7_raw_block_bytes = 0;
                 a.bc7_keyframe_requests = 0;
                 a.bc7_last_packet_ns = 0;
                 a.bc7_last_present_ns = 0;
@@ -2575,6 +2655,8 @@ int main(int argc, char **argv) {
                 memset(&a.bc7_upload_ns, 0, sizeof(a.bc7_upload_ns));
                 memset(&a.bc7_present_ns, 0, sizeof(a.bc7_present_ns));
                 memset(&a.bc7_present_interval_ns, 0, sizeof(a.bc7_present_interval_ns));
+                memset(&a.bc7_decompression_ns, 0, sizeof(a.bc7_decompression_ns));
+                memset(&a.bc7_inverse_transform_ns, 0, sizeof(a.bc7_inverse_transform_ns));
                 snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
@@ -2723,6 +2805,10 @@ int main(int argc, char **argv) {
                     metric_summary(&a.bc7_present_ns);
                 const struct tb_metric_summary present_interval =
                     metric_summary(&a.bc7_present_interval_ns);
+                const struct tb_metric_summary decompression =
+                    metric_summary(&a.bc7_decompression_ns);
+                const struct tb_metric_summary inverse_transform =
+                    metric_summary(&a.bc7_inverse_transform_ns);
                 fprintf(stderr,
                         "[diag] event=metrics connected=%s sessionActive=%s "
                         "transport=%s fps=%.2f presentFps=%.2f networkGbps=%.3f packets=%llu "
@@ -2732,7 +2818,10 @@ int main(int argc, char **argv) {
                         "ackRequests=%llu acksSent=%llu presented=%llu coalesced=%llu "
                         "packetIntervalMs=%.2f/%.2f/%.2f applyMs=%.2f/%.2f/%.2f "
                         "uploadMs=%.2f/%.2f/%.2f presentMs=%.2f/%.2f/%.2f "
-                        "presentIntervalMs=%.2f/%.2f/%.2f\n",
+                        "presentIntervalMs=%.2f/%.2f/%.2f compressed=%llu "
+                        "compressionRatio=%.3f decompressionFailures=%llu "
+                        "decompressionMs=%.2f/%.2f/%.2f "
+                        "inverseMs=%.2f/%.2f/%.2f\n",
                         a.client_fd >= 0 ? "true" : "false",
                         a.session_active ? "true" : "false",
                         a.active_transport,
@@ -2767,7 +2856,19 @@ int main(int argc, char **argv) {
                         ns_to_ms(present.p99),
                         ns_to_ms(present_interval.p50),
                         ns_to_ms(present_interval.p95),
-                        ns_to_ms(present_interval.p99));
+                        ns_to_ms(present_interval.p99),
+                        (unsigned long long)a.bc7_compressed_packets,
+                        a.bc7_raw_block_bytes > 0
+                            ? (double)a.bc7_compressed_block_bytes /
+                                (double)a.bc7_raw_block_bytes
+                            : 1.0,
+                        (unsigned long long)a.bc7_decompression_failures,
+                        ns_to_ms(decompression.p50),
+                        ns_to_ms(decompression.p95),
+                        ns_to_ms(decompression.p99),
+                        ns_to_ms(inverse_transform.p50),
+                        ns_to_ms(inverse_transform.p95),
+                        ns_to_ms(inverse_transform.p99));
             } else if (df > 0) {
                 fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
             }

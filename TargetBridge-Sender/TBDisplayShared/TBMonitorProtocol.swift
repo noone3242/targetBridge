@@ -15,6 +15,8 @@ enum TBMonitorPacketType: UInt8 {
     case bc7RenderAckRequest = 0x26
     case bc7TileDelta = 0x27
     case bc7KeyframeRequest = 0x28
+    case bc7CompressedFrame = 0x29
+    case bc7CompressedDelta = 0x2A
     case heartbeat = 0x30
     case teardown = 0x31
     case cursor = 0x32
@@ -50,6 +52,7 @@ struct TBMonitorDisplayProfile: Codable {
     var supportsRawNV12: Bool?
     var supportsBC7Mode6: Bool?
     var supportsBC7TileDelta: Bool?
+    var supportsBC7LZFSE: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
     var receiverVersion: String? = nil
@@ -92,6 +95,16 @@ struct TBMonitorReceiverMetrics: Codable, Equatable {
     var presentIntervalP99Ms: Double?
     var presentedFrames: UInt64?
     var coalescedFrames: UInt64?
+    var compressedPackets: UInt64?
+    var decompressionFailures: UInt64?
+    var rawBlockBytes: UInt64?
+    var compressedBlockBytes: UInt64?
+    var decompressionP50Ms: Double?
+    var decompressionP95Ms: Double?
+    var decompressionP99Ms: Double?
+    var inverseTransformP50Ms: Double?
+    var inverseTransformP95Ms: Double?
+    var inverseTransformP99Ms: Double?
 }
 
 struct TBMonitorUILanguageUpdate: Codable {
