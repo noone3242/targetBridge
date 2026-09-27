@@ -110,6 +110,27 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
         XCTAssertEqual(detail, "dialed 192.168.1.64:54321 from 192.168.1.225 [networkLink]")
     }
 
+    func testConnectedThunderboltWaitReleasesSessionResources() {
+        XCTAssertTrue(
+            tbShouldReleaseSessionOnNetworkWait(
+                isConnected: true,
+                transportKind: .thunderboltBridge
+            )
+        )
+        XCTAssertFalse(
+            tbShouldReleaseSessionOnNetworkWait(
+                isConnected: false,
+                transportKind: .thunderboltBridge
+            )
+        )
+        XCTAssertFalse(
+            tbShouldReleaseSessionOnNetworkWait(
+                isConnected: true,
+                transportKind: .networkLink
+            )
+        )
+    }
+
     // MARK: - currentIPv4Interfaces (live snapshot; environment-tolerant)
 
     func testCurrentIPv4InterfacesExcludesLoopbackAndHasNames() {

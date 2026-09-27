@@ -67,7 +67,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "TargetBridge")
-        item.button?.imagePosition = .imageOnly
+        item.button?.imagePosition = .imageLeading
         item.button?.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
 
         // Assign one menu instance for the lifetime of the status item and
@@ -90,6 +90,30 @@ final class TBDisplaySenderStatusItemController: NSObject {
     private func refreshStatusItem() {
         guard let item = statusItem else { return }
         item.button?.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
+        guard let button = item.button else { return }
+        if let session = service.sessions.first(where: { $0.isStreaming }) ??
+            service.sessions.first(where: { $0.isConnected }) {
+            let fps = max(
+                session.liveMetrics.senderFPS,
+                Int(session.liveMetrics.receiverFPS.rounded())
+            )
+            let bandwidth = session.liveMetrics.senderNetworkGbps
+            let text = String(format: " %d fps  %.2fG", fps, bandwidth)
+            button.attributedTitle = NSAttributedString(
+                string: text,
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(
+                        ofSize: 10,
+                        weight: .medium
+                    ),
+                    .foregroundColor: NSColor.labelColor
+                ]
+            )
+            button.imagePosition = .imageLeading
+        } else {
+            button.attributedTitle = NSAttributedString(string: "")
+            button.imagePosition = .imageOnly
+        }
     }
 
     private func rebuildMenuItems(in menu: NSMenu) {

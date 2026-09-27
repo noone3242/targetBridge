@@ -8,7 +8,7 @@ struct TBDisplaySenderSettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 24) {
                 SurfaceCard {
                     HStack(alignment: .top, spacing: 16) {
                         ZStack {
@@ -33,7 +33,7 @@ struct TBDisplaySenderSettingsView: View {
                             Text(settingsTitle)
                                 .font(.system(size: 28, weight: .bold, design: .rounded))
                             Text(settingsSubtitle)
-                                .font(.subheadline)
+                                .font(.body)
                                 .foregroundStyle(.secondary)
                             versionChip
                         }
@@ -133,7 +133,7 @@ struct TBDisplaySenderSettingsView: View {
                     }
                 }
             }
-            .padding(20)
+            .padding(28)
         }
         .background(appBackground)
         .alert(addonImportErrorTitle, isPresented: Binding(
@@ -150,12 +150,11 @@ struct TBDisplaySenderSettingsView: View {
 
     private func settingsSection<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
         SurfaceCard {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(title.uppercased())
-                    .font(.system(.caption, design: .rounded, weight: .bold))
-                    .tracking(1.0)
-                    .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 16) {
+                Text(title)
+                    .font(.system(size: 21, weight: .bold, design: .rounded))
                 content()
+                    .font(.body)
             }
         }
     }
@@ -259,15 +258,8 @@ struct TBDisplaySenderSettingsView: View {
     }
 
     private var appBackground: some View {
-        LinearGradient(
-            colors: [
-                Color(red: 0.12, green: 0.13, blue: 0.14),
-                Color(red: 0.08, green: 0.09, blue: 0.10)
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-        .ignoresSafeArea()
+        Color(nsColor: .windowBackgroundColor)
+            .ignoresSafeArea()
     }
 
     private var settingsTitle: String {

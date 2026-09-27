@@ -8,7 +8,7 @@ struct TBDisplaySenderApp: App {
     var body: some Scene {
         Window("TargetBridge", id: "main") {
             TBDisplaySenderContentView(service: service)
-                .frame(minWidth: 540)
+                .frame(minWidth: 780, minHeight: 680)
                 .task {
                     statusItemController.activate()
                     TBSenderAutomation.handleLaunchArguments(CommandLine.arguments)
@@ -17,11 +17,11 @@ struct TBDisplaySenderApp: App {
                     TBSenderAutomation.handle(url: url)
                 }
         }
-        .defaultSize(width: 860, height: 860)
+        .defaultSize(width: 1040, height: 900)
 
         Settings {
             TBDisplaySenderSettingsView(service: service)
-                .frame(minWidth: 760, minHeight: 620)
+                .frame(minWidth: 860, minHeight: 720)
         }
     }
 }

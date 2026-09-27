@@ -6,7 +6,7 @@ struct TBDisplaySenderContentView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 24) {
                 headerCard
                 controlDeck
 
@@ -21,10 +21,10 @@ struct TBDisplaySenderContentView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(20)
+            .padding(28)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .background(Color.black.opacity(0.02))
+        .background(Color(nsColor: .windowBackgroundColor))
         .task {
             service.refreshLocalInterfaces()
         }
@@ -71,7 +71,7 @@ struct TBDisplaySenderContentView: View {
                     Text(TBDisplaySenderL10n.appName(service.language))
                         .font(.system(size: 31, weight: .bold, design: .rounded))
                     Text(TBDisplaySenderL10n.appSubtitle(service.language))
-                        .font(.subheadline)
+                        .font(.body)
                         .foregroundStyle(.secondary)
                 }
 
@@ -98,7 +98,7 @@ struct TBDisplaySenderContentView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         sectionHeading(TBDisplaySenderL10n.connectionGroup(service.language))
                         Text(TBDisplaySenderL10n.multiSessionHint(service.language))
-                            .font(.footnote)
+                            .font(.callout)
                             .foregroundStyle(.secondary)
                     }
 
@@ -109,16 +109,19 @@ struct TBDisplaySenderContentView: View {
                             service.addSession()
                         }
                         .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
 
                         Button(TBDisplaySenderL10n.refreshIPButton(service.language)) {
                             service.refreshLocalInterfaces()
                         }
                         .buttonStyle(.bordered)
+                        .controlSize(.large)
 
                         Button(TBDisplaySenderL10n.stopAllButton(service.language)) {
                             service.stopAll()
                         }
                         .buttonStyle(.bordered)
+                        .controlSize(.large)
                         .disabled(!service.anyConnected)
                     }
                 }
@@ -126,7 +129,7 @@ struct TBDisplaySenderContentView: View {
                 SurfaceSubcard {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(TBDisplaySenderL10n.availableLocalInterfaces(service.language))
-                            .font(.caption.weight(.semibold))
+                            .font(.callout.weight(.semibold))
                             .foregroundStyle(.secondary)
                         Text(service.localInterfaceSummaryText)
                             .font(.system(.body, design: .monospaced))
@@ -138,10 +141,8 @@ struct TBDisplaySenderContentView: View {
     }
 
     private func sectionHeading(_ title: String) -> some View {
-        Text(title.uppercased())
-            .font(.system(.caption, design: .rounded, weight: .bold))
-            .tracking(1.1)
-            .foregroundStyle(.secondary)
+        Text(title)
+            .font(.system(.headline, design: .rounded, weight: .semibold))
     }
 
     private func statusChip(_ text: String, tint: Color) -> some View {
@@ -185,9 +186,11 @@ private struct TBDisplaySenderSessionCard: View {
     @ObservedObject var service: TBDisplaySenderService
     @ObservedObject var session: TBDisplaySenderSession
     @State private var showingSessionSettings = false
+    @State private var showingDiagnostics = false
 
     private let summaryColumns = [
-        GridItem(.adaptive(minimum: 180), spacing: 12)
+        GridItem(.flexible(minimum: 240), spacing: 14),
+        GridItem(.flexible(minimum: 240), spacing: 14)
     ]
 
     var body: some View {
@@ -234,6 +237,7 @@ private struct TBDisplaySenderSessionCard: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
                 .disabled(!session.isConnected && (trimmedReceiverIP.isEmpty || session.localInterfaceIP.isEmpty))
 
                 Button {
@@ -242,11 +246,13 @@ private struct TBDisplaySenderSessionCard: View {
                     Label(TBDisplaySenderL10n.showSettings(service.language), systemImage: "gearshape.2")
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.large)
 
                 Button(TBDisplaySenderL10n.removeSessionButton(service.language)) {
                     service.removeSession(session)
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.large)
                 .disabled(service.sessions.count == 1 || session.isConnected || session.isStreaming)
             }
         }
@@ -274,8 +280,8 @@ private struct TBDisplaySenderSessionCard: View {
 
             summaryTile(
                 title: fpsTitle,
-                value: "\(session.senderFPS)",
-                subtitle: session.isStreaming ? liveSubtitle : idleSubtitle,
+                value: liveFPSValue,
+                subtitle: liveBandwidthValue,
                 accent: session.isStreaming ? .green : .secondary
             )
         }
@@ -283,60 +289,68 @@ private struct TBDisplaySenderSessionCard: View {
 
     private var monitorDetailsCard: some View {
         SurfaceSubcard {
-            VStack(alignment: .leading, spacing: 10) {
-                sectionHeading(sessionMonitorTitle)
+            DisclosureGroup(isExpanded: $showingDiagnostics) {
+                VStack(alignment: .leading, spacing: 12) {
 
-                VStack(alignment: .leading, spacing: 8) {
-                    infoRow(statusLabel, session.statusText)
-                    infoRow(connectionPathLabel, session.connectionPathText)
-                    infoRow(TBDisplaySenderL10n.receiverLabel(service.language), session.receiverPanelText)
-                    infoRow(TBDisplaySenderL10n.virtualDisplayLabel(service.language), session.virtualDisplayText)
-                    infoRow(displayModeLabel, session.displayModeDiagnosticsText)
-                    infoRow(configuredStreamLabel, session.streamResolutionText)
-                    infoRow(actualStreamLabel, session.actualStreamText)
-                    infoRow(transportDetailsLabel, session.transportDiagnosticsText)
-                    infoRow(receiverMetricsLabel, session.receiverMetricsText)
-                    infoRow(generationLabel, session.generationDiagnosticsText)
-                    infoRow(captureLabel, session.captureDisplayText)
-                    infoRow(displayStateLabel, session.displayStateText)
-                    infoRow(TBDisplaySenderL10n.fpsLabel(service.language), "\(session.senderFPS)")
-                }
-
-                Divider().overlay(Color.white.opacity(0.08))
-
-                HStack {
-                    sectionHeading(sessionLogTitle)
-                    Spacer()
-                    Button(clearLogTitle) {
-                        session.clearSessionLog()
+                    VStack(alignment: .leading, spacing: 10) {
+                        infoRow(statusLabel, session.statusText)
+                        infoRow(connectionPathLabel, session.connectionPathText)
+                        infoRow(TBDisplaySenderL10n.receiverLabel(service.language), session.receiverPanelText)
+                        infoRow(TBDisplaySenderL10n.virtualDisplayLabel(service.language), session.virtualDisplayText)
+                        infoRow(displayModeLabel, session.displayModeDiagnosticsText)
+                        infoRow(configuredStreamLabel, session.streamResolutionText)
+                        infoRow(actualStreamLabel, session.actualStreamText)
+                        infoRow(transportDetailsLabel, session.transportDiagnosticsText)
+                        infoRow(receiverMetricsLabel, session.receiverMetricsText)
+                        infoRow(generationLabel, session.generationDiagnosticsText)
+                        infoRow(captureLabel, session.captureDisplayText)
+                        infoRow(displayStateLabel, session.displayStateText)
                     }
-                    .buttonStyle(.borderless)
-                    .disabled(session.sessionLogEntries.isEmpty)
-                }
 
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 5) {
-                        if session.sessionLogEntries.isEmpty {
-                            Text(emptyLogText)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(session.sessionLogEntries.reversed()) { entry in
-                                HStack(alignment: .top, spacing: 8) {
-                                    Text(entry.timestamp)
-                                        .foregroundStyle(.secondary)
-                                    Text(entry.message)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Divider()
+
+                    HStack {
+                        Text(sessionLogTitle)
+                            .font(.headline)
+                        Spacer()
+                        Button(clearLogTitle) {
+                            session.clearSessionLog()
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(session.sessionLogEntries.isEmpty)
+                    }
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 7) {
+                            if session.sessionLogEntries.isEmpty {
+                                Text(emptyLogText)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(session.sessionLogEntries.reversed()) { entry in
+                                    HStack(alignment: .top, spacing: 8) {
+                                        Text(entry.timestamp)
+                                            .foregroundStyle(.secondary)
+                                        Text(entry.message)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .textSelection(.enabled)
                                 }
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(minHeight: 110, maxHeight: 220)
+                    .padding(12)
+                    .background(
+                        Color(nsColor: .textBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: 10)
+                    )
                 }
-                .frame(minHeight: 90, maxHeight: 180)
-                .padding(10)
-                .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 8))
+                .padding(.top, 14)
+            } label: {
+                Label(sessionMonitorTitle, systemImage: "waveform.path.ecg")
+                    .font(.system(size: 17, weight: .semibold))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -427,10 +441,8 @@ private struct TBDisplaySenderSessionCard: View {
     }
 
     private func sectionHeading(_ title: String) -> some View {
-        Text(title.uppercased())
-            .font(.system(.caption, design: .rounded, weight: .bold))
-            .tracking(1.0)
-            .foregroundStyle(.secondary)
+        Text(title)
+            .font(.system(.headline, design: .rounded, weight: .semibold))
     }
 
     private func summaryTile(title: String, value: String, subtitle: String, accent: Color = .primary) -> some View {
@@ -438,12 +450,12 @@ private struct TBDisplaySenderSessionCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 sectionHeading(title)
                 Text(value)
-                    .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    .font(.system(size: 20, weight: .semibold, design: .rounded))
                     .foregroundStyle(accent)
                     .lineLimit(2)
                     .textSelection(.enabled)
                 Text(subtitle)
-                    .font(.footnote)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
                     .textSelection(.enabled)
@@ -488,8 +500,25 @@ private struct TBDisplaySenderSessionCard: View {
         case .english: return "Telemetry"
         case .german: return "Telemetrie"
         case .french: return "Télémétrie"
-        case .chinese: return "遥测"
+        case .chinese: return "实时性能"
         }
+    }
+
+    private var liveFPSValue: String {
+        let sender = session.liveMetrics.senderFPS
+        let receiver = Int(session.liveMetrics.receiverFPS.rounded())
+        return session.isStreaming
+            ? "\(sender) / \(receiver) FPS"
+            : "—"
+    }
+
+    private var liveBandwidthValue: String {
+        guard session.isStreaming else { return idleSubtitle }
+        return String(
+            format: "%.2f Gbit/s · %@",
+            session.liveMetrics.senderNetworkGbps,
+            liveSubtitle
+        )
     }
 
     private var receiverMetricsLabel: String {
@@ -615,10 +644,11 @@ private struct TBDisplaySenderSessionCard: View {
     private func infoRow(_ label: String, _ value: String) -> some View {
         HStack(alignment: .top, spacing: 14) {
             Text(label)
-                .font(.subheadline.weight(.semibold))
+                .font(.body.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: 138, alignment: .leading)
             Text(value)
+                .font(.body)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -686,6 +716,10 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                 }
 
                 settingsSection(title: outputSettingsTitle) {
+                    settingsSubheading(
+                        displayAndLayoutTitle,
+                        systemImage: "display.2"
+                    )
                     settingRow(TBDisplaySenderL10n.displayProfiles(service.language), details: TBDisplaySenderL10n.displayProfilesHint(service.language)) {
                         HStack(spacing: 8) {
                             ForEach(TBDisplayProfile.allCases) { profile in
@@ -717,6 +751,13 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         .pickerStyle(.menu)
                         .disabled(session.isConnected || session.isStreaming)
                     }
+
+                    Divider()
+                        .padding(.vertical, 6)
+                    settingsSubheading(
+                        streamingAndQualityTitle,
+                        systemImage: "waveform.path"
+                    )
 
                     settingRow(
                         service.language == .chinese ? "视频传输" : "Video transport",
@@ -772,6 +813,12 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                     }
 
                     if service.inputDockstationAvailable {
+                        Divider()
+                            .padding(.vertical, 6)
+                        settingsSubheading(
+                            inputAndControlTitle,
+                            systemImage: "keyboard.badge.ellipsis"
+                        )
                         settingRow(inputDockstationTitle, details: inputDockstationDetails) {
                             Picker(
                                 inputDockstationTitle,
@@ -979,30 +1026,16 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                     }
                 }
             }
-            .padding(24)
-            .padding(.top, 14)
+            .padding(28)
+            .padding(.top, 18)
         }
-        .frame(width: 720, height: 620)
-        .background(
-            LinearGradient(
-                colors: [
-                    Color(red: 0.12, green: 0.13, blue: 0.14),
-                    Color(red: 0.08, green: 0.09, blue: 0.10)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-        )
-        // The panel uses a fixed dark background, so force the dark color scheme:
-        // otherwise in system Light mode the semantic text colors (.primary /
-        // .secondary) resolve to dark variants and render dark-on-dark.
-        .preferredColorScheme(.dark)
+        .frame(width: 840, height: 760)
+        .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
     }
 
     private func settingsSection<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
         SurfaceCard {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 16) {
                 sectionHeading(title)
                 content()
             }
@@ -1010,28 +1043,36 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
     }
 
     private func settingRow<Content: View>(_ label: String, details: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(label)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.body.weight(.semibold))
                 Spacer()
                 content()
-                    .frame(maxWidth: 310, alignment: .trailing)
+                    .frame(maxWidth: 360, alignment: .trailing)
             }
 
             Text(details)
-                .font(.footnote)
+                .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(.vertical, 4)
     }
 
     private func sectionHeading(_ title: String) -> some View {
-        Text(title.uppercased())
-            .font(.system(.caption, design: .rounded, weight: .bold))
-            .tracking(1.0)
+        Text(title)
+            .font(.system(size: 21, weight: .bold, design: .rounded))
+    }
+
+    private func settingsSubheading(
+        _ title: String,
+        systemImage: String
+    ) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: 16, weight: .semibold))
             .foregroundStyle(.secondary)
+            .padding(.top, 2)
     }
 
     @ViewBuilder
@@ -1094,9 +1135,9 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text(service.sessionTitle(for: session))
-                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                        .font(.system(size: 26, weight: .bold, design: .rounded))
                     Text(settingsSubtitle)
-                        .font(.subheadline)
+                        .font(.body)
                         .foregroundStyle(.secondary)
                 }
 
@@ -1118,6 +1159,18 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .french: return "Configurez le transport, la sortie et le diagnostic sans encombrer le tableau de bord principal."
         case .chinese: return "在不干扰主控制面板的情况下配置传输、输出和诊断。"
         }
+    }
+
+    private var displayAndLayoutTitle: String {
+        service.language == .chinese ? "显示与布局" : "Display & layout"
+    }
+
+    private var streamingAndQualityTitle: String {
+        service.language == .chinese ? "传输与画质" : "Streaming & quality"
+    }
+
+    private var inputAndControlTitle: String {
+        service.language == .chinese ? "输入与控制" : "Input & control"
     }
 
     private var connectionSettingsTitle: String {

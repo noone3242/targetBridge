@@ -7,25 +7,20 @@ struct SurfaceCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             content
         }
-        .padding(16)
+        .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.065),
-                            Color.white.opacity(0.03)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+                .fill(Color(nsColor: .controlBackgroundColor))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.09), lineWidth: 1)
+                .strokeBorder(
+                    Color(nsColor: .separatorColor).opacity(0.65),
+                    lineWidth: 1
+                )
         )
+        .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
     }
 }
 
@@ -36,15 +31,18 @@ struct SurfaceSubcard<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             content
         }
-        .padding(14)
+        .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color.white.opacity(0.03))
+                .fill(Color(nsColor: .underPageBackgroundColor))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.07), lineWidth: 1)
+                .strokeBorder(
+                    Color(nsColor: .separatorColor).opacity(0.55),
+                    lineWidth: 1
+                )
         )
     }
 }

@@ -24,6 +24,13 @@ enum TBReceiverStateUpdate: Equatable {
     ]
 }
 
+func tbShouldReleaseSessionOnNetworkWait(
+    isConnected: Bool,
+    transportKind: TBTransportKind
+) -> Bool {
+    isConnected && transportKind == .thunderboltBridge
+}
+
 struct TBSessionLogEntry: Identifiable, Equatable {
     let id: UUID
     let timestamp: String
@@ -3011,6 +3018,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
 @MainActor
 final class TBSessionLiveMetrics: ObservableObject {
     @Published var senderFPS = 0
+    @Published var senderNetworkGbps = 0.0
+    @Published var receiverFPS = 0.0
 }
 
 @MainActor
@@ -3700,6 +3709,18 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     // bare "Connection timed out".
                     self.lastConnectionStateDetail = "waiting(\(error.localizedDescription))"
                     TBLog.connection.warning("connect: waiting — \(error.localizedDescription, privacy: .public)")
+                    if tbShouldReleaseSessionOnNetworkWait(
+                        isConnected: self.isConnected,
+                        transportKind: self.transportKind
+                    ) {
+                        let message =
+                            "Thunderbolt disconnected: \(error.localizedDescription)"
+                        self.recordSessionEvent(message)
+                        self.stop(
+                            resetStatusTo: .connectionFailed(message),
+                            persistArrangement: false
+                        )
+                    }
                 case .failed(let error):
                     self.lastConnectionStateDetail = "failed(\(error.localizedDescription))"
                     let detail = TBConnectionDiagnostics.failureDetail(
@@ -3933,6 +3954,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
         refreshLocalizedText()
         liveMetrics.senderFPS = 0
+        liveMetrics.senderNetworkGbps = 0
+        liveMetrics.receiverFPS = 0
         sentSnapshot = 0
         sentBytesSnapshot = 0
         capturedSnapshot = 0
@@ -4709,6 +4732,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             metrics.renderFailures,
             metrics.keyframeRequests
         )
+        liveMetrics.receiverFPS = metrics.presentFPS ?? metrics.fps
         let event = "Receiver metrics: \(receiverMetricsText)"
         TBLog.connection.info("\(event, privacy: .public)")
         if lastReceiverMetrics == nil ||
@@ -5676,6 +5700,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 let completedHz = Double(sendCompletedFrames) / intervalSeconds
                 let displayedFPS = Int(sentHz.rounded())
                 liveMetrics.senderFPS = displayedFPS
+                liveMetrics.senderNetworkGbps =
+                    bytesPerSecond * 8.0 / 1_000_000_000.0
                 senderFPS = displayedFPS
                 sentSnapshot = total
                 sentBytesSnapshot = totalBytes

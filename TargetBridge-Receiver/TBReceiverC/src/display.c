@@ -418,22 +418,22 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
                                   38.0 * scale,
                                   0.075, 0.09, 0.12, 1.0);
         tb_disp_draw_brand_icon(ctx, icon_x, icon_y, icon_size);
-        tb_disp_draw_text(ctx, "TargetBridge", title_font, 42.0 * scale,
+        tb_disp_draw_text(ctx, "TargetBridge", title_font, 48.0 * scale,
                           center_x - 156.0 * scale, icon_y + icon_size + 74.0 * scale,
                           0.95, 0.98, 0.97);
-        tb_disp_draw_text(ctx, "RECEIVER", mono_bold_font, 15.0 * scale,
+        tb_disp_draw_text(ctx, "RECEIVER", mono_bold_font, 18.0 * scale,
                           center_x - 48.0 * scale, icon_y + icon_size + 104.0 * scale,
                           0.40, 0.90, 0.59);
-        tb_disp_draw_text(ctx, tb_i18n_get("receiver.splash.connecting"), body_font, 23.0 * scale,
+        tb_disp_draw_text(ctx, tb_i18n_get("receiver.splash.connecting"), body_font, 28.0 * scale,
                           center_x - 158.0 * scale, icon_y + icon_size + 166.0 * scale,
                           0.93, 0.95, 0.99);
-        tb_disp_draw_text(ctx, tb_i18n_get("receiver.splash.waiting_first_frame"), body_font, 17.0 * scale,
+        tb_disp_draw_text(ctx, tb_i18n_get("receiver.splash.waiting_first_frame"), body_font, 21.0 * scale,
                           center_x - 178.0 * scale, icon_y + icon_size + 202.0 * scale,
                           0.62, 0.68, 0.77);
-        tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_font, 13.0 * scale,
+        tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_font, 15.0 * scale,
                           center_x - 26.0 * scale, icon_y + icon_size + 310.0 * scale,
                           0.40, 0.45, 0.53);
-        tb_disp_draw_text(ctx, "commit " TB_RECEIVER_COMMIT, mono_font, 11.0 * scale,
+        tb_disp_draw_text(ctx, "commit " TB_RECEIVER_COMMIT, mono_font, 13.0 * scale,
                           center_x - 48.0 * scale, icon_y + icon_size + 334.0 * scale,
                           0.40, 0.45, 0.53);
     } else {
@@ -448,13 +448,13 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
     const CGFloat card_gap = 28.0;
     const CGFloat card_w = (outer_w - card_gap) / 2.0;
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.title"), title_font, 28, 72, (CGFloat)drawable_h - 84, 0.95, 0.97, 1.0);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.subtitle"), body_font, 17, 72, (CGFloat)drawable_h - 118, 0.72, 0.76, 0.84);
-    tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_bold_font, 17, (CGFloat)drawable_w - 220, (CGFloat)drawable_h - 82, 0.64, 0.69, 0.78);
-    tb_disp_draw_text(ctx, TB_RECEIVER_BUILD, mono_font, 13, (CGFloat)drawable_w - 220, (CGFloat)drawable_h - 114, 0.53, 0.57, 0.66);
-    tb_disp_draw_text(ctx, "commit " TB_RECEIVER_COMMIT, mono_font, 13, (CGFloat)drawable_w - 220, (CGFloat)drawable_h - 138, 0.53, 0.57, 0.66);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.title"), title_font, 34, 72, (CGFloat)drawable_h - 84, 0.95, 0.97, 1.0);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.subtitle"), body_font, 20, 72, (CGFloat)drawable_h - 122, 0.72, 0.76, 0.84);
+    tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_bold_font, 19, (CGFloat)drawable_w - 250, (CGFloat)drawable_h - 82, 0.64, 0.69, 0.78);
+    tb_disp_draw_text(ctx, TB_RECEIVER_BUILD, mono_font, 15, (CGFloat)drawable_w - 250, (CGFloat)drawable_h - 116, 0.53, 0.57, 0.66);
+    tb_disp_draw_text(ctx, "commit " TB_RECEIVER_COMMIT, mono_font, 15, (CGFloat)drawable_w - 250, (CGFloat)drawable_h - 142, 0.53, 0.57, 0.66);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 15, outer_x, top_y, 0.54, 0.62, 0.76);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 17, outer_x, top_y, 0.54, 0.62, 0.76);
     tb_disp_draw_text(ctx, ip, mono_bold_font, 34, outer_x, top_y - 42.0, 0.43, 0.93, 0.60);
 
     const CGFloat info_top = top_y - 126.0;
@@ -462,30 +462,30 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
     tb_disp_fill_rect(ctx, outer_x, info_top - info_h, card_w, info_h, 0.14, 0.15, 0.19, 1.0);
     tb_disp_fill_rect(ctx, outer_x + card_w + card_gap, info_top - info_h, card_w, info_h, 0.14, 0.15, 0.19, 1.0);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.status"), section_font, 15, outer_x + 20.0, info_top - 34.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, status, body_font, 22, outer_x + 20.0, info_top - 68.0, 0.94, 0.96, 0.99);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.sender"), section_font, 14, outer_x + 20.0, info_top - 118.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, sender, body_font, 20, outer_x + 20.0, info_top - 148.0, 0.94, 0.96, 0.99);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.status"), section_font, 17, outer_x + 20.0, info_top - 34.0, 0.54, 0.62, 0.76);
+    tb_disp_draw_text(ctx, status, body_font, 26, outer_x + 20.0, info_top - 72.0, 0.94, 0.96, 0.99);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.sender"), section_font, 16, outer_x + 20.0, info_top - 120.0, 0.54, 0.62, 0.76);
+    tb_disp_draw_text(ctx, sender, body_font, 23, outer_x + 20.0, info_top - 152.0, 0.94, 0.96, 0.99);
 
     const CGFloat display_x = outer_x + card_w + card_gap + 20.0;
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.display"), section_font, 15, display_x, info_top - 34.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, panel, zh ? body_font : mono_font, 20, display_x, info_top - 68.0, 0.94, 0.96, 0.99);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.stream_profile"), section_font, 14, display_x, info_top - 118.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, mode, zh ? body_font : mono_font, 20, display_x, info_top - 148.0, 0.94, 0.96, 0.99);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.display"), section_font, 17, display_x, info_top - 34.0, 0.54, 0.62, 0.76);
+    tb_disp_draw_text(ctx, panel, zh ? body_font : mono_font, 23, display_x, info_top - 72.0, 0.94, 0.96, 0.99);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.stream_profile"), section_font, 16, display_x, info_top - 120.0, 0.54, 0.62, 0.76);
+    tb_disp_draw_text(ctx, mode, zh ? body_font : mono_font, 23, display_x, info_top - 152.0, 0.94, 0.96, 0.99);
 
     const CGFloat footer_top = info_top - info_h - 28.0;
     const CGFloat footer_h = 150.0;
     tb_disp_fill_rect(ctx, outer_x, footer_top - footer_h, outer_w, footer_h, 0.14, 0.15, 0.19, 1.0);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.language"), section_font, 15, outer_x + 20.0, footer_top - 32.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, language, body_font, 20, outer_x + 20.0, footer_top - 64.0, 0.94, 0.96, 0.99);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.language"), section_font, 17, outer_x + 20.0, footer_top - 32.0, 0.54, 0.62, 0.76);
+    tb_disp_draw_text(ctx, language, body_font, 23, outer_x + 20.0, footer_top - 68.0, 0.94, 0.96, 0.99);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.permissions"), section_font, 15, outer_x + 20.0, footer_top - 102.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, permissions, body_font, 20, outer_x + 20.0, footer_top - 134.0, 0.94, 0.96, 0.99);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.permissions"), section_font, 17, outer_x + 20.0, footer_top - 104.0, 0.54, 0.62, 0.76);
+    tb_disp_draw_text(ctx, permissions, body_font, 23, outer_x + 20.0, footer_top - 138.0, 0.94, 0.96, 0.99);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_1"), body_font, 17, 72, 138, 0.76, 0.80, 0.88);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_2"), body_font, 17, 72, 108, 0.76, 0.80, 0.88);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_4"), body_font, 17, 72, 78, 0.76, 0.80, 0.88);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_1"), body_font, 19, 72, 142, 0.76, 0.80, 0.88);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_2"), body_font, 19, 72, 108, 0.76, 0.80, 0.88);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_4"), body_font, 19, 72, 74, 0.76, 0.80, 0.88);
     }
 
     CGContextRelease(ctx);
