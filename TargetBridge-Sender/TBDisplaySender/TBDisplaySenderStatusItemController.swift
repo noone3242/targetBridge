@@ -7,6 +7,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
     nonisolated(unsafe) private var statusItem: NSStatusItem?
     private var cancellables = Set<AnyCancellable>()
     private var hasActivated = false
+    nonisolated(unsafe) private var statsTimer: Timer?
 
     init(service: TBDisplaySenderService) {
         self.service = service
@@ -16,6 +17,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
     }
 
     deinit {
+        statsTimer?.invalidate()
         let item = statusItem
         DispatchQueue.main.async { [item] in
             if let item {
@@ -51,6 +53,15 @@ final class TBDisplaySenderStatusItemController: NSObject {
         guard !hasActivated else { return }
         hasActivated = true
         syncVisibility()
+        statsTimer = Timer.scheduledTimer(
+            withTimeInterval: 1,
+            repeats: true
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshStatusItem()
+            }
+        }
+        RunLoop.main.add(statsTimer!, forMode: .common)
     }
 
     private func syncVisibility() {
