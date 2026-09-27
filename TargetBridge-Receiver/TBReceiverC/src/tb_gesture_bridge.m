@@ -69,8 +69,12 @@ static void tb_draw_symbol(NSString *name, NSRect rect, NSColor *color, CGFloat 
     NSImageSymbolConfiguration *configuration =
         [NSImageSymbolConfiguration configurationWithPointSize:point_size
                                                         weight:NSFontWeightSemibold];
+    if (@available(macOS 12.0, *)) {
+        NSImageSymbolConfiguration *palette =
+            [NSImageSymbolConfiguration configurationWithPaletteColors:@[color]];
+        configuration = [configuration configurationByApplyingConfiguration:palette];
+    }
     image = [image imageWithSymbolConfiguration:configuration];
-    [color set];
     [image drawInRect:rect
              fromRect:NSZeroRect
             operation:NSCompositingOperationSourceOver
@@ -80,7 +84,16 @@ static void tb_draw_symbol(NSString *name, NSRect rect, NSColor *color, CGFloat 
 }
 
 static void tb_draw_brand_icon(NSRect rect) {
-    tb_draw_rounded_fill(rect, 16.0, tb_rgb(0.82, 0.95, 0.89));
+    NSBezierPath *shape = [NSBezierPath bezierPathWithRoundedRect:rect xRadius:16.0 yRadius:16.0];
+    [NSColor.whiteColor setFill];
+    [shape fill];
+    [NSGraphicsContext saveGraphicsState];
+    [shape addClip];
+    NSGradient *gradient = [[NSGradient alloc]
+        initWithStartingColor:[NSColor.systemGreenColor colorWithAlphaComponent:0.28]
+                  endingColor:[tb_rgb(0.22, 0.78, 0.86) colorWithAlphaComponent:0.12]];
+    [gradient drawInRect:rect angle:-45.0];
+    [NSGraphicsContext restoreGraphicsState];
     tb_draw_symbol(@"display.2", NSInsetRect(rect, 12.0, 12.0), NSColor.whiteColor, 22.0);
 }
 
@@ -208,9 +221,9 @@ static NSString *tb_string(const char *value) {
     tb_draw_card(statusCard);
     tb_draw_card(displayCard);
 
-    tb_draw_symbol(@"dot.radiowaves.left.and.right",
+    tb_draw_symbol(@"cable.connector",
                    NSMakeRect(NSMinX(statusCard) + 18.0, NSMinY(statusCard) + 18.0, 19.0, 19.0),
-                   tb_rgb(0.42, 0.44, 0.49), 14.0);
+                   tb_rgb(0.42, 0.44, 0.49), 17.0);
     tb_draw_text(tb_string(tb_i18n_get("receiver.ui.status")),
                  NSMakeRect(NSMinX(statusCard) + 46.0, NSMinY(statusCard) + 17.0, 120.0, 20.0),
                  tb_system_font(12.0, NSFontWeightSemibold),
@@ -246,10 +259,13 @@ static NSString *tb_string(const char *value) {
                  tb_rgb(0.12, 0.13, 0.15),
                  NSTextAlignmentLeft);
     tb_draw_text(tb_string(tb_i18n_get("receiver.ui.stream_profile")),
-                 NSMakeRect(NSMinX(displayCard) + 18.0, NSMinY(displayCard) + 78.0, 120.0, 20.0),
+                 NSMakeRect(NSMinX(displayCard) + 46.0, NSMinY(displayCard) + 78.0, 120.0, 20.0),
                  tb_system_font(12.0, NSFontWeightSemibold),
                  tb_rgb(0.42, 0.44, 0.49),
                  NSTextAlignmentLeft);
+    tb_draw_symbol(@"rectangle.on.rectangle",
+                   NSMakeRect(NSMinX(displayCard) + 18.0, NSMinY(displayCard) + 79.0, 20.0, 20.0),
+                   tb_rgb(0.42, 0.44, 0.49), 17.0);
     tb_draw_text(self.modeText,
                  NSMakeRect(NSMinX(displayCard) + 18.0, NSMinY(displayCard) + 102.0, cardWidth - 36.0, 23.0),
                  tb_system_font(15.0, NSFontWeightRegular),
@@ -258,16 +274,13 @@ static NSString *tb_string(const char *value) {
 
     NSRect permission = NSMakeRect(x, top + 328.0, contentWidth, 88.0);
     tb_draw_card(permission);
-    tb_draw_symbol(@"lock.shield",
-                   NSMakeRect(x + 18.0, top + 349.0, 20.0, 20.0),
-                   tb_rgb(0.42, 0.44, 0.49), 15.0);
     tb_draw_text(tb_string(tb_i18n_get("receiver.ui.permissions")),
-                 NSMakeRect(x + 46.0, top + 344.0, 100.0, 20.0),
+                 NSMakeRect(x + 18.0, top + 344.0, 100.0, 20.0),
                  tb_system_font(12.0, NSFontWeightSemibold),
                  tb_rgb(0.42, 0.44, 0.49),
                  NSTextAlignmentLeft);
     tb_draw_text(self.permissionsText,
-                 NSMakeRect(x + 46.0, top + 372.0, contentWidth - 300.0, 24.0),
+                 NSMakeRect(x + 18.0, top + 372.0, contentWidth - 270.0, 24.0),
                  tb_system_font(16.0, NSFontWeightRegular),
                  tb_rgb(0.12, 0.13, 0.15),
                  NSTextAlignmentLeft);
@@ -284,21 +297,18 @@ static NSString *tb_string(const char *value) {
 
     NSRect help = NSMakeRect(x, top + 430.0, contentWidth, 74.0);
     tb_draw_card(help);
-    tb_draw_symbol(@"info.circle",
-                   NSMakeRect(x + 18.0, top + 449.0, 20.0, 20.0),
-                   tb_rgb(0.42, 0.44, 0.49), 15.0);
     tb_draw_text(tb_string(tb_i18n_get("receiver.ui.help_1")),
-                 NSMakeRect(x + 48.0, top + 440.0, contentWidth - 66.0, 20.0),
+                 NSMakeRect(x + 18.0, top + 440.0, contentWidth - 36.0, 20.0),
                  tb_system_font(13.0, NSFontWeightRegular),
                  tb_rgb(0.34, 0.36, 0.41),
                  NSTextAlignmentLeft);
     tb_draw_text(tb_string(tb_i18n_get("receiver.ui.help_2")),
-                 NSMakeRect(x + 48.0, top + 461.0, contentWidth - 66.0, 20.0),
+                 NSMakeRect(x + 18.0, top + 461.0, contentWidth - 36.0, 20.0),
                  tb_system_font(13.0, NSFontWeightRegular),
                  tb_rgb(0.34, 0.36, 0.41),
                  NSTextAlignmentLeft);
     tb_draw_text(tb_string(tb_i18n_get("receiver.ui.help_4")),
-                 NSMakeRect(x + 48.0, top + 482.0, contentWidth - 66.0, 20.0),
+                 NSMakeRect(x + 18.0, top + 482.0, contentWidth - 36.0, 20.0),
                  tb_system_font(13.0, NSFontWeightRegular),
                  tb_rgb(0.34, 0.36, 0.41),
                  NSTextAlignmentLeft);
