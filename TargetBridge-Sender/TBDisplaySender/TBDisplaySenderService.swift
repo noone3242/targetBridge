@@ -4241,7 +4241,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             (metrics.rawBlockBytes ?? 0) > 0
                 ? Double(metrics.compressedBlockBytes ?? 0) /
                     Double(metrics.rawBlockBytes ?? 1)
-                : 1,
+                : 1.0,
             metrics.decompressionP95Ms ?? 0,
             metrics.packetIntervalP95Ms ?? 0,
             metrics.applyP95Ms ?? 0,

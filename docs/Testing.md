@@ -159,29 +159,16 @@ LZFSE supercompression activates only when the Receiver also advertises
 
 ### Sender signing and Screen Recording
 
-`scripts/build_targetbridge_sender_app.sh` now requires a stable code-signing
-identity by default. It auto-selects the first valid identity reported by:
+`scripts/build_targetbridge_sender_app.sh` uses ad-hoc signing. A rebuild changes
+the app's CDHash, so the script automatically runs:
 
 ```bash
-security find-identity -v -p codesigning
+tccutil reset ScreenCapture com.targetbridge.sender
 ```
 
-To select one explicitly:
-
-```bash
-TARGETBRIDGE_SIGNING_IDENTITY="Apple Development: Name (TEAMID)" \
-  ./scripts/build_targetbridge_sender_app.sh
-```
-
-When no identity is installed, an ad-hoc build must be explicitly requested:
-
-```bash
-ALLOW_ADHOC=1 ./scripts/build_targetbridge_sender_app.sh
-```
-
-Ad-hoc signing changes the app's CDHash after a rebuild and may invalidate the
-existing Screen Recording authorization. The build records the selected mode,
-identity, Team ID, and reset command in:
+After opening the new build, click Connect and grant Screen Recording. If macOS
+requests an app restart, reopen TargetBridge once. The build records the signing
+mode and reset status in:
 
 ```text
 build/TargetBridge.app.signing.txt
