@@ -1,6 +1,20 @@
 import AppKit
 import Combine
 
+func tbMenuBarByteRateText(gigabitsPerSecond: Double) -> String {
+    let bytesPerSecond = max(0, gigabitsPerSecond) * 1_000_000_000 / 8
+    if bytesPerSecond >= 1_000_000_000 {
+        return "\(Int((bytesPerSecond / 1_000_000_000).rounded())) GB/s"
+    }
+    if bytesPerSecond >= 1_000_000 {
+        return "\(Int((bytesPerSecond / 1_000_000).rounded())) MB/s"
+    }
+    if bytesPerSecond >= 1_000 {
+        return "\(Int((bytesPerSecond / 1_000).rounded())) KB/s"
+    }
+    return "\(Int(bytesPerSecond.rounded())) B/s"
+}
+
 @MainActor
 final class TBDisplaySenderStatusItemController: NSObject {
     private let service: TBDisplaySenderService
@@ -109,20 +123,61 @@ final class TBDisplaySenderStatusItemController: NSObject {
                 Int(session.liveMetrics.receiverFPS.rounded())
             )
             let bandwidth = session.liveMetrics.senderNetworkGbps
-            let text = String(format: " %d fps  %.2fG", fps, bandwidth)
-            button.attributedTitle = NSAttributedString(
-                string: text,
-                attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(
-                        ofSize: 10,
-                        weight: .medium
-                    ),
-                    .foregroundColor: NSColor.labelColor
-                ]
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .left
+            paragraph.lineSpacing = -2
+            paragraph.minimumLineHeight = 8
+            paragraph.maximumLineHeight = 9
+            let font = NSFont.monospacedDigitSystemFont(
+                ofSize: 9,
+                weight: .medium
             )
-            button.imagePosition = .imageLeading
+            let title = NSMutableAttributedString()
+            title.append(NSAttributedString(
+                string: "● ",
+                attributes: [
+                    .font: font,
+                    .foregroundColor: NSColor.systemGreen,
+                    .paragraphStyle: paragraph
+                ]
+            ))
+            title.append(NSAttributedString(
+                string: "\(fps) FPS\n",
+                attributes: [
+                    .font: font,
+                    .foregroundColor: NSColor.labelColor,
+                    .paragraphStyle: paragraph
+                ]
+            ))
+            title.append(NSAttributedString(
+                string: "● ",
+                attributes: [
+                    .font: font,
+                    .foregroundColor: NSColor.systemBlue,
+                    .paragraphStyle: paragraph
+                ]
+            ))
+            title.append(NSAttributedString(
+                string: tbMenuBarByteRateText(
+                    gigabitsPerSecond: bandwidth
+                ),
+                attributes: [
+                    .font: font,
+                    .foregroundColor: NSColor.labelColor,
+                    .paragraphStyle: paragraph
+                ]
+            ))
+            button.attributedTitle = title
+            button.toolTip =
+                "TargetBridge\nFrame rate: \(fps) FPS\n" +
+                "Thunderbolt throughput: " +
+                tbMenuBarByteRateText(gigabitsPerSecond: bandwidth)
+            button.cell?.usesSingleLineMode = false
+            button.cell?.lineBreakMode = .byClipping
+            button.imagePosition = .noImage
         } else {
             button.attributedTitle = NSAttributedString(string: "")
+            button.cell?.usesSingleLineMode = true
             button.imagePosition = .imageOnly
         }
     }

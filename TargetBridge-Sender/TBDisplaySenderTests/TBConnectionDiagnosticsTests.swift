@@ -131,6 +131,29 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
         )
     }
 
+    func testMenuBarBandwidthUsesAdaptiveByteUnitsWithoutDecimals() {
+        XCTAssertEqual(
+            tbMenuBarByteRateText(gigabitsPerSecond: 0),
+            "0 B/s"
+        )
+        XCTAssertEqual(
+            tbMenuBarByteRateText(gigabitsPerSecond: 0.000_008),
+            "1 KB/s"
+        )
+        XCTAssertEqual(
+            tbMenuBarByteRateText(gigabitsPerSecond: 0.008),
+            "1 MB/s"
+        )
+        XCTAssertEqual(
+            tbMenuBarByteRateText(gigabitsPerSecond: 8),
+            "1 GB/s"
+        )
+        XCTAssertEqual(
+            tbMenuBarByteRateText(gigabitsPerSecond: 0.812),
+            "102 MB/s"
+        )
+    }
+
     // MARK: - currentIPv4Interfaces (live snapshot; environment-tolerant)
 
     func testCurrentIPv4InterfacesExcludesLoopbackAndHasNames() {
