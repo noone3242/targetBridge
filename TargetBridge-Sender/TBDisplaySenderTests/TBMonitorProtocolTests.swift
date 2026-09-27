@@ -328,6 +328,43 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(runs[0].tileX, 1)
     }
 
+    func testBC7DeltaPlannerUsesMetalTileAnalysis() throws {
+        let width = 128
+        let height = 64
+        let bytesPerRow = 512
+        let planner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        let initial = Data(repeating: 0, count: bytesPerRow * (height / 4))
+        _ = planner.plan(
+            current: initial,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            analyzedDirtyTiles: [0, 1],
+            analyzedChecksums: [10, 20]
+        )
+
+        var changed = initial
+        changed[256] = 1
+        guard case .delta(_, _, let checksum, let runs, let dirtyTiles, _) =
+            try XCTUnwrap(planner.plan(
+                current: changed,
+                width: width,
+                height: height,
+                bytesPerRow: bytesPerRow,
+                candidateDirtyTiles: [],
+                analyzedDirtyTiles: [1],
+                analyzedChecksums: [10, 30]
+            )) else {
+            return XCTFail("Metal-analyzed frame must remain a delta")
+        }
+
+        XCTAssertEqual(checksum, 10 ^ 30)
+        XCTAssertEqual(dirtyTiles, 1)
+        XCTAssertEqual(runs, [
+            TBBC7DeltaRun(tileX: 1, tileY: 0, tileCountX: 1, pixelHeight: 64)
+        ])
+    }
+
     func testBC7RecoveryRequiresAFullFrame() throws {
         let planner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
         XCTAssertTrue(planner.requiresFullFrame)
@@ -425,6 +462,55 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(dirty, 2)
         XCTAssertEqual(runs.count, 1)
         XCTAssertEqual(runs[0].tileCountX, 2)
+    }
+
+    func testBC7DeltaPacketWritesRunsDirectlyFromFrameBuffer() throws {
+        let width = 192
+        let height = 64
+        let bytesPerRow = 768
+        let current = Data((0..<(bytesPerRow * 16)).map {
+            UInt8(truncatingIfNeeded: $0 &+ ($0 / 256) &* 17)
+        })
+        let runs = [
+            TBBC7DeltaRun(tileX: 1, tileY: 0, tileCountX: 2, pixelHeight: 64)
+        ]
+
+        let packet = try XCTUnwrap(tbMakeBC7DeltaPacket(
+            current: current,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            sequence: 9,
+            baseSequence: 8,
+            checksum: 0x1122_3344_5566_7788,
+            runs: runs
+        ))
+
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 0), UInt32(packet.count - 4))
+        XCTAssertEqual(packet[4], TBMonitorPacketType.bc7TileDelta.rawValue)
+        XCTAssertEqual(packet[5], 1)
+        XCTAssertEqual(TBMonitorProtocol.readBE64(packet, offset: 6), 9)
+        XCTAssertEqual(TBMonitorProtocol.readBE64(packet, offset: 14), 8)
+        XCTAssertEqual(
+            TBMonitorProtocol.readBE64(packet, offset: 22),
+            0x1122_3344_5566_7788
+        )
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 30), UInt32(width))
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 34), UInt32(height))
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 38), 64)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 40), 1)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 42), 1)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 44), 0)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 46), 2)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 48), 64)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 50), 8192)
+
+        var expected = Data(capacity: 8192)
+        for row in 0..<16 {
+            let start = row * bytesPerRow + 256
+            expected.append(current[start..<(start + 512)])
+        }
+        XCTAssertEqual(packet.subdata(in: 54..<packet.count), expected)
     }
 
     func testNative5KRequiresNativeSourceFramebuffer() {
@@ -588,9 +674,81 @@ final class TBMonitorProtocolTests: XCTestCase {
         ))
 
         XCTAssertEqual(second.candidateDirtyTiles, Set([1]))
+        XCTAssertEqual(try XCTUnwrap(second.tileAnalysis).dirtyTiles, Set([1]))
+        XCTAssertEqual(try XCTUnwrap(second.tileAnalysis).checksums.count, 2)
         XCTAssertEqual(first.data.subdata(in: 0..<16), second.data.subdata(in: 0..<16))
         XCTAssertNotEqual(first.data.subdata(in: 256..<272), second.data.subdata(in: 256..<272))
         XCTAssertNil(encoder.encode(pixelBuffer: updated, dirtyRects: []))
+    }
+
+    func testMetalTileAnalysisMatchesCPUPlannerChecksum() throws {
+        let width = 128
+        let height = 64
+        let pixelBuffer = try makeBGRAPixelBuffer(width: width, height: height) { x, y in
+            let value = UInt8(truncatingIfNeeded: x &* 17 &+ y &* 29)
+            return (value, 255 &- value, value / 2, 255)
+        }
+        let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+        let encoded = try XCTUnwrap(encoder.encode(pixelBuffer: pixelBuffer))
+        let analysis = try XCTUnwrap(encoded.tileAnalysis)
+
+        let cpuPlanner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        let gpuPlanner = TBBC7DeltaPlanner(keyframeIntervalFrames: 120)
+        guard case .keyframe(_, let cpuChecksum, _) = try XCTUnwrap(cpuPlanner.plan(
+            current: encoded.data,
+            width: width,
+            height: height,
+            bytesPerRow: encoded.bytesPerRow
+        )), case .keyframe(_, let gpuChecksum, _) = try XCTUnwrap(gpuPlanner.plan(
+            current: encoded.data,
+            width: width,
+            height: height,
+            bytesPerRow: encoded.bytesPerRow,
+            candidateDirtyTiles: encoded.candidateDirtyTiles,
+            analyzedDirtyTiles: analysis.dirtyTiles,
+            analyzedChecksums: analysis.checksums
+        )) else {
+            return XCTFail("first analyzed frame must be a keyframe")
+        }
+        XCTAssertEqual(gpuChecksum, cpuChecksum)
+
+        let updatedPixelBuffer = try makeBGRAPixelBuffer(
+            width: width,
+            height: height
+        ) { x, y in
+            if x >= 64 {
+                return (UInt8(20), UInt8(40), UInt8(220), UInt8(255))
+            }
+            let value = UInt8(truncatingIfNeeded: x &* 17 &+ y &* 29)
+            return (value, 255 &- value, value / 2, 255)
+        }
+        let updated = try XCTUnwrap(encoder.encode(
+            pixelBuffer: updatedPixelBuffer,
+            dirtyRects: [CGRect(x: 64, y: 0, width: 64, height: 64)]
+        ))
+        let updatedAnalysis = try XCTUnwrap(updated.tileAnalysis)
+        guard case .delta(_, _, let cpuDeltaChecksum, let cpuRuns, _, _) =
+            try XCTUnwrap(cpuPlanner.plan(
+                current: updated.data,
+                width: width,
+                height: height,
+                bytesPerRow: updated.bytesPerRow,
+                candidateDirtyTiles: updated.candidateDirtyTiles
+            )), case .delta(_, _, let gpuDeltaChecksum, let gpuRuns, _, _) =
+            try XCTUnwrap(gpuPlanner.plan(
+                current: updated.data,
+                width: width,
+                height: height,
+                bytesPerRow: updated.bytesPerRow,
+                candidateDirtyTiles: updated.candidateDirtyTiles,
+                analyzedDirtyTiles: updatedAnalysis.dirtyTiles,
+                analyzedChecksums: updatedAnalysis.checksums
+            )) else {
+            return XCTFail("updated analyzed frame must remain a delta")
+        }
+        XCTAssertEqual(updatedAnalysis.dirtyTiles, Set([1]))
+        XCTAssertEqual(gpuDeltaChecksum, cpuDeltaChecksum)
+        XCTAssertEqual(gpuRuns, cpuRuns)
     }
 
     func testMetalBC7Mode6EncoderRejectsUnsupportedPixelBuffers() throws {

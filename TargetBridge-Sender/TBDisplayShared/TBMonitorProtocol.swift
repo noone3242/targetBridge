@@ -63,7 +63,7 @@ struct TBMonitorCreateSessionAck: Codable {
     var displayID: UInt32
 }
 
-struct TBMonitorReceiverMetrics: Codable {
+struct TBMonitorReceiverMetrics: Codable, Equatable {
     var fps: Double
     var networkGbps: Double
     var packets: UInt64
@@ -235,6 +235,13 @@ enum TBMonitorProtocol {
     static func readBE32(_ data: Data, offset: Int) -> UInt32 {
         data.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
             $0.load(as: UInt32.self).bigEndian
+        }
+    }
+
+    static func readBE16(_ data: Data, offset: Int) -> UInt16 {
+        guard offset >= 0, data.count >= offset + 2 else { return 0 }
+        return data[offset..<(offset + 2)].reduce(UInt16(0)) {
+            ($0 << 8) | UInt16($1)
         }
     }
 
