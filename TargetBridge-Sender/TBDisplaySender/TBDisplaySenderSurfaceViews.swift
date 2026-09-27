@@ -7,7 +7,7 @@ struct SurfaceCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             content
         }
-        .padding(20)
+        .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -20,7 +20,7 @@ struct SurfaceCard<Content: View>: View {
                     lineWidth: 1
                 )
         )
-        .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
+        .shadow(color: .black.opacity(0.045), radius: 5, y: 2)
     }
 }
 
@@ -31,11 +31,11 @@ struct SurfaceSubcard<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             content
         }
-        .padding(16)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color(nsColor: .underPageBackgroundColor))
+                .fill(Color(nsColor: .textBackgroundColor))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)

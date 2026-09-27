@@ -454,13 +454,22 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
     tb_disp_draw_text(ctx, TB_RECEIVER_BUILD, mono_font, 15, (CGFloat)drawable_w - 250, (CGFloat)drawable_h - 116, 0.53, 0.57, 0.66);
     tb_disp_draw_text(ctx, "commit " TB_RECEIVER_COMMIT, mono_font, 15, (CGFloat)drawable_w - 250, (CGFloat)drawable_h - 142, 0.53, 0.57, 0.66);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 17, outer_x, top_y, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, ip, mono_bold_font, 34, outer_x, top_y - 42.0, 0.43, 0.93, 0.60);
+    tb_disp_fill_rounded_rect(
+        ctx,
+        outer_x,
+        top_y - 88.0,
+        outer_w,
+        102.0,
+        22.0,
+        0.10, 0.13, 0.16, 1.0
+    );
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 17, outer_x + 22.0, top_y - 20.0, 0.54, 0.62, 0.76);
+    tb_disp_draw_text(ctx, ip, mono_bold_font, 34, outer_x + 22.0, top_y - 63.0, 0.43, 0.93, 0.60);
 
     const CGFloat info_top = top_y - 126.0;
     const CGFloat info_h = 194.0;
-    tb_disp_fill_rect(ctx, outer_x, info_top - info_h, card_w, info_h, 0.14, 0.15, 0.19, 1.0);
-    tb_disp_fill_rect(ctx, outer_x + card_w + card_gap, info_top - info_h, card_w, info_h, 0.14, 0.15, 0.19, 1.0);
+    tb_disp_fill_rounded_rect(ctx, outer_x, info_top - info_h, card_w, info_h, 20.0, 0.14, 0.15, 0.19, 1.0);
+    tb_disp_fill_rounded_rect(ctx, outer_x + card_w + card_gap, info_top - info_h, card_w, info_h, 20.0, 0.14, 0.15, 0.19, 1.0);
 
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.status"), section_font, 17, outer_x + 20.0, info_top - 34.0, 0.54, 0.62, 0.76);
     tb_disp_draw_text(ctx, status, body_font, 26, outer_x + 20.0, info_top - 72.0, 0.94, 0.96, 0.99);
@@ -475,7 +484,7 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
 
     const CGFloat footer_top = info_top - info_h - 28.0;
     const CGFloat footer_h = 150.0;
-    tb_disp_fill_rect(ctx, outer_x, footer_top - footer_h, outer_w, footer_h, 0.14, 0.15, 0.19, 1.0);
+    tb_disp_fill_rounded_rect(ctx, outer_x, footer_top - footer_h, outer_w, footer_h, 20.0, 0.14, 0.15, 0.19, 1.0);
 
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.language"), section_font, 17, outer_x + 20.0, footer_top - 32.0, 0.54, 0.62, 0.76);
     tb_disp_draw_text(ctx, language, body_font, 23, outer_x + 20.0, footer_top - 68.0, 0.94, 0.96, 0.99);

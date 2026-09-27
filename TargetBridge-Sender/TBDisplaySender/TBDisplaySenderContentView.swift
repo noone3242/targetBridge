@@ -6,7 +6,7 @@ struct TBDisplaySenderContentView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: 18) {
                 headerCard
                 controlDeck
 
@@ -21,7 +21,7 @@ struct TBDisplaySenderContentView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(28)
+            .padding(20)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -48,7 +48,7 @@ struct TBDisplaySenderContentView: View {
 
     private var headerCard: some View {
         SurfaceCard {
-            HStack(alignment: .top, spacing: 16) {
+            HStack(alignment: .center, spacing: 14) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(
@@ -62,30 +62,27 @@ struct TBDisplaySenderContentView: View {
                             )
                         )
                     Image(systemName: "display.2")
-                        .font(.system(size: 24, weight: .semibold))
+                        .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.92))
                 }
-                .frame(width: 58, height: 58)
+                .frame(width: 48, height: 48)
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text(TBDisplaySenderL10n.appName(service.language))
-                        .font(.system(size: 31, weight: .bold, design: .rounded))
+                        .font(.system(size: 25, weight: .bold, design: .rounded))
                     Text(TBDisplaySenderL10n.appSubtitle(service.language))
-                        .font(.body)
+                        .font(.callout)
                         .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
 
                 Spacer(minLength: 16)
 
-                VStack(alignment: .trailing, spacing: 8) {
+                VStack(alignment: .trailing, spacing: 6) {
                     statusChip(
                         service.summaryStatusText(),
                         tint: service.anyStreaming ? .green : .secondary
                     )
-                    Text(service.localInterfaceSummaryText)
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.trailing)
                 }
             }
         }
@@ -93,9 +90,9 @@ struct TBDisplaySenderContentView: View {
 
     private var controlDeck: some View {
         SurfaceCard {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 3) {
                         sectionHeading(TBDisplaySenderL10n.connectionGroup(service.language))
                         Text(TBDisplaySenderL10n.multiSessionHint(service.language))
                             .font(.callout)
@@ -104,37 +101,36 @@ struct TBDisplaySenderContentView: View {
 
                     Spacer()
 
-                    HStack(spacing: 10) {
+                    HStack(spacing: 8) {
                         Button(TBDisplaySenderL10n.addSessionButton(service.language)) {
                             service.addSession()
                         }
                         .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
+                        .controlSize(.regular)
 
                         Button(TBDisplaySenderL10n.refreshIPButton(service.language)) {
                             service.refreshLocalInterfaces()
                         }
                         .buttonStyle(.bordered)
-                        .controlSize(.large)
+                        .controlSize(.regular)
 
                         Button(TBDisplaySenderL10n.stopAllButton(service.language)) {
                             service.stopAll()
                         }
                         .buttonStyle(.bordered)
-                        .controlSize(.large)
+                        .controlSize(.regular)
                         .disabled(!service.anyConnected)
                     }
                 }
 
-                SurfaceSubcard {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(TBDisplaySenderL10n.availableLocalInterfaces(service.language))
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        Text(service.localInterfaceSummaryText)
-                            .font(.system(.body, design: .monospaced))
-                            .textSelection(.enabled)
-                    }
+                Divider()
+                Label {
+                    Text(service.localInterfaceSummaryText)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                } icon: {
+                    Image(systemName: "network")
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -188,11 +184,6 @@ private struct TBDisplaySenderSessionCard: View {
     @State private var showingSessionSettings = false
     @State private var showingDiagnostics = false
 
-    private let summaryColumns = [
-        GridItem(.flexible(minimum: 240), spacing: 14),
-        GridItem(.flexible(minimum: 240), spacing: 14)
-    ]
-
     var body: some View {
         SurfaceCard {
             VStack(alignment: .leading, spacing: 16) {
@@ -217,7 +208,7 @@ private struct TBDisplaySenderSessionCard: View {
             HStack(alignment: .top, spacing: 14) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(service.sessionTitle(for: session))
-                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .font(.system(size: 24, weight: .bold, design: .rounded))
                     Text(session.statusText)
                         .font(.subheadline)
                         .foregroundStyle(session.isStreaming ? .green : .secondary)
@@ -237,7 +228,7 @@ private struct TBDisplaySenderSessionCard: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+                .controlSize(.regular)
                 .disabled(!session.isConnected && (trimmedReceiverIP.isEmpty || session.localInterfaceIP.isEmpty))
 
                 Button {
@@ -246,45 +237,74 @@ private struct TBDisplaySenderSessionCard: View {
                     Label(TBDisplaySenderL10n.showSettings(service.language), systemImage: "gearshape.2")
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.large)
+                .controlSize(.regular)
 
                 Button(TBDisplaySenderL10n.removeSessionButton(service.language)) {
                     service.removeSession(session)
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.large)
+                .controlSize(.regular)
                 .disabled(service.sessions.count == 1 || session.isConnected || session.isStreaming)
             }
         }
     }
 
     private var summaryGrid: some View {
-        LazyVGrid(columns: summaryColumns, alignment: .leading, spacing: 12) {
-            summaryTile(
+        VStack(spacing: 0) {
+            compactSummaryRow(
+                icon: "cable.connector",
                 title: transportTitle,
                 value: session.transportKind.title(service.language),
-                subtitle: service.interfaceDisplayText(for: session.localInterfaceIP)
+                detail: service.interfaceDisplayText(
+                    for: session.localInterfaceIP
+                )
             )
-
-            summaryTile(
+            Divider()
+            compactSummaryRow(
+                icon: "display",
                 title: receiverTitle,
-                value: session.receiverDisplayName.isEmpty ? TBDisplaySenderL10n.notDetected(service.language) : session.receiverDisplayName,
-                subtitle: session.receiverSubtitle
+                value: session.receiverDisplayName.isEmpty
+                    ? TBDisplaySenderL10n.notDetected(service.language)
+                    : session.receiverDisplayName,
+                detail: session.receiverSubtitle
             )
-
-            summaryTile(
+            Divider()
+            compactSummaryRow(
+                icon: "rectangle.on.rectangle",
                 title: sourceTitle,
                 value: session.captureSource.title(service.language),
-                subtitle: session.streamResolutionText
+                detail: session.streamResolutionText
             )
-
-            summaryTile(
-                title: fpsTitle,
-                value: liveFPSValue,
-                subtitle: liveBandwidthValue,
-                accent: session.isStreaming ? .green : .secondary
-            )
+            Divider()
+            HStack(spacing: 10) {
+                Image(systemName: "gauge.with.dots.needle.50percent")
+                    .font(.system(size: 17))
+                    .foregroundStyle(session.isStreaming ? .green : .secondary)
+                    .frame(width: 24)
+                Text(fpsTitle)
+                    .font(.body.weight(.semibold))
+                Spacer()
+                metricBadge(liveFPSValue)
+                metricBadge(
+                    session.isStreaming
+                        ? String(
+                            format: "%.2f Gbit/s",
+                            session.liveMetrics.senderNetworkGbps
+                        )
+                        : "—"
+                )
+            }
+            .padding(.vertical, 13)
         }
+        .padding(.horizontal, 14)
+        .background(
+            Color(nsColor: .textBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.55))
+        )
     }
 
     private var monitorDetailsCard: some View {
@@ -445,23 +465,49 @@ private struct TBDisplaySenderSessionCard: View {
             .font(.system(.headline, design: .rounded, weight: .semibold))
     }
 
-    private func summaryTile(title: String, value: String, subtitle: String, accent: Color = .primary) -> some View {
-        SurfaceSubcard {
-            VStack(alignment: .leading, spacing: 8) {
-                sectionHeading(title)
-                Text(value)
-                    .font(.system(size: 20, weight: .semibold, design: .rounded))
-                    .foregroundStyle(accent)
-                    .lineLimit(2)
-                    .textSelection(.enabled)
-                Text(subtitle)
-                    .font(.callout)
+    private func compactSummaryRow(
+        icon: String,
+        title: String,
+        value: String,
+        detail: String
+    ) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 17))
+                .foregroundStyle(.secondary)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .textSelection(.enabled)
+                Text(value)
+                    .font(.body.weight(.semibold))
+                    .lineLimit(1)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            Spacer(minLength: 12)
+            Text(detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+                .frame(maxWidth: 300, alignment: .trailing)
         }
+        .padding(.vertical, 11)
+    }
+
+    private func metricBadge(_ value: String) -> some View {
+        Text(value)
+            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                Capsule()
+                    .fill(
+                        session.isStreaming
+                            ? Color.green.opacity(0.12)
+                            : Color.secondary.opacity(0.10)
+                    )
+            )
     }
 
     private var transportTitle: String {
