@@ -63,7 +63,7 @@ fba7473  BC7 stable baseline
 | `f492b1e82950` | Recoverable NV12 region | No tag | 37 | 0.431 Gbit/s | 0.515 Gbit/s | Sender 26.98 Hz; Receiver 29.11 FPS; Sender LZ4 p95 7.65 ms; Receiver apply p95 23.23 ms |
 | `b3f416150a39` | NV12 pipeline breakdown | No tag | No valid paired deployment | Not available | Not available | Instrumentation, reusable decode scratch, and shadow-state changes; Receiver was not deployed at the same commit |
 | `b90430696861` | NV12 checksum disabled | `nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27` | 80 | 1.133 Gbit/s | 3.074 Gbit/s | Sender 51.72 Hz; Receiver 51.79 FPS; selected intervals reached 55–58 FPS |
-| `7c03537705c4` | GPU-detected NV12 64×64 tile runs | No tag | 18 initial high-load windows | 0.691 Gbit/s | 1.166 Gbit/s | Sender 55.06 Hz; Receiver 54.73 FPS; tile detection p95 snapshot average 2.86 ms; no protocol or render errors |
+| `7c03537705c4` | GPU-detected NV12 64×64 tile runs | No tag | 48 high-load windows | 0.812 Gbit/s | 1.780 Gbit/s | Sender 55.04 Hz; Receiver 53.33 FPS; tile detection p95 snapshot average 2.84 ms; no protocol or render errors |
 
 ## Stage measurements
 
@@ -136,27 +136,27 @@ motion to about 51–52 FPS over the broader high-load sample set.
 
 ### `7c03537` GPU-detected NV12 tile runs
 
-Initial run after deploying format 4. The sample set contains 18 windows with
+Extended run after deploying format 4. The sample set contains 48 windows with
 `networkGbps >= 0.3`.
 
 ```text
-Sender capture/sent:          55.61 / 55.06 Hz
-Receiver present:             54.73 FPS
-network average/peak:         0.691 / 1.166 Gbit/s
-GPU tile detection p95 avg:   2.86 ms
-run count p95 avg/max:        82 / 88
-Sender run copy p95 avg:      2.44 ms
-Sender LZ4 p95 avg:           6.46 ms
-Sender send p95 avg:          0.862 ms
-Receiver decompress p95 avg:  3.06 ms
-Receiver upload p95 avg:      2.08 ms
-Receiver apply p95 avg:       5.04 ms
+Sender capture/sent:          55.56 / 55.04 Hz
+Receiver present:             53.33 FPS
+network average/peak:         0.812 / 1.780 Gbit/s
+GPU tile detection p95 avg:   2.84 ms
+run count p95 avg/max:        76.60 / 88
+Sender run copy p95 avg:      2.26 ms
+Sender LZ4 p95 avg:           7.11 ms
+Sender send p95 avg:          1.15 ms
+Receiver decompress p95 avg:  3.25 ms
+Receiver upload p95 avg:      2.18 ms
+Receiver apply p95 avg:       5.31 ms
 invalid/render/key requests:  0 / 0 / 0
 ```
 
 Compared with the broader `b904306` high-load sample set, observed average
-bandwidth decreased from 1.133 to 0.691 Gbit/s (39.0%), while Sender/Receiver
-rates increased from 51.72/51.79 to 55.06/54.73 FPS. The workloads and sample
+bandwidth decreased from 1.133 to 0.812 Gbit/s (28.3%), while Sender/Receiver
+rates changed from 51.72/51.79 to 55.04/53.33 FPS. The workloads and sample
 counts were not identical, so this is an initial hardware result rather than a
 controlled benchmark.
 
