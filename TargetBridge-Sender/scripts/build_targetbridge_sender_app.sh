@@ -11,6 +11,7 @@ SOURCE_APP="${BUILD_DIR}/TargetBridge.app"
 DEST_DIR="${REPO_ROOT}/build"
 DEST_APP="${DEST_DIR}/TargetBridge.app"
 SIGNING_STATUS_FILE="${DEST_DIR}/TargetBridge.app.signing.txt"
+SIGNING_REQUIREMENT='=designated => identifier "com.targetbridge.sender"'
 
 cd "$ROOT"
 
@@ -30,24 +31,29 @@ rm -rf "$DEST_APP"
 ditto "$SOURCE_APP" "$DEST_APP"
 echo "Cleaning extended attributes..."
 xattr -cr "$DEST_APP" || true
-echo "Signing sender application ad-hoc..."
-codesign --force --deep --sign - "$DEST_APP"
+echo "Signing sender application with a stable local requirement..."
+codesign \
+  --force \
+  --deep \
+  --sign - \
+  --requirements "$SIGNING_REQUIREMENT" \
+  "$DEST_APP"
 codesign --verify --deep --strict "$DEST_APP"
 touch "$DEST_APP"
 
-echo "Resetting Screen Recording authorization for the new ad-hoc build..."
-tccutil reset ScreenCapture com.targetbridge.sender
-
 SIGNATURE_DETAILS="$(codesign -dv --verbose=2 "$DEST_APP" 2>&1)"
+DESIGNATED_REQUIREMENT="$(codesign -d --requirements - "$DEST_APP" 2>&1 |
+  tail -n 1)"
 {
   echo "app=$DEST_APP"
-  echo "mode=adhoc"
+  echo "mode=adhoc-stable-requirement"
   echo "identity=-"
+  echo "designated_requirement=$DESIGNATED_REQUIREMENT"
   echo "$SIGNATURE_DETAILS" | grep -E '^(Identifier|Signature|TeamIdentifier)=' || true
   cat <<'EOF'
-screen_recording_warning=This ad-hoc build may require Screen Recording permission again.
+screen_recording_note=Grant Screen Recording once after switching to this stable requirement. Later rebuilds keep the same designated requirement.
 reset_command=tccutil reset ScreenCapture com.targetbridge.sender
-tcc_reset=completed_by_build_script
+tcc_reset=not_performed_by_build_script
 EOF
 } > "$SIGNING_STATUS_FILE"
 
@@ -56,12 +62,10 @@ echo "Local DerivedData: $DERIVED_DATA_DIR"
 echo "Signing status: $SIGNING_STATUS_FILE"
 cat >&2 <<'EOF'
 
-TargetBridge was signed ad-hoc. The build script already reset the old Screen
-Recording authorization. After opening the new build:
+TargetBridge was signed ad-hoc with a stable designated requirement. When
+switching from the previous CDHash-bound build, grant Screen Recording once.
+Later rebuilds with this script retain the same requirement and do not reset
+TCC automatically.
 
-  1. Click Connect.
-  2. Grant Screen Recording in the macOS prompt.
-  3. If macOS requests an app restart, quit and reopen TargetBridge once.
-
-These steps are also saved in build/TargetBridge.app.signing.txt.
+These details are also saved in build/TargetBridge.app.signing.txt.
 EOF
