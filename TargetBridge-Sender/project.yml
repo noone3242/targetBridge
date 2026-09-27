@@ -41,14 +41,14 @@ targets:
       - name: Stamp Sender Build Info
         script: |
           set -euo pipefail
-          STAMP="$(date +%Y%m%d%H%M%S)"
+          STAMP="${TB_BUILD_TIMESTAMP:-$(date +%Y%m%d%H%M%S)}"
           COMMIT="$(git -C "${SRCROOT}/.." rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
           cat > "${SRCROOT}/TBDisplaySender/TBDisplaySenderBuildInfo.swift" <<EOI
           enum TBDisplaySenderBuildInfo {
               static let marketingVersion = "4.0.1"
               static let buildNumber = "${STAMP}"
               static let gitCommit = "${COMMIT}"
-              static let versionDisplay = "\\(marketingVersion) + build \\(buildNumber) · commit \\(gitCommit)"
+              static let versionDisplay = "\\(marketingVersion) · build \\(buildNumber) · commit \\(gitCommit)"
           }
           EOI
 
