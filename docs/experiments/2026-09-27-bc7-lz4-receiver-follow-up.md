@@ -25,7 +25,7 @@ Receiver packet p95:    31.7 ms
 ## 2. Follow-up 分支
 
 ```text
-branch: 2026-09-27_bc7-lz4-receiver-opt
+branch: 2026-09-27_bc7-lz4-receiver-opt-paused
 ```
 
 提交：
