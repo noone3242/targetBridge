@@ -156,6 +156,36 @@ BC7 activates only when the Receiver advertises `supportsBC7Mode6=true`.
 LZFSE supercompression activates only when the Receiver also advertises
 `supportsBC7LZFSE=true`. Complete Sender metrics are written beside the app at
 `logs/sender-metrics.jsonl`; OSLog contains only short summaries and errors.
+
+### Sender signing and Screen Recording
+
+`scripts/build_targetbridge_sender_app.sh` now requires a stable code-signing
+identity by default. It auto-selects the first valid identity reported by:
+
+```bash
+security find-identity -v -p codesigning
+```
+
+To select one explicitly:
+
+```bash
+TARGETBRIDGE_SIGNING_IDENTITY="Apple Development: Name (TEAMID)" \
+  ./scripts/build_targetbridge_sender_app.sh
+```
+
+When no identity is installed, an ad-hoc build must be explicitly requested:
+
+```bash
+ALLOW_ADHOC=1 ./scripts/build_targetbridge_sender_app.sh
+```
+
+Ad-hoc signing changes the app's CDHash after a rebuild and may invalidate the
+existing Screen Recording authorization. The build records the selected mode,
+identity, Team ID, and reset command in:
+
+```text
+build/TargetBridge.app.signing.txt
+```
 The Diagnostics **Start BC7 Test** action runs a real 1440p BC7 session and
 reports success only after the Receiver completes a Metal render command and
 returns the matching generation acknowledgment.
