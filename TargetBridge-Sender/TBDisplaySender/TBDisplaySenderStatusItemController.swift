@@ -132,41 +132,16 @@ final class TBDisplaySenderStatusItemController: NSObject {
                 ofSize: 9,
                 weight: .medium
             )
-            let title = NSMutableAttributedString()
-            title.append(NSAttributedString(
-                string: "● ",
-                attributes: [
-                    .font: font,
-                    .foregroundColor: NSColor.systemGreen,
-                    .paragraphStyle: paragraph
-                ]
-            ))
-            title.append(NSAttributedString(
-                string: "\(fps) FPS\n",
+            let title = NSAttributedString(
+                string:
+                    "\(fps) FPS\n" +
+                    tbMenuBarByteRateText(gigabitsPerSecond: bandwidth),
                 attributes: [
                     .font: font,
                     .foregroundColor: NSColor.labelColor,
                     .paragraphStyle: paragraph
                 ]
-            ))
-            title.append(NSAttributedString(
-                string: "● ",
-                attributes: [
-                    .font: font,
-                    .foregroundColor: NSColor.systemBlue,
-                    .paragraphStyle: paragraph
-                ]
-            ))
-            title.append(NSAttributedString(
-                string: tbMenuBarByteRateText(
-                    gigabitsPerSecond: bandwidth
-                ),
-                attributes: [
-                    .font: font,
-                    .foregroundColor: NSColor.labelColor,
-                    .paragraphStyle: paragraph
-                ]
-            ))
+            )
             button.attributedTitle = title
             button.toolTip =
                 "TargetBridge\nFrame rate: \(fps) FPS\n" +
@@ -174,7 +149,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
                 tbMenuBarByteRateText(gigabitsPerSecond: bandwidth)
             button.cell?.usesSingleLineMode = false
             button.cell?.lineBreakMode = .byClipping
-            button.imagePosition = .noImage
+            button.imagePosition = .imageLeading
         } else {
             button.attributedTitle = NSAttributedString(string: "")
             button.cell?.usesSingleLineMode = true
