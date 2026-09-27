@@ -104,6 +104,8 @@ struct app {
     uint8_t *raw_uv_shadow;
     size_t raw_y_len, raw_uv_len;
     uint32_t raw_width, raw_height, raw_y_stride, raw_uv_stride;
+    uint64_t raw_last_keyframe_request_ms;
+    int raw_keyframe_request_pending;
     uint64_t bc7_last_keyframe_request_ms;
     int bc7_keyframe_request_pending;
     uint8_t *bc7_shadow;
@@ -129,6 +131,10 @@ struct app {
     struct tb_metric_window bc7_present_interval_ns;
     struct tb_metric_window bc7_decompression_ns;
     struct tb_metric_window bc7_inverse_transform_ns;
+    uint64_t raw_full_frames;
+    uint64_t raw_region_frames;
+    struct tb_metric_window raw_shadow_commit_ns;
+    struct tb_metric_window raw_upload_ns;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      debug_enabled;
@@ -991,6 +997,9 @@ static void tb_receiver_apply_input_control_mode(struct app *a, const uint8_t *p
 
 /* ---- Callbacks: decoder → display ------------------------------------ */
 
+static void record_bc7_packet_arrival(struct app *a, uint64_t now);
+static void request_raw_keyframe(struct app *a, const char *reason);
+
 static void on_frame(const uint8_t *y, int y_stride,
                      const uint8_t *uv, int uv_stride,
                      int w, int h, void *ud) {
@@ -1008,7 +1017,22 @@ static void on_frame(const uint8_t *y, int y_stride,
         snprintf(height_text, sizeof(height_text), "%d", h);
         tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
     }
-    tb_disp_render_nv12(a->disp, y, y_stride, uv, uv_stride, w, h);
+    const uint64_t present_started = now_ns();
+    if (tb_disp_render_nv12(a->disp, y, y_stride, uv, uv_stride, w, h) != 0) {
+        a->bc7_render_failures++;
+        return;
+    }
+    const uint64_t present_finished = now_ns();
+    metric_record(&a->bc7_present_ns, present_finished - present_started);
+    if (a->bc7_last_present_ns != 0 &&
+        present_finished >= a->bc7_last_present_ns) {
+        metric_record(
+            &a->bc7_present_interval_ns,
+            present_finished - a->bc7_last_present_ns
+        );
+    }
+    a->bc7_last_present_ns = present_finished;
+    a->bc7_presented_frames++;
     a->frames++;
 }
 
@@ -1016,7 +1040,14 @@ static void on_frame(const uint8_t *y, int y_stride,
  * Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
  *          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)] */
 static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
-    if (len >= 54 && p[0] == 3 && p[1] == 1 && a->raw_y_shadow) {
+    const uint64_t apply_started = now_ns();
+    record_bc7_packet_arrival(a, apply_started);
+    if (len > 0 && p[0] == 3) {
+        if (len < 54 || p[1] != 1 ||
+            !a->raw_y_shadow || !a->raw_uv_shadow) {
+            request_raw_keyframe(a, "region-base");
+            return;
+        }
         uint32_t v[11];
         for (int i = 0; i < 11; i++) {
             const uint8_t *q = p + 2 + i * 4;
@@ -1030,26 +1061,77 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             ((uint64_t)p[52] << 8) | p[53];
         uint32_t w=v[0], h=v[1], ys=v[2], us=v[3], x=v[4], y=v[5],
                  rw=v[6], rh=v[7], ylen=v[8], uvlen=v[9], clen=v[10];
-        if (w != a->raw_width || h != a->raw_height ||
+        const size_t expected_y_len = (size_t)rw * rh;
+        const size_t expected_uv_len = (size_t)rw * (rh / 2u);
+        if (w == 0 || h == 0 || w > 8192 || h > 8192 ||
+            w != a->raw_width || h != a->raw_height ||
             ys != a->raw_y_stride || us != a->raw_uv_stride ||
-            !rw || !rh || ((x|y|rw|rh)&1u) || x+rw>w || y+rh>h ||
-            ylen != rw*rh || uvlen != rw*(rh/2) || clen != len-54) return;
+            ys > 16384 || us > 16384 ||
+            !rw || !rh || ((x|y|rw|rh)&1u) ||
+            x > w || rw > w - x || y > h || rh > h - y ||
+            ylen != expected_y_len || uvlen != expected_uv_len ||
+            clen != len-54 || clen < 4 ||
+            p[len-4] != 0x62 || p[len-3] != 0x76 ||
+            p[len-2] != 0x34 || p[len-1] != 0x24 ||
+            (size_t)(y + rh - 1u) * ys + x + rw > a->raw_y_len ||
+            (size_t)(y / 2u + rh / 2u - 1u) * us + x + rw >
+                a->raw_uv_len) {
+            request_raw_keyframe(a, "region-geometry");
+            return;
+        }
         size_t raw_len=(size_t)ylen+uvlen;
-        uint8_t *raw=malloc(raw_len); if(!raw)return;
+        uint8_t *raw=malloc(raw_len);
+        if(!raw) {
+            request_raw_keyframe(a, "region-allocation");
+            return;
+        }
+        const uint64_t decode_started = now_ns();
         size_t decoded=compression_decode_buffer(
             raw,raw_len,p+54,clen,NULL,COMPRESSION_LZ4);
+        metric_record(&a->bc7_decompression_ns, now_ns() - decode_started);
         if(decoded!=raw_len ||
-           tb_bc7_supercompression_checksum(raw,raw_len)!=checksum){free(raw);return;}
+           tb_bc7_supercompression_checksum(raw,raw_len)!=checksum){
+            free(raw);
+            request_raw_keyframe(a, "region-checksum");
+            return;
+        }
+        uint8_t *uv=raw+ylen;
+        const uint64_t present_started = now_ns();
+        if (tb_disp_render_nv12_region(
+                a->disp, raw, (int)rw, uv, (int)rw,
+                (int)w, (int)h, (int)x, (int)y, (int)rw, (int)rh) != 0) {
+            free(raw);
+            request_raw_keyframe(a, "region-upload");
+            return;
+        }
+        const uint64_t present_finished = now_ns();
+        const uint64_t commit_started = present_finished;
         for(uint32_t row=0;row<rh;row++)
             memcpy(a->raw_y_shadow+(size_t)(y+row)*ys+x,raw+(size_t)row*rw,rw);
-        uint8_t *uv=raw+ylen;
         for(uint32_t row=0;row<rh/2;row++)
             memcpy(a->raw_uv_shadow+(size_t)(y/2+row)*us+x,uv+(size_t)row*rw,rw);
-        on_frame(a->raw_y_shadow,(int)ys,a->raw_uv_shadow,(int)us,(int)w,(int)h,a);
+        metric_record(&a->raw_shadow_commit_ns, now_ns() - commit_started);
+        metric_record(&a->raw_upload_ns, present_finished - present_started);
+        metric_record(&a->bc7_present_ns, present_finished - present_started);
+        if (a->bc7_last_present_ns != 0) {
+            metric_record(
+                &a->bc7_present_interval_ns,
+                present_finished - a->bc7_last_present_ns
+            );
+        }
+        a->bc7_last_present_ns = present_finished;
+        a->bc7_presented_frames++;
+        a->raw_region_frames++;
+        a->have_video_frame = 1;
+        a->frames++;
+        metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
         free(raw); return;
     }
     if (len >= 38 && p[0] == 2) {
-        if (p[1] != 1) return;
+        if (p[1] != 1) {
+            request_raw_keyframe(a, "full-format");
+            return;
+        }
         uint32_t w = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
                      ((uint32_t)p[4] << 8) | p[5];
         uint32_t h = ((uint32_t)p[6] << 24) | ((uint32_t)p[7] << 16) |
@@ -1072,39 +1154,87 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             ((uint64_t)p[36] << 8) | p[37];
         if (w == 0 || h == 0 || (w & 1) || (h & 1) ||
             w > 8192 || h > 8192 || ys < w || us < w ||
+            ys > 16384 || us > 16384 ||
             y_size != (size_t)ys * h ||
             uv_size != (size_t)us * (h / 2) ||
+            (size_t)y_size + uv_size > 64u * 1024u * 1024u ||
             compressed_len != len - 38 ||
             compressed_len < 4 ||
             p[len - 4] != 0x62 || p[len - 3] != 0x76 ||
-            p[len - 2] != 0x34 || p[len - 1] != 0x24) return;
+            p[len - 2] != 0x34 || p[len - 1] != 0x24) {
+            request_raw_keyframe(a, "full-geometry");
+            return;
+        }
         size_t raw_len = (size_t)y_size + uv_size;
         uint8_t *raw = malloc(raw_len);
-        if (!raw) return;
+        if (!raw) {
+            request_raw_keyframe(a, "full-allocation");
+            return;
+        }
+        const uint64_t decode_started = now_ns();
         size_t decoded = compression_decode_buffer(
             raw, raw_len, p + 38, compressed_len, NULL, COMPRESSION_LZ4
         );
+        metric_record(&a->bc7_decompression_ns, now_ns() - decode_started);
         if (decoded != raw_len ||
             tb_bc7_supercompression_checksum(raw, raw_len) != checksum) {
             free(raw);
+            request_raw_keyframe(a, "full-checksum");
             return;
         }
-        free(a->raw_y_shadow); free(a->raw_uv_shadow);
-        a->raw_y_shadow=malloc(y_size); a->raw_uv_shadow=malloc(uv_size);
-        if(!a->raw_y_shadow||!a->raw_uv_shadow){
-            free(a->raw_y_shadow); free(a->raw_uv_shadow);
-            a->raw_y_shadow=a->raw_uv_shadow=NULL; free(raw); return;
+        const uint64_t commit_started = now_ns();
+        uint8_t *next_y = malloc(y_size);
+        uint8_t *next_uv = malloc(uv_size);
+        if(!next_y || !next_uv){
+            free(next_y); free(next_uv); free(raw);
+            request_raw_keyframe(a, "full-shadow-allocation");
+            return;
         }
-        memcpy(a->raw_y_shadow,raw,y_size);
-        memcpy(a->raw_uv_shadow,raw+y_size,uv_size);
+        memcpy(next_y,raw,y_size);
+        memcpy(next_uv,raw+y_size,uv_size);
+        metric_record(
+            &a->raw_shadow_commit_ns,
+            now_ns() - commit_started
+        );
+        const uint64_t upload_started = now_ns();
+        if (tb_disp_render_nv12(
+                a->disp, raw, (int)ys, raw + y_size, (int)us,
+                (int)w, (int)h) != 0) {
+            free(next_y); free(next_uv); free(raw);
+            request_raw_keyframe(a, "full-upload");
+            return;
+        }
+        const uint64_t upload_finished = now_ns();
+        free(a->raw_y_shadow); free(a->raw_uv_shadow);
+        a->raw_y_shadow=next_y; a->raw_uv_shadow=next_uv;
         a->raw_y_len=y_size; a->raw_uv_len=uv_size;
         a->raw_width=w; a->raw_height=h; a->raw_y_stride=ys; a->raw_uv_stride=us;
-        on_frame(raw, (int)ys, raw + y_size, (int)us, (int)w, (int)h, a);
+        metric_record(&a->raw_upload_ns, upload_finished - upload_started);
+        metric_record(&a->bc7_present_ns, upload_finished - upload_started);
+        if (a->bc7_last_present_ns != 0) {
+            metric_record(
+                &a->bc7_present_interval_ns,
+                upload_finished - a->bc7_last_present_ns
+            );
+        }
+        a->bc7_last_present_ns = upload_finished;
+        a->bc7_presented_frames++;
+        a->have_video_frame = 1;
+        a->frames++;
+        a->raw_full_frames++;
+        a->raw_keyframe_request_pending = 0;
+        metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
         free(raw);
         return;
     }
-    if (len < 17) return;
-    if (p[0] != 1) return; /* only NV12 is supported */
+    if (len < 17) {
+        request_raw_keyframe(a, "raw-header");
+        return;
+    }
+    if (p[0] != 1) {
+        request_raw_keyframe(a, "raw-format");
+        return;
+    }
     uint32_t w  = ((uint32_t)p[1]  << 24) | ((uint32_t)p[2]  << 16) | ((uint32_t)p[3]  << 8) | (uint32_t)p[4];
     uint32_t h  = ((uint32_t)p[5]  << 24) | ((uint32_t)p[6]  << 16) | ((uint32_t)p[7]  << 8) | (uint32_t)p[8];
     uint32_t ys = ((uint32_t)p[9]  << 24) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 8) | (uint32_t)p[12];
@@ -1114,29 +1244,58 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
      * practical 4:2:0 display sizes and the protocol packet cap. */
     if (w == 0 || h == 0 || (w & 1) || (h & 1) ||
         w > 8192 || h > 8192 || ys < w || us < w ||
-        ys > 16384 || us > 16384) return;
+        ys > 16384 || us > 16384) {
+        request_raw_keyframe(a, "raw-geometry");
+        return;
+    }
     size_t y_size  = (size_t)ys * h;
     size_t uv_size = (size_t)us * (h / 2);
     size_t payload_size = len - 17;
-    if (y_size > payload_size || uv_size > payload_size - y_size) return;
+    if (y_size > payload_size || uv_size > payload_size - y_size) {
+        request_raw_keyframe(a, "raw-length");
+        return;
+    }
     const uint8_t *y  = p + 17;
     const uint8_t *uv = y + y_size;
-
-    a->have_video_frame = 1;
-    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
-    {
-        char width_text[16];
-        char height_text[16];
-        struct tb_i18n_pair pairs[] = {
-            { "width", width_text },
-            { "height", height_text }
-        };
-        snprintf(width_text, sizeof(width_text), "%u", w);
-        snprintf(height_text, sizeof(height_text), "%u", h);
-        tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
+    uint8_t *next_y = malloc(y_size);
+    uint8_t *next_uv = malloc(uv_size);
+    if (!next_y || !next_uv) {
+        free(next_y); free(next_uv);
+        request_raw_keyframe(a, "raw-shadow-allocation");
+        return;
     }
-    tb_disp_render_nv12(a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h);
+    const uint64_t commit_started = now_ns();
+    memcpy(next_y, y, y_size);
+    memcpy(next_uv, uv, uv_size);
+    metric_record(&a->raw_shadow_commit_ns, now_ns() - commit_started);
+    const uint64_t upload_started = now_ns();
+    if (tb_disp_render_nv12(
+            a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h) != 0) {
+        free(next_y); free(next_uv);
+        request_raw_keyframe(a, "raw-upload");
+        return;
+    }
+    const uint64_t upload_finished = now_ns();
+    free(a->raw_y_shadow); free(a->raw_uv_shadow);
+    a->raw_y_shadow = next_y; a->raw_uv_shadow = next_uv;
+    a->raw_y_len = y_size; a->raw_uv_len = uv_size;
+    a->raw_width = w; a->raw_height = h;
+    a->raw_y_stride = ys; a->raw_uv_stride = us;
+    metric_record(&a->raw_upload_ns, upload_finished - upload_started);
+    metric_record(&a->bc7_present_ns, upload_finished - upload_started);
+    if (a->bc7_last_present_ns != 0) {
+        metric_record(
+            &a->bc7_present_interval_ns,
+            upload_finished - a->bc7_last_present_ns
+        );
+    }
+    a->bc7_last_present_ns = upload_finished;
+    a->bc7_presented_frames++;
+    a->raw_full_frames++;
+    a->raw_keyframe_request_pending = 0;
+    a->have_video_frame = 1;
     a->frames++;
+    metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
 }
 
 static void reset_bc7_delta_state(struct app *a) {
@@ -1205,6 +1364,7 @@ static void request_bc7_keyframe(struct app *a, const char *reason) {
          now - a->bc7_last_keyframe_request_ms < 250)) {
         return;
     }
+
     uint8_t packet[9] = {
         0, 0, 0, 5, TB_PKT_BC7_KEYFRAME_REQUEST,
         (uint8_t)(a->bc7_render_generation >> 24),
@@ -1220,6 +1380,30 @@ static void request_bc7_keyframe(struct app *a, const char *reason) {
             fprintf(stderr,
                     "[diag] event=bc7-keyframe-request generation=%u reason=%s count=%llu\n",
                     a->bc7_render_generation,
+                    reason,
+                    (unsigned long long)a->bc7_keyframe_requests);
+        }
+    }
+
+}
+
+static void request_raw_keyframe(struct app *a, const char *reason) {
+    const uint64_t now = now_ms();
+    if (a->client_fd < 0 || a->raw_keyframe_request_pending ||
+        (a->raw_last_keyframe_request_ms != 0 &&
+         now - a->raw_last_keyframe_request_ms < 250)) {
+        return;
+    }
+    const uint8_t packet[5] = {
+        0, 0, 0, 1, TB_PKT_RAW_NV12_KEYFRAME_REQUEST
+    };
+    if (send_all(a->client_fd, packet, sizeof(packet)) == 0) {
+        a->raw_last_keyframe_request_ms = now;
+        a->raw_keyframe_request_pending = 1;
+        a->bc7_keyframe_requests++;
+        if (a->debug_enabled) {
+            fprintf(stderr,
+                    "[diag] event=raw-keyframe-request reason=%s count=%llu\n",
                     reason,
                     (unsigned long long)a->bc7_keyframe_requests);
         }
@@ -1381,6 +1565,8 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         a->bc7_applied_sequence = frame.sequence;
         a->bc7_checksum = checksum;
         a->bc7_keyframe_request_pending = 0;
+        a->raw_keyframe_request_pending = 0;
+        a->raw_last_keyframe_request_ms = 0;
     } else {
         const uint64_t upload_started = now_ns();
         if (tb_disp_upload_bc7(a->disp,
@@ -2378,7 +2564,11 @@ static void send_receiver_metrics(
         metric_summary(&a->bc7_decompression_ns);
     const struct tb_metric_summary inverse_transform =
         metric_summary(&a->bc7_inverse_transform_ns);
-    char json[2048];
+    const struct tb_metric_summary raw_shadow =
+        metric_summary(&a->raw_shadow_commit_ns);
+    const struct tb_metric_summary raw_upload =
+        metric_summary(&a->raw_upload_ns);
+    char json[2560];
     int json_len = snprintf(
         json,
         sizeof(json),
@@ -2397,7 +2587,11 @@ static void send_receiver_metrics(
         "\"compressedBlockBytes\":%llu,\"decompressionP50Ms\":%.3f,"
         "\"decompressionP95Ms\":%.3f,\"decompressionP99Ms\":%.3f,"
         "\"inverseTransformP50Ms\":%.3f,\"inverseTransformP95Ms\":%.3f,"
-        "\"inverseTransformP99Ms\":%.3f}",
+        "\"inverseTransformP99Ms\":%.3f,\"rawFullFrames\":%llu,"
+        "\"rawRegionFrames\":%llu,\"rawShadowCommitP50Ms\":%.3f,"
+        "\"rawShadowCommitP95Ms\":%.3f,\"rawShadowCommitP99Ms\":%.3f,"
+        "\"rawUploadP50Ms\":%.3f,\"rawUploadP95Ms\":%.3f,"
+        "\"rawUploadP99Ms\":%.3f}",
         fps,
         present_fps,
         gbps,
@@ -2435,12 +2629,20 @@ static void send_receiver_metrics(
         ns_to_ms(decompression.p99),
         ns_to_ms(inverse_transform.p50),
         ns_to_ms(inverse_transform.p95),
-        ns_to_ms(inverse_transform.p99)
+        ns_to_ms(inverse_transform.p99),
+        (unsigned long long)a->raw_full_frames,
+        (unsigned long long)a->raw_region_frames,
+        ns_to_ms(raw_shadow.p50),
+        ns_to_ms(raw_shadow.p95),
+        ns_to_ms(raw_shadow.p99),
+        ns_to_ms(raw_upload.p50),
+        ns_to_ms(raw_upload.p95),
+        ns_to_ms(raw_upload.p99)
     );
     if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
 
     const size_t packet_len = 5u + (size_t)json_len;
-    uint8_t packet[5 + 2048];
+    uint8_t packet[5 + 2560];
     write_be32(packet, (uint32_t)(1 + json_len));
     packet[4] = TB_PKT_RECEIVER_METRICS;
     memcpy(packet + 5, json, (size_t)json_len);
@@ -2736,6 +2938,8 @@ int main(int argc, char **argv) {
                 a.bc7_render_generation = 0;
                 a.bc7_last_keyframe_request_ms = 0;
                 a.bc7_keyframe_request_pending = 0;
+                a.raw_keyframe_request_pending = 0;
+                a.raw_last_keyframe_request_ms = 0;
                 reset_bc7_delta_state(&a);
                 reset_raw_state(&a);
                 a.frames = 0;
@@ -2756,6 +2960,8 @@ int main(int argc, char **argv) {
                 a.bc7_compressed_block_bytes = 0;
                 a.bc7_raw_block_bytes = 0;
                 a.bc7_keyframe_requests = 0;
+                a.raw_full_frames = 0;
+                a.raw_region_frames = 0;
                 a.bc7_last_packet_ns = 0;
                 a.bc7_last_present_ns = 0;
                 a.bc7_presented_frames = 0;
@@ -2767,6 +2973,8 @@ int main(int argc, char **argv) {
                 memset(&a.bc7_present_interval_ns, 0, sizeof(a.bc7_present_interval_ns));
                 memset(&a.bc7_decompression_ns, 0, sizeof(a.bc7_decompression_ns));
                 memset(&a.bc7_inverse_transform_ns, 0, sizeof(a.bc7_inverse_transform_ns));
+                memset(&a.raw_shadow_commit_ns, 0, sizeof(a.raw_shadow_commit_ns));
+                memset(&a.raw_upload_ns, 0, sizeof(a.raw_upload_ns));
                 snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();

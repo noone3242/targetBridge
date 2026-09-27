@@ -70,10 +70,15 @@ int                tb_disp_window_on_active_space(struct tb_display *d);
 int  tb_disp_ensure_texture(struct tb_display *d, int w, int h);
 
 /* Upload NV12 planes + render. Called once per decoded frame. */
-void tb_disp_render_nv12(struct tb_display *d,
-                         const uint8_t *y, int y_stride,
-                         const uint8_t *uv, int uv_stride,
-                         int w, int h);
+int tb_disp_render_nv12(struct tb_display *d,
+                        const uint8_t *y, int y_stride,
+                        const uint8_t *uv, int uv_stride,
+                        int w, int h);
+int tb_disp_render_nv12_region(struct tb_display *d,
+                               const uint8_t *y, int y_stride,
+                               const uint8_t *uv, int uv_stride,
+                               int texture_w, int texture_h,
+                               int x, int y_pos, int w, int h);
 
 /* Report whether the active Metal device can sample BC7 textures. */
 int tb_disp_supports_bc7(struct tb_display *d);

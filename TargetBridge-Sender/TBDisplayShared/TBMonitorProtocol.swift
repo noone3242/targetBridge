@@ -17,6 +17,7 @@ enum TBMonitorPacketType: UInt8 {
     case bc7KeyframeRequest = 0x28
     case bc7CompressedFrame = 0x29
     case bc7CompressedDelta = 0x2A
+    case rawNV12KeyframeRequest = 0x2B
     case heartbeat = 0x30
     case teardown = 0x31
     case cursor = 0x32
@@ -107,6 +108,14 @@ struct TBMonitorReceiverMetrics: Codable, Equatable {
     var inverseTransformP50Ms: Double?
     var inverseTransformP95Ms: Double?
     var inverseTransformP99Ms: Double?
+    var rawFullFrames: UInt64?
+    var rawRegionFrames: UInt64?
+    var rawShadowCommitP50Ms: Double?
+    var rawShadowCommitP95Ms: Double?
+    var rawShadowCommitP99Ms: Double?
+    var rawUploadP50Ms: Double?
+    var rawUploadP95Ms: Double?
+    var rawUploadP99Ms: Double?
 }
 
 struct TBMonitorUILanguageUpdate: Codable {

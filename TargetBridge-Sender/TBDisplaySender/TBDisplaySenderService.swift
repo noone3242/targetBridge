@@ -1624,6 +1624,30 @@ final class TBLatestFrameSlot<Value>: @unchecked Sendable {
         return value
     }
 
+    func takeWithDroppedCount() -> (value: Value?, droppedCount: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = pendingValue
+        pendingValue = nil
+        return (value, dropped)
+    }
+
+    func submitIfEmpty(
+        _ value: Value
+    ) -> (inserted: Bool, shouldSchedule: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard pendingValue == nil else {
+            return (false, false)
+        }
+        pendingValue = value
+        guard !drainScheduled else {
+            return (true, false)
+        }
+        drainScheduled = true
+        return (true, true)
+    }
+
     func finishProcessing() -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -1695,6 +1719,14 @@ struct TBPipelineDiagnosticsSnapshot {
     let dirtyTiles: TBMetricSummary
     let planeSplitTime: TBMetricSummary
     let compressionTime: TBMetricSummary
+    let nv12FullFrames: Int
+    let nv12RegionFrames: Int
+    let nv12RawBytes: UInt64
+    let nv12WireBytes: UInt64
+    let nv12CopyTime: TBMetricSummary
+    let nv12CompressionTime: TBMetricSummary
+    let nv12RegionPixels: TBMetricSummary
+    let nv12OverfetchPermille: TBMetricSummary
 
     static let empty = TBPipelineDiagnosticsSnapshot(
         pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
@@ -1713,7 +1745,11 @@ struct TBPipelineDiagnosticsSnapshot {
         captureInterval: .empty, queueAge: .empty, encodeTime: .empty,
         planTime: .empty, packetTime: .empty, sendTime: .empty,
         packetBytes: .empty, dirtyTiles: .empty,
-        planeSplitTime: .empty, compressionTime: .empty
+        planeSplitTime: .empty, compressionTime: .empty,
+        nv12FullFrames: 0, nv12RegionFrames: 0,
+        nv12RawBytes: 0, nv12WireBytes: 0,
+        nv12CopyTime: .empty, nv12CompressionTime: .empty,
+        nv12RegionPixels: .empty, nv12OverfetchPermille: .empty
     )
 }
 
@@ -1754,7 +1790,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var firstFrameNotified = false
     private var running = false
     private var rawNV12HasBaseline = false
+    private var rawNV12ObservedDropped = 0
+    private var lastRawNV12Frame: TBCapturedFrame?
     private let latestBC7Frame = TBLatestFrameSlot<TBCapturedFrame>()
+    private let latestRawNV12Frame = TBLatestFrameSlot<TBCapturedFrame>()
 
     // Read from the main thread (fps timer / watchdog); guarded by `lock`.
     private let lock = NSLock()
@@ -1791,6 +1830,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _dirtyTilesWindow = TBRollingMetricWindow()
     private var _planeSplitTimeWindow = TBRollingMetricWindow()
     private var _compressionTimeWindow = TBRollingMetricWindow()
+    private var _nv12FullFrames = 0
+    private var _nv12RegionFrames = 0
+    private var _nv12RawBytes: UInt64 = 0
+    private var _nv12WireBytes: UInt64 = 0
+    private var _nv12CopyTimeWindow = TBRollingMetricWindow()
+    private var _nv12CompressionTimeWindow = TBRollingMetricWindow()
+    private var _nv12RegionPixelsWindow = TBRollingMetricWindow()
+    private var _nv12OverfetchPermilleWindow = TBRollingMetricWindow()
     private var _lastCaptureFrameAt = Date()
 
     init(preset: TBDisplayCapturePreset,
@@ -1852,7 +1899,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
         queue.sync {
             running = false
             rawNV12HasBaseline = false
+            rawNV12ObservedDropped = 0
+            lastRawNV12Frame = nil
             latestBC7Frame.cancel()
+            latestRawNV12Frame.cancel()
             if let encoder = vtEncoder { VTCompressionSessionInvalidate(encoder) }
             vtEncoder = nil
             bc7Encoder = nil
@@ -1891,7 +1941,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
             return TBPipelineDiagnosticsSnapshot(
                 pending: pendingVideoPackets,
                 inFlight: inFlightEncodeFrames,
-                dropped: droppedVideoFrames + latestBC7Frame.droppedCount,
+                dropped: droppedVideoFrames + latestBC7Frame.droppedCount +
+                    latestRawNV12Frame.droppedCount,
                 ptsSeq: displayStreamFrameSequence,
                 bc7Keyframes: bc7Keyframes,
                 bc7DeltaFrames: bc7DeltaFrames,
@@ -1929,7 +1980,15 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 packetBytes: _packetBytesWindow.summary(),
                 dirtyTiles: _dirtyTilesWindow.summary(),
                 planeSplitTime: _planeSplitTimeWindow.summary(),
-                compressionTime: _compressionTimeWindow.summary()
+                compressionTime: _compressionTimeWindow.summary(),
+                nv12FullFrames: _nv12FullFrames,
+                nv12RegionFrames: _nv12RegionFrames,
+                nv12RawBytes: _nv12RawBytes,
+                nv12WireBytes: _nv12WireBytes,
+                nv12CopyTime: _nv12CopyTimeWindow.summary(),
+                nv12CompressionTime: _nv12CompressionTimeWindow.summary(),
+                nv12RegionPixels: _nv12RegionPixelsWindow.summary(),
+                nv12OverfetchPermille: _nv12OverfetchPermilleWindow.summary()
             )
         }
     }
@@ -2000,6 +2059,37 @@ private final class TBVideoPipeline: @unchecked Sendable {
         lock.unlock()
     }
 
+    private func recordNV12Packet(
+        _ result: TBNV12Compression.PacketResult,
+        isRegion: Bool,
+        dirtyPixels: Int
+    ) {
+        lock.lock()
+        if isRegion { _nv12RegionFrames += 1 } else { _nv12FullFrames += 1 }
+        _nv12RawBytes &+= UInt64(result.rawBytes)
+        _nv12WireBytes &+= UInt64(result.wireBytes)
+        _nv12CopyTimeWindow.record(result.copyNanoseconds)
+        _nv12CompressionTimeWindow.record(result.compressionNanoseconds)
+        _nv12RegionPixelsWindow.record(UInt64(result.regionPixels))
+        if dirtyPixels > 0 {
+            _nv12OverfetchPermilleWindow.record(
+                UInt64(result.regionPixels * 1000 / dirtyPixels)
+            )
+        }
+        lock.unlock()
+    }
+
+    private func recordNV12RawBaseline(rawBytes: Int, wireBytes: Int) {
+        lock.lock()
+        _nv12FullFrames += 1
+        _nv12RawBytes &+= UInt64(rawBytes)
+        _nv12WireBytes &+= UInt64(wireBytes)
+        _nv12RegionPixelsWindow.record(
+            UInt64(preset.width * preset.height)
+        )
+        lock.unlock()
+    }
+
     // MARK: - Encoder setup (on `queue`)
 
     private func setupEncoder() {
@@ -2067,6 +2157,18 @@ private final class TBVideoPipeline: @unchecked Sendable {
     func submitCapturedFrame(_ sampleBuffer: CMSampleBuffer) {
         markCaptureFrame()
         guard usesBC7Mode6 else {
+            if usesRawNV12 {
+                let frame = TBCapturedFrame(
+                    sampleBuffer: sampleBuffer,
+                    receivedAtNanoseconds: DispatchTime.now().uptimeNanoseconds
+                )
+                if latestRawNV12Frame.submit(frame) {
+                    queue.async { [weak self] in
+                        self?.drainLatestRawNV12Frame()
+                    }
+                }
+                return
+            }
             queue.async { [weak self] in
                 self?.encode(sampleBuffer)
             }
@@ -2080,6 +2182,32 @@ private final class TBVideoPipeline: @unchecked Sendable {
             queue.async { [weak self] in
                 self?.drainLatestBC7Frame()
             }
+        }
+    }
+
+    private func drainLatestRawNV12Frame() {
+        guard pendingVideoPackets == 0 else { return }
+        let taken = latestRawNV12Frame.takeWithDroppedCount()
+        let dropped = taken.droppedCount
+        if dropped > rawNV12ObservedDropped {
+            rawNV12HasBaseline = false
+            rawNV12ObservedDropped = dropped
+        }
+        guard let capturedFrame = taken.value else {
+            if latestRawNV12Frame.finishProcessing() {
+                queue.async { [weak self] in self?.drainLatestRawNV12Frame() }
+            }
+            return
+        }
+        let queueAge = DispatchTime.now().uptimeNanoseconds -
+            capturedFrame.receivedAtNanoseconds
+        lock.lock()
+        _queueAgeWindow.record(queueAge)
+        lock.unlock()
+        lastRawNV12Frame = capturedFrame
+        encode(capturedFrame.sampleBuffer)
+        if latestRawNV12Frame.finishProcessing(), pendingVideoPackets == 0 {
+            queue.async { [weak self] in self?.drainLatestRawNV12Frame() }
         }
     }
 
@@ -2259,7 +2387,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
         // Backpressure: never pile frames on top of a network that can't keep up.
-        if pendingVideoPackets >= preset.maxPendingVideoPackets {
+        if pendingVideoPackets != 0 {
             droppedVideoFrames += 1
             return
         }
@@ -2283,36 +2411,82 @@ private final class TBVideoPipeline: @unchecked Sendable {
         notifyFirstFrameIfNeeded(width: width, height: height)
 
         let packet: Data
+        var isFullBaselinePacket = false
         let dirtyRects = Self.dirtyRects(
             from: sampleBuffer, pixelWidth: width, pixelHeight: height
         )
         if usesRawNV12LZ4, rawNV12HasBaseline,
-           let rects = dirtyRects, !rects.isEmpty {
+           let rects = dirtyRects, rects.isEmpty {
+            return
+        } else if usesRawNV12LZ4, rawNV12HasBaseline,
+                  let rects = dirtyRects {
             let union = rects.dropFirst().reduce(rects[0]) { $0.union($1) }
             let x = max(0, Int(floor(union.minX)) & ~1)
             let y = max(0, Int(floor(union.minY)) & ~1)
             let maxX = min(width, (Int(ceil(union.maxX)) + 1) & ~1)
             let maxY = min(height, (Int(ceil(union.maxY)) + 1) & ~1)
-            packet = TBNV12Compression.makeRegionPacket(
+            if let result = TBNV12Compression.makeRegionPacket(
                 yBase: yBase, uvBase: uvBase,
                 width: width, height: height,
                 yStride: yStride, uvStride: uvStride,
                 x: x, y: y, regionWidth: maxX - x, regionHeight: maxY - y
-            ) ?? Data()
-            if packet.isEmpty { return }
+            ) {
+                packet = result.packet
+                let dirtyPixels = rects.reduce(0) {
+                    $0 + max(0, Int($1.width * $1.height))
+                }
+                recordNV12Packet(
+                    result, isRegion: true, dirtyPixels: dirtyPixels
+                )
+            } else {
+                rawNV12HasBaseline = false
+                let y = Data(bytes: yBase, count: ySize)
+                let uv = Data(bytes: uvBase, count: uvSize)
+                var payload = Data(capacity: 17 + ySize + uvSize)
+                payload.append(1)
+                TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(yStride))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(uvStride))
+                payload.append(y); payload.append(uv)
+                packet = TBMonitorProtocol.makePacket(
+                    type: .rawFrame, payload: payload
+                )
+                isFullBaselinePacket = true
+                recordNV12RawBaseline(
+                    rawBytes: ySize + uvSize,
+                    wireBytes: packet.count
+                )
+            }
         } else if usesRawNV12LZ4 {
             let y = Data(bytes: yBase, count: ySize)
             let uv = Data(bytes: uvBase, count: uvSize)
-            guard let compressed = TBNV12Compression.makePacket(
-            y: y,
-            uv: uv,
-            width: width,
-            height: height,
-            yStride: yStride,
-            uvStride: uvStride
-            ) else { return }
-            packet = compressed
-            rawNV12HasBaseline = true
+            if let result = TBNV12Compression.makePacket(
+                y: y, uv: uv, width: width, height: height,
+                yStride: yStride, uvStride: uvStride
+            ) {
+                packet = result.packet
+                recordNV12Packet(
+                    result, isRegion: false, dirtyPixels: width * height
+                )
+            } else {
+                var payload = Data(capacity: 17 + ySize + uvSize)
+                payload.append(1)
+                TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(yStride))
+                TBMonitorProtocol.appendBE32(&payload, UInt32(uvStride))
+                payload.append(y)
+                payload.append(uv)
+                packet = TBMonitorProtocol.makePacket(
+                    type: .rawFrame, payload: payload
+                )
+                recordNV12RawBaseline(
+                    rawBytes: ySize + uvSize,
+                    wireBytes: packet.count
+                )
+            }
+            isFullBaselinePacket = true
         } else {
             let y = Data(bytes: yBase, count: ySize)
             let uv = Data(bytes: uvBase, count: uvSize)
@@ -2325,15 +2499,53 @@ private final class TBVideoPipeline: @unchecked Sendable {
             payload.append(y)
             payload.append(uv)
             packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+            recordNV12RawBaseline(
+                rawBytes: ySize + uvSize,
+                wireBytes: packet.count
+            )
         }
         pendingVideoPackets += 1
-        connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
+        let sendStarted = DispatchTime.now().uptimeNanoseconds
+        let fullBaselinePacket = isFullBaselinePacket
+        connection.send(content: packet, completion: .contentProcessed({ [weak self] error in
             guard let self else { return }
             self.queue.async {
                 self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                self.lock.lock()
+                if error == nil {
+                    self._bc7SendCompletedFrames += 1
+                    let elapsed =
+                        DispatchTime.now().uptimeNanoseconds - sendStarted
+                    self._bc7SendNanoseconds &+= elapsed
+                    self._sendTimeWindow.record(elapsed)
+                    if fullBaselinePacket {
+                        self.rawNV12HasBaseline = true
+                    }
+                } else {
+                    self._bc7SendErrors += 1
+                    self.rawNV12HasBaseline = false
+                }
+                self.lock.unlock()
+                self.drainLatestRawNV12Frame()
             }
         }))
         lock.lock(); _sentFrames += 1; _sentBytes += packet.count; lock.unlock()
+    }
+
+    func requestRawNV12Keyframe() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.rawNV12HasBaseline = false
+            guard let frame = self.lastRawNV12Frame else { return }
+            let retry = TBCapturedFrame(
+                sampleBuffer: frame.sampleBuffer,
+                receivedAtNanoseconds: DispatchTime.now().uptimeNanoseconds
+            )
+            let result = self.latestRawNV12Frame.submitIfEmpty(retry)
+            if result.shouldSchedule {
+                self.drainLatestRawNV12Frame()
+            }
+        }
     }
 
     private func sendBC7Frame(_ sampleBuffer: CMSampleBuffer) {
@@ -3775,6 +3987,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 let generation = TBMonitorProtocol.readBE32(payload, offset: 0)
                 guard generation == bc7RenderGeneration else { break }
                 pipeline?.requestBC7Keyframe()
+            case .rawNV12KeyframeRequest:
+                guard payload.isEmpty else { break }
+                pipeline?.requestRawNV12Keyframe()
             case .inputEvent:
                 if inputControlRole == .receiverMaster,
                    let event = TBMonitorProtocol.decodeJSON(TBMonitorInputEvent.self, from: payload) {
@@ -5355,7 +5570,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     "compressionP50Ms":
                         Double(diagnostics.compressionTime.p50) / 1_000_000.0,
                     "compressionP95Ms":
-                        Double(diagnostics.compressionTime.p95) / 1_000_000.0
+                        Double(diagnostics.compressionTime.p95) / 1_000_000.0,
+                    "nv12FullFrames": diagnostics.nv12FullFrames,
+                    "nv12RegionFrames": diagnostics.nv12RegionFrames,
+                    "nv12RawBytes": diagnostics.nv12RawBytes,
+                    "nv12WireBytes": diagnostics.nv12WireBytes,
+                    "nv12CopyP50Ms":
+                        Double(diagnostics.nv12CopyTime.p50) / 1_000_000.0,
+                    "nv12CopyP95Ms":
+                        Double(diagnostics.nv12CopyTime.p95) / 1_000_000.0,
+                    "nv12CompressionP50Ms":
+                        Double(diagnostics.nv12CompressionTime.p50) / 1_000_000.0,
+                    "nv12CompressionP95Ms":
+                        Double(diagnostics.nv12CompressionTime.p95) / 1_000_000.0,
+                    "nv12RegionPixelsP50": diagnostics.nv12RegionPixels.p50,
+                    "nv12RegionPixelsP95": diagnostics.nv12RegionPixels.p95,
+                    "nv12OverfetchP50":
+                        Double(diagnostics.nv12OverfetchPermille.p50) / 1000.0,
+                    "nv12OverfetchP95":
+                        Double(diagnostics.nv12OverfetchPermille.p95) / 1000.0
                 ]
                 if let receiver = lastReceiverMetrics {
                     metricsJSON["receiver"] = [
@@ -5379,6 +5612,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                             receiver.decompressionP95Ms ?? 0,
                         "inverseTransformP95Ms":
                             receiver.inverseTransformP95Ms ?? 0,
+                        "rawFullFrames": receiver.rawFullFrames ?? 0,
+                        "rawRegionFrames": receiver.rawRegionFrames ?? 0,
+                        "rawShadowCommitP95Ms":
+                            receiver.rawShadowCommitP95Ms ?? 0,
+                        "rawUploadPresentP95Ms":
+                            receiver.rawUploadP95Ms ?? 0,
                         "invalid": receiver.bc7Invalid,
                         "renderFailures": receiver.renderFailures,
                         "keyframeRequests": receiver.keyframeRequests

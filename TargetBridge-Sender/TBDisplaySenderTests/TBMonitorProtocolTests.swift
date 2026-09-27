@@ -121,6 +121,10 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(TBMonitorPacketType.bc7KeyframeRequest.rawValue, 0x28)
         XCTAssertEqual(TBMonitorPacketType.bc7CompressedFrame.rawValue, 0x29)
         XCTAssertEqual(TBMonitorPacketType.bc7CompressedDelta.rawValue, 0x2A)
+        XCTAssertEqual(
+            TBMonitorPacketType.rawNV12KeyframeRequest.rawValue,
+            0x2B
+        )
         XCTAssertEqual(TBMonitorPacketType.receiverMetrics.rawValue, 0x14)
 
         let olderProfile = Data("""
@@ -758,13 +762,52 @@ final class TBMonitorProtocolTests: XCTestCase {
             yStride: yStride,
             uvStride: uvStride
         ))
-        let decoded = try XCTUnwrap(TBNV12Compression.decodePacket(packet))
+        let decoded = try XCTUnwrap(
+            TBNV12Compression.decodePacket(packet.packet)
+        )
         XCTAssertEqual(decoded.width, width)
         XCTAssertEqual(decoded.height, height)
         XCTAssertEqual(decoded.yStride, yStride)
         XCTAssertEqual(decoded.uvStride, uvStride)
         XCTAssertEqual(decoded.y, y)
         XCTAssertEqual(decoded.uv, uv)
+    }
+
+    func testNV12LZ4RegionPacketCopiesOnlyAlignedRegion() throws {
+        let width = 128, height = 64
+        let yStride = 128, uvStride = 128
+        let y = Data((0..<(yStride * height)).map {
+            UInt8(truncatingIfNeeded: $0)
+        })
+        let uv = Data((0..<(uvStride * height / 2)).map {
+            UInt8(truncatingIfNeeded: $0 &* 3)
+        })
+        let packet = try y.withUnsafeBytes { yBytes in
+            try uv.withUnsafeBytes { uvBytes in
+                try XCTUnwrap(TBNV12Compression.makeRegionPacket(
+                    yBase: try XCTUnwrap(yBytes.baseAddress),
+                    uvBase: try XCTUnwrap(uvBytes.baseAddress),
+                    width: width, height: height,
+                    yStride: yStride, uvStride: uvStride,
+                    x: 32, y: 16, regionWidth: 64, regionHeight: 32
+                ))
+            }
+        }
+        let decoded = try XCTUnwrap(
+            TBNV12Compression.decodeRegionPacket(packet.packet)
+        )
+        XCTAssertEqual(decoded.x, 32)
+        XCTAssertEqual(decoded.y, 16)
+        XCTAssertEqual(decoded.regionWidth, 64)
+        XCTAssertEqual(decoded.regionHeight, 32)
+        var expected = Data()
+        for row in 16..<48 {
+            expected.append(y[(row * yStride + 32)..<(row * yStride + 96)])
+        }
+        for row in 8..<24 {
+            expected.append(uv[(row * uvStride + 32)..<(row * uvStride + 96)])
+        }
+        XCTAssertEqual(decoded.raw, expected)
     }
 
     func testBC7CompressionModeCapabilityResolution() {
@@ -1246,6 +1289,29 @@ final class TBMonitorProtocolTests: XCTestCase {
 
         XCTAssertTrue(slot.submit(4))
         XCTAssertEqual(slot.take(), 4)
+        XCTAssertFalse(slot.finishProcessing())
+    }
+
+    func testLatestFrameSlotAtomicallyReturnsDropGeneration() {
+        let slot = TBLatestFrameSlot<Int>()
+        XCTAssertTrue(slot.submit(1))
+        XCTAssertFalse(slot.submit(2))
+        XCTAssertFalse(slot.submit(3))
+        let taken = slot.takeWithDroppedCount()
+        XCTAssertEqual(taken.value, 3)
+        XCTAssertEqual(taken.droppedCount, 2)
+        XCTAssertFalse(slot.finishProcessing())
+    }
+
+    func testLatestFrameSlotRecoveryDoesNotReplaceNewerPendingFrame() {
+        let slot = TBLatestFrameSlot<Int>()
+        XCTAssertTrue(slot.submit(1))
+        XCTAssertEqual(slot.take(), 1)
+        XCTAssertFalse(slot.submit(2))
+        let recovery = slot.submitIfEmpty(1)
+        XCTAssertFalse(recovery.inserted)
+        XCTAssertFalse(recovery.shouldSchedule)
+        XCTAssertEqual(slot.take(), 2)
         XCTAssertFalse(slot.finishProcessing())
     }
 

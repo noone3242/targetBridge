@@ -1135,11 +1135,11 @@ static void tb_disp_render_current(struct tb_display *d) {
     SDL_RenderPresent(d->ren);
 }
 
-void tb_disp_render_nv12(struct tb_display *d,
-                         const uint8_t *y, int y_stride,
-                         const uint8_t *uv, int uv_stride,
-                         int w, int h) {
-    if (tb_disp_ensure_texture(d, w, h) < 0) return;
+int tb_disp_render_nv12(struct tb_display *d,
+                        const uint8_t *y, int y_stride,
+                        const uint8_t *uv, int uv_stride,
+                        int w, int h) {
+    if (tb_disp_ensure_texture(d, w, h) < 0) return -1;
     tb_disp_set_connection_state(d, 1);
     tb_bc7_renderer_set_visible(d->bc7, 0);
 
@@ -1147,10 +1147,32 @@ void tb_disp_render_nv12(struct tb_display *d,
                             y,  y_stride,
                             uv, uv_stride) < 0) {
         fprintf(stderr, "[disp] UpdateNVTexture: %s\n", SDL_GetError());
-        return;
+        return -1;
     }
     d->last_video_frame_time = SDL_GetTicks();
     tb_disp_render_current(d);
+    return 0;
+}
+
+int tb_disp_render_nv12_region(struct tb_display *d,
+                               const uint8_t *y, int y_stride,
+                               const uint8_t *uv, int uv_stride,
+                               int texture_w, int texture_h,
+                               int x, int y_pos, int w, int h) {
+    if (!d || !d->tex || d->tex_w != texture_w || d->tex_h != texture_h ||
+        !y || !uv || x < 0 || y_pos < 0 || w <= 0 || h <= 0 ||
+        ((x | y_pos | w | h) & 1) ||
+        x + w > texture_w || y_pos + h > texture_h) {
+        return -1;
+    }
+    SDL_Rect rect = {x, y_pos, w, h};
+    if (SDL_UpdateNVTexture(d->tex, &rect, y, y_stride, uv, uv_stride) < 0) {
+        fprintf(stderr, "[disp] UpdateNVTexture region: %s\n", SDL_GetError());
+        return -1;
+    }
+    d->last_video_frame_time = SDL_GetTicks();
+    tb_disp_render_current(d);
+    return 0;
 }
 
 int tb_disp_supports_bc7(struct tb_display *d) {

@@ -2,6 +2,14 @@ import Compression
 import Foundation
 
 enum TBNV12Compression {
+    struct PacketResult {
+        let packet: Data
+        let rawBytes: Int
+        let wireBytes: Int
+        let copyNanoseconds: UInt64
+        let compressionNanoseconds: UInt64
+        let regionPixels: Int
+    }
     struct Decoded {
         let y: Data
         let uv: Data
@@ -9,6 +17,17 @@ enum TBNV12Compression {
         let height: Int
         let yStride: Int
         let uvStride: Int
+    }
+    struct DecodedRegion {
+        let raw: Data
+        let width: Int
+        let height: Int
+        let yStride: Int
+        let uvStride: Int
+        let x: Int
+        let y: Int
+        let regionWidth: Int
+        let regionHeight: Int
     }
 
     static func makePacket(
@@ -18,16 +37,19 @@ enum TBNV12Compression {
         height: Int,
         yStride: Int,
         uvStride: Int
-    ) -> Data? {
+    ) -> PacketResult? {
         guard width > 0, height > 0, width % 2 == 0, height % 2 == 0,
               y.count == yStride * height,
               uv.count == uvStride * (height / 2)
         else { return nil }
+        let copyStarted = DispatchTime.now().uptimeNanoseconds
         var raw = Data(capacity: y.count + uv.count)
         raw.append(y)
         raw.append(uv)
+        let copyFinished = DispatchTime.now().uptimeNanoseconds
         let capacity = raw.count + 64 * 1024
         var compressed = Data(count: capacity)
+        let compressionStarted = copyFinished
         let size = raw.withUnsafeBytes { source in
             compressed.withUnsafeMutableBytes { destination in
                 guard let src = source.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -37,8 +59,8 @@ enum TBNV12Compression {
                     dst, capacity, src, raw.count, nil, COMPRESSION_LZ4
                 )
             }
-
         }
+        let compressionFinished = DispatchTime.now().uptimeNanoseconds
         guard size > 0 else { return nil }
         compressed.count = size
         var payload = Data(capacity: 38 + size)
@@ -54,18 +76,27 @@ enum TBNV12Compression {
         TBMonitorProtocol.appendBE64(&payload, checksum(raw))
         payload.append(compressed)
         let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
-        return raw.count + 17 - packet.count >= 4 * 1024 ? packet : nil
+        guard raw.count + 17 - packet.count >= 4 * 1024 else { return nil }
+        return PacketResult(
+            packet: packet,
+            rawBytes: raw.count,
+            wireBytes: packet.count,
+            copyNanoseconds: copyFinished - copyStarted,
+            compressionNanoseconds: compressionFinished - compressionStarted,
+            regionPixels: width * height
+        )
     }
 
     static func makeRegionPacket(
         yBase: UnsafeRawPointer, uvBase: UnsafeRawPointer,
         width: Int, height: Int, yStride: Int, uvStride: Int,
         x: Int, y: Int, regionWidth: Int, regionHeight: Int
-    ) -> Data? {
+    ) -> PacketResult? {
         guard x >= 0, y >= 0, regionWidth > 0, regionHeight > 0,
               x % 2 == 0, y % 2 == 0, regionWidth % 2 == 0,
               regionHeight % 2 == 0, x + regionWidth <= width,
               y + regionHeight <= height else { return nil }
+        let copyStarted = DispatchTime.now().uptimeNanoseconds
         var raw = Data(capacity: regionWidth * regionHeight * 3 / 2)
         for row in 0..<regionHeight {
             raw.append(
@@ -81,8 +112,10 @@ enum TBNV12Compression {
                 count: regionWidth
             )
         }
+        let copyFinished = DispatchTime.now().uptimeNanoseconds
         let capacity = raw.count + 64 * 1024
         var compressed = Data(count: capacity)
+        let compressionStarted = copyFinished
         let size = raw.withUnsafeBytes { src in
             compressed.withUnsafeMutableBytes { dst in
                 guard let s = src.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -93,6 +126,7 @@ enum TBNV12Compression {
                 )
             }
         }
+        let compressionFinished = DispatchTime.now().uptimeNanoseconds
         guard size > 0 else { return nil }
         compressed.count = size
         var payload = Data(capacity: 54 + size)
@@ -105,7 +139,49 @@ enum TBNV12Compression {
         }
         TBMonitorProtocol.appendBE64(&payload, checksum(raw))
         payload.append(compressed)
-        return TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+        let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+        return PacketResult(
+            packet: packet,
+            rawBytes: raw.count,
+            wireBytes: packet.count,
+            copyNanoseconds: copyFinished - copyStarted,
+            compressionNanoseconds: compressionFinished - compressionStarted,
+            regionPixels: regionWidth * regionHeight
+        )
+    }
+
+    static func decodeRegionPacket(_ packet: Data) -> DecodedRegion? {
+        guard packet.count >= 59, packet[4] == TBMonitorPacketType.rawFrame.rawValue,
+              packet[5] == 3, packet[6] == 1 else { return nil }
+        let values = stride(from: 7, through: 47, by: 4).map {
+            Int(TBMonitorProtocol.readBE32(packet, offset: $0))
+        }
+        let checksumValue = TBMonitorProtocol.readBE64(packet, offset: 51)
+        let compressedStart = 59
+        let rawLength = values[8] + values[9]
+        guard values[6] > 0, values[7] > 0,
+              values[8] == values[6] * values[7],
+              values[9] == values[6] * values[7] / 2,
+              compressedStart + values[10] == packet.count else { return nil }
+        var raw = Data(count: rawLength)
+        let decoded = packet.withUnsafeBytes { sourceBytes in
+            raw.withUnsafeMutableBytes { destinationBytes in
+                guard let source = sourceBytes.baseAddress?
+                    .advanced(by: compressedStart).assumingMemoryBound(to: UInt8.self),
+                      let destination = destinationBytes.baseAddress?
+                    .assumingMemoryBound(to: UInt8.self) else { return 0 }
+                return compression_decode_buffer(
+                    destination, rawLength, source, values[10], nil, COMPRESSION_LZ4
+                )
+            }
+        }
+        guard decoded == rawLength, checksum(raw) == checksumValue else { return nil }
+        return DecodedRegion(
+            raw: raw, width: values[0], height: values[1],
+            yStride: values[2], uvStride: values[3],
+            x: values[4], y: values[5],
+            regionWidth: values[6], regionHeight: values[7]
+        )
     }
 
     static func decodePacket(_ packet: Data) -> Decoded? {
