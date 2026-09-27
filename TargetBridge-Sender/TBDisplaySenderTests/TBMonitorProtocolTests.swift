@@ -153,6 +153,7 @@ final class TBMonitorProtocolTests: XCTestCase {
           "hiDPI": true,
           "captureWidth": 5120,
           "captureHeight": 2880,
+          "supportsBC7AdaptivePatches": true,
           "receiverVersion": "3.3.0",
           "receiverBuild": "dev-20260926163000",
           "receiverCommit": "9b6b092abcde"
@@ -162,6 +163,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(current.receiverVersion, "3.3.0")
         XCTAssertEqual(current.receiverBuild, "dev-20260926163000")
         XCTAssertEqual(current.receiverCommit, "9b6b092abcde")
+        XCTAssertEqual(current.supportsBC7AdaptivePatches, true)
 
         let metrics = try JSONDecoder().decode(
             TBMonitorReceiverMetrics.self,
@@ -513,6 +515,161 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(packet.subdata(in: 54..<packet.count), expected)
     }
 
+    func testBC7AdaptivePatchRectBoundsDirtyTiles() throws {
+        XCTAssertEqual(
+            tbBC7AdaptivePatchRect(
+                tileIndices: [1, 2, 81, 82],
+                width: 5120,
+                height: 2880
+            ),
+            CGRect(x: 64, y: 0, width: 128, height: 128)
+        )
+        XCTAssertNil(tbBC7AdaptivePatchRect(
+            tileIndices: [],
+            width: 5120,
+            height: 2880
+        ))
+    }
+
+    func testBC7AdaptiveModeRequiresPresetCodecAndReceiverCapability() {
+        XCTAssertTrue(tbBC7AdaptiveModeEnabled(
+            preset: .native5k90Adaptive,
+            usesBC7Mode6: true,
+            receiverSupportsTileDelta: true,
+            receiverSupportsAdaptivePatches: true
+        ))
+        XCTAssertFalse(tbBC7AdaptiveModeEnabled(
+            preset: .native5k90Adaptive,
+            usesBC7Mode6: true,
+            receiverSupportsTileDelta: true,
+            receiverSupportsAdaptivePatches: false
+        ))
+        XCTAssertFalse(tbBC7AdaptiveModeEnabled(
+            preset: .native5k90Adaptive,
+            usesBC7Mode6: false,
+            receiverSupportsTileDelta: true,
+            receiverSupportsAdaptivePatches: true
+        ))
+        XCTAssertFalse(tbBC7AdaptiveModeEnabled(
+            preset: .native5k,
+            usesBC7Mode6: true,
+            receiverSupportsTileDelta: true,
+            receiverSupportsAdaptivePatches: true
+        ))
+        XCTAssertFalse(tbBC7AdaptiveModeEnabled(
+            preset: .native5k90Adaptive,
+            usesBC7Mode6: true,
+            receiverSupportsTileDelta: false,
+            receiverSupportsAdaptivePatches: true
+        ))
+    }
+
+    func testBC7AdaptivePatchRequiresBaselineAndTwentyPercentDirtyTiles() {
+        XCTAssertFalse(tbShouldSendBC7AdaptivePatch(
+            requiresFullFrame: true,
+            dirtyTileCount: 1440,
+            totalTileCount: 7200
+        ))
+        XCTAssertFalse(tbShouldSendBC7AdaptivePatch(
+            requiresFullFrame: false,
+            dirtyTileCount: 1439,
+            totalTileCount: 7200
+        ))
+        XCTAssertTrue(tbShouldSendBC7AdaptivePatch(
+            requiresFullFrame: false,
+            dirtyTileCount: 1440,
+            totalTileCount: 7200
+        ))
+    }
+
+    func testIdleCaptureFrameOnlyRunsForPendingAdaptiveRepair() {
+        XCTAssertFalse(tbShouldProcessCaptureFrame(
+            status: .idle,
+            adaptiveRepairNeeded: false
+        ))
+        XCTAssertTrue(tbShouldProcessCaptureFrame(
+            status: .idle,
+            adaptiveRepairNeeded: true
+        ))
+        XCTAssertTrue(tbShouldProcessCaptureFrame(
+            status: .complete,
+            adaptiveRepairNeeded: false
+        ))
+        XCTAssertFalse(tbShouldProcessCaptureFrame(
+            status: .blank,
+            adaptiveRepairNeeded: true
+        ))
+    }
+
+    func testAdaptiveRepairForcesFullFrameEncoding() {
+        let emptyDirtyRects: [CGRect] = []
+        XCTAssertNil(tbBC7EncodeDirtyRects(
+            emptyDirtyRects,
+            repairingAdaptiveFrame: true
+        ))
+        XCTAssertEqual(
+            tbBC7EncodeDirtyRects(
+                emptyDirtyRects,
+                repairingAdaptiveFrame: false
+            ),
+            emptyDirtyRects
+        )
+    }
+
+    func testBC7AdaptivePatchPacketLayout() throws {
+        let patchData = Data((0..<4096).map { UInt8(truncatingIfNeeded: $0 * 17) })
+        let patch = TBBC7ScaledPatch(
+            destinationX: 128,
+            destinationY: 64,
+            destinationWidth: 128,
+            destinationHeight: 128,
+            encodedWidth: 64,
+            encodedHeight: 64,
+            bytesPerRow: 256,
+            data: patchData
+        )
+        let packet = try XCTUnwrap(tbMakeBC7AdaptivePatchPacket(
+            patch: patch,
+            canvasWidth: 5120,
+            canvasHeight: 2880,
+            generation: 7,
+            frameID: 11,
+            captureTimestampNanoseconds: 13,
+            nativeSequence: 5,
+            nativeChecksum: 0x1122_3344_5566_7788
+        ))
+
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 0), UInt32(packet.count - 4))
+        XCTAssertEqual(packet[4], TBMonitorPacketType.bc7AdaptiveFrame.rawValue)
+        XCTAssertEqual(packet[5], 1)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 6), 7)
+        XCTAssertEqual(TBMonitorProtocol.readBE64(packet, offset: 10), 11)
+        XCTAssertEqual(TBMonitorProtocol.readBE64(packet, offset: 18), 13)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 26), 5120)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 30), 2880)
+        XCTAssertEqual(TBMonitorProtocol.readBE64(packet, offset: 34), 5)
+        XCTAssertEqual(TBMonitorProtocol.readBE64(packet, offset: 42), 5)
+        XCTAssertEqual(
+            TBMonitorProtocol.readBE64(packet, offset: 50),
+            0x1122_3344_5566_7788
+        )
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 58), 0)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 60), 1)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 62), 64)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 64), 64)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 66), 256)
+        XCTAssertEqual(TBMonitorProtocol.readBE32(packet, offset: 70), 4096)
+        XCTAssertEqual(
+            TBMonitorProtocol.readBE64(packet, offset: 74),
+            tbBC7PayloadChecksum(patchData)
+        )
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 82), 128)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 84), 64)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 86), 128)
+        XCTAssertEqual(TBMonitorProtocol.readBE16(packet, offset: 88), 128)
+        XCTAssertEqual(packet.subdata(in: 98..<packet.count), patchData)
+    }
+
     func testNative5KRequiresNativeSourceFramebuffer() {
         XCTAssertFalse(tbSourceFramebufferSupportsNativeCapture(
             preset: .native5k, pixelWidth: 2560, pixelHeight: 1440
@@ -755,6 +912,32 @@ final class TBMonitorProtocolTests: XCTestCase {
         let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
         let unaligned = try makeBGRAPixelBuffer(width: 5, height: 4) { _, _ in
             (0, 0, 0, 255)
+        }
+
+        func testMetalBC7HalfScalePatchUsesLocalDestinationCoordinates() throws {
+            let pixelBuffer = try makeBGRAPixelBuffer(width: 128, height: 128) { x, y in
+                (
+                    UInt8(truncatingIfNeeded: x * 3),
+                    UInt8(truncatingIfNeeded: y * 5),
+                    UInt8(truncatingIfNeeded: x + y),
+                    255
+                )
+            }
+            let encoder = try XCTUnwrap(TBBC7Mode6Encoder())
+            let patch = try XCTUnwrap(encoder.encodeHalfScalePatch(
+                pixelBuffer: pixelBuffer,
+                destinationRect: CGRect(x: 64, y: 0, width: 64, height: 64)
+            ))
+
+            XCTAssertEqual(patch.destinationX, 64)
+            XCTAssertEqual(patch.destinationY, 0)
+            XCTAssertEqual(patch.destinationWidth, 64)
+            XCTAssertEqual(patch.destinationHeight, 64)
+            XCTAssertEqual(patch.encodedWidth, 32)
+            XCTAssertEqual(patch.encodedHeight, 32)
+            XCTAssertEqual(patch.bytesPerRow, 128)
+            XCTAssertEqual(patch.data.count, 1024)
+            XCTAssertNotEqual(Set(patch.data), Set([UInt8(0)]))
         }
         XCTAssertNil(encoder.encode(pixelBuffer: unaligned))
 

@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "bc7_adaptive.h"
+
 struct tb_display;
 
 struct tb_display_info {
@@ -103,6 +105,10 @@ int tb_disp_upload_bc7_region(struct tb_display *d,
                               uint32_t height,
                               uint32_t bytes_per_row);
 int tb_disp_present_bc7(struct tb_display *d, int wait_for_completion);
+int tb_disp_apply_bc7_adaptive(
+    struct tb_display *d,
+    const struct tb_bc7_adaptive_frame *frame,
+    int wait_for_completion);
 
 /* Update low-latency local cursor overlay in source-frame coordinates. */
 void tb_disp_set_cursor(struct tb_display *d,

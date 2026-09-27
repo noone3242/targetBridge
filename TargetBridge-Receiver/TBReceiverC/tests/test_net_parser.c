@@ -9,6 +9,7 @@
 #include "../src/proto.h"
 #include "../src/bc7_frame.h"
 #include "../src/bc7_delta.h"
+#include "../src/bc7_adaptive.h"
 #include "../src/bc7_cursor.h"
 
 #include <stdio.h>
@@ -362,6 +363,21 @@ static void test_bc7_delta_validation(void) {
           "shadow contains the delta tile bytes");
     CHECK(applied_checksum == frame.checksum,
           "applied shadow checksum matches wire checksum");
+    memset(shadow, 0, sizeof(shadow));
+    tile_checksums[0] = 0;
+    uint64_t candidate_checksums[1] = {0};
+    CHECK(tb_bc7_delta_validate_candidate(
+              &frame, tile_checksums, 1, 0,
+              candidate_checksums, &applied_checksum) == 0,
+          "delta candidate validates without cloning the shadow");
+    CHECK(shadow[0] == 0 && tile_checksums[0] == 0,
+          "candidate validation does not mutate live state");
+    CHECK(tb_bc7_delta_commit_to_shadow(
+              &frame, shadow, sizeof(shadow), 256,
+              tile_checksums, 1, candidate_checksums) == 0,
+          "validated delta commits in place");
+    CHECK(memcmp(shadow, payload + 49, sizeof(shadow)) == 0,
+          "in-place commit writes run bytes");
     CHECK(!tb_bc7_delta_prefers_full_upload(&frame, 32768),
           "single small run keeps regional upload");
     frame.run_count = 9;
@@ -382,6 +398,18 @@ static void test_bc7_delta_validation(void) {
     memset(shadow, 0, sizeof(shadow));
     tile_checksums[0] = 0;
     frame.checksum ^= 1u;
+    memset(shadow, 0x44, sizeof(shadow));
+    tile_checksums[0] = UINT64_C(0x1234);
+    uint8_t unchanged_shadow[sizeof(shadow)];
+    memcpy(unchanged_shadow, shadow, sizeof(shadow));
+    const uint64_t unchanged_tile_checksum = tile_checksums[0];
+    CHECK(tb_bc7_delta_validate_candidate(
+              &frame, tile_checksums, 1, tile_checksums[0],
+              candidate_checksums, &applied_checksum) == -1,
+          "in-place candidate checksum mismatch rejected");
+    CHECK(memcmp(shadow, unchanged_shadow, sizeof(shadow)) == 0 &&
+              tile_checksums[0] == unchanged_tile_checksum,
+          "failed candidate validation leaves live state unchanged");
     CHECK(tb_bc7_delta_apply_to_shadow(
               &frame, shadow, sizeof(shadow), 256,
               tile_checksums, 1, &applied_checksum) == -1,
@@ -423,6 +451,217 @@ static void test_bc7_delta_validation(void) {
           "tile checksum matches cross-language fixture");
 }
 
+static size_t make_adaptive_payload(uint8_t *payload, size_t capacity) {
+    const size_t length = 77 + 16 + 16;
+    if (capacity < length) return 0;
+    memset(payload, 0, length);
+    payload[0] = TB_BC7_ADAPTIVE_FORMAT_VERSION;
+    put_be32(payload + 1, 7);
+    put_be64(payload + 5, 12);
+    put_be64(payload + 13, UINT64_C(987654321));
+    put_be32(payload + 21, TB_BC7_ADAPTIVE_CANVAS_WIDTH);
+    put_be32(payload + 25, TB_BC7_ADAPTIVE_CANVAS_HEIGHT);
+    put_be64(payload + 29, 4);
+    put_be64(payload + 37, 4);
+    put_be64(payload + 45, UINT64_C(0x1122334455667788));
+    put_be16(payload + 53, 0);
+    put_be16(payload + 55, 1);
+    put_be16(payload + 57, 4);
+    put_be16(payload + 59, 4);
+    put_be32(payload + 61, 16);
+    put_be32(payload + 65, 16);
+    put_be16(payload + 77, 5116);
+    put_be16(payload + 79, 2876);
+    put_be16(payload + 81, 4);
+    put_be16(payload + 83, 4);
+    put_be16(payload + 85, 0);
+    put_be16(payload + 87, 0);
+    put_be16(payload + 89, 4);
+    put_be16(payload + 91, 4);
+    for (size_t index = 0; index < 16; index++) {
+        payload[93 + index] = (uint8_t)(index * 19u);
+    }
+    put_be64(payload + 69, tb_bc7_adaptive_checksum(payload + 93, 16));
+    return length;
+}
+
+static void test_bc7_adaptive_validation(void) {
+    uint8_t payload[256];
+    const size_t length = make_adaptive_payload(payload, sizeof(payload));
+    struct tb_bc7_adaptive_frame frame;
+    CHECK(TB_PKT_BC7_ADAPTIVE_FRAME == 0x29,
+          "adaptive packet type is stable");
+    CHECK(tb_bc7_adaptive_parse(payload, length, &frame) == 0,
+          "valid adaptive frame accepted");
+    CHECK(frame.generation == 7 && frame.frame_id == 12,
+          "adaptive identity parsed");
+    CHECK(frame.patch_count == 1 && frame.native_run_count == 0,
+          "adaptive counts parsed");
+    CHECK(frame.atlas_data == payload + 93 &&
+              frame.atlas_data_length == 16,
+          "adaptive atlas location parsed");
+    CHECK(tb_bc7_adaptive_checksum(frame.atlas_data, frame.atlas_data_length) ==
+              frame.atlas_checksum,
+          "adaptive atlas checksum fixture validates");
+    uint64_t tile_checksums[
+        (TB_BC7_ADAPTIVE_CANVAS_WIDTH / TB_BC7_DELTA_TILE_SIZE) *
+        (TB_BC7_ADAPTIVE_CANVAS_HEIGHT / TB_BC7_DELTA_TILE_SIZE)
+    ] = {0};
+    uint64_t candidate_checksums[
+        (TB_BC7_ADAPTIVE_CANVAS_WIDTH / TB_BC7_DELTA_TILE_SIZE) *
+        (TB_BC7_ADAPTIVE_CANVAS_HEIGHT / TB_BC7_DELTA_TILE_SIZE)
+    ] = {0};
+    struct tb_bc7_adaptive_state state = {
+        .generation = 7,
+        .frame_id = 11,
+        .native_sequence = 4,
+        .native_checksum = UINT64_C(0x1122334455667788)
+    };
+    uint64_t native_result_checksum = 0;
+    CHECK(tb_bc7_adaptive_validate_state(
+              &frame, &state, tile_checksums,
+              sizeof(tile_checksums) / sizeof(tile_checksums[0]),
+              candidate_checksums, &native_result_checksum) ==
+              TB_BC7_ADAPTIVE_VALID,
+          "adaptive state accepts next visual frame without native change");
+    CHECK(native_result_checksum == state.native_checksum,
+          "adaptive no-op native baseline checksum preserved");
+    frame.frame_id = state.frame_id;
+    CHECK(tb_bc7_adaptive_validate_state(
+              &frame, &state, tile_checksums,
+              sizeof(tile_checksums) / sizeof(tile_checksums[0]),
+              candidate_checksums, &native_result_checksum) ==
+              TB_BC7_ADAPTIVE_STALE,
+          "duplicate adaptive frame rejected as stale");
+    frame.frame_id = 12;
+    frame.generation = 8;
+    CHECK(tb_bc7_adaptive_validate_state(
+              &frame, &state, tile_checksums,
+              sizeof(tile_checksums) / sizeof(tile_checksums[0]),
+              candidate_checksums, &native_result_checksum) ==
+              TB_BC7_ADAPTIVE_INVALID,
+          "future adaptive generation rejected");
+    frame.generation = 7;
+    frame.native_base_sequence = 3;
+    CHECK(tb_bc7_adaptive_validate_state(
+              &frame, &state, tile_checksums,
+              sizeof(tile_checksums) / sizeof(tile_checksums[0]),
+              candidate_checksums, &native_result_checksum) ==
+              TB_BC7_ADAPTIVE_INVALID,
+          "adaptive native base mismatch rejected");
+    frame.native_base_sequence = 4;
+    payload[93] ^= 1u;
+    CHECK(tb_bc7_adaptive_validate_state(
+              &frame, &state, tile_checksums,
+              sizeof(tile_checksums) / sizeof(tile_checksums[0]),
+              candidate_checksums, &native_result_checksum) ==
+              TB_BC7_ADAPTIVE_INVALID,
+          "adaptive atlas checksum mismatch rejected before apply");
+    CHECK(state.frame_id == 11 && state.native_sequence == 4 &&
+              tile_checksums[0] == 0,
+          "failed adaptive validation leaves live state unchanged");
+    payload[93] ^= 1u;
+
+    uint8_t native_tile[4096];
+    memset(native_tile, 0x6d, sizeof(native_tile));
+    tile_checksums[1] = state.native_checksum;
+    frame.native_run_count = 1;
+    frame.native_result_sequence = 5;
+    frame.native_runs[0] = (struct tb_bc7_delta_run){
+        .tile_x = 0,
+        .tile_y = 0,
+        .tile_count_x = 1,
+        .pixel_height = 64,
+        .data_length = sizeof(native_tile),
+        .data = native_tile
+    };
+    const uint64_t changed_tile_checksum =
+        tb_bc7_tile_checksum(native_tile, 256, 16, 0);
+    frame.native_result_checksum =
+        state.native_checksum ^ changed_tile_checksum;
+    CHECK(tb_bc7_adaptive_validate_state(
+              &frame, &state, tile_checksums,
+              sizeof(tile_checksums) / sizeof(tile_checksums[0]),
+              candidate_checksums, &native_result_checksum) ==
+              TB_BC7_ADAPTIVE_VALID,
+          "adaptive frame validates an exact native run atomically");
+    CHECK(native_result_checksum == frame.native_result_checksum &&
+              candidate_checksums[0] == changed_tile_checksum,
+          "adaptive native candidate checksum is prepared for commit");
+    CHECK(tile_checksums[0] == 0 && tile_checksums[1] == state.native_checksum,
+          "adaptive native validation does not mutate live checksums");
+    frame.native_run_count = 0;
+    frame.native_result_sequence = 4;
+    frame.native_result_checksum = state.native_checksum;
+    tile_checksums[1] = 0;
+
+    CHECK(tb_bc7_adaptive_parse(payload, 76, &frame) == -1,
+          "truncated adaptive header rejected");
+    CHECK(tb_bc7_adaptive_parse(payload, length - 1, &frame) == -1,
+          "truncated adaptive atlas rejected");
+    CHECK(tb_bc7_adaptive_parse(payload, length + 1, &frame) == -1,
+          "trailing adaptive bytes rejected");
+
+#define REJECT_ADAPTIVE_AT(offset, bytes, message) do {                    \
+    uint8_t saved[(bytes)];                                                \
+    memcpy(saved, payload + (offset), (bytes));                            \
+    memset(payload + (offset), 0, (bytes));                                \
+    CHECK(tb_bc7_adaptive_parse(payload, length, &frame) == -1, (message)); \
+    memcpy(payload + (offset), saved, (bytes));                            \
+} while (0)
+    REJECT_ADAPTIVE_AT(0, 1, "adaptive version zero rejected");
+    REJECT_ADAPTIVE_AT(1, 4, "adaptive generation zero rejected");
+    REJECT_ADAPTIVE_AT(5, 8, "adaptive frame ID zero rejected");
+    REJECT_ADAPTIVE_AT(21, 4, "adaptive canvas width mismatch rejected");
+    REJECT_ADAPTIVE_AT(57, 2, "adaptive atlas width zero rejected");
+    REJECT_ADAPTIVE_AT(61, 4, "adaptive atlas stride zero rejected");
+    REJECT_ADAPTIVE_AT(65, 4, "adaptive atlas length zero rejected");
+#undef REJECT_ADAPTIVE_AT
+
+    put_be16(payload + 55, TB_BC7_ADAPTIVE_MAX_PATCHES + 1u);
+    CHECK(tb_bc7_adaptive_parse(payload, length, &frame) == -1,
+          "adaptive patch count cap enforced");
+    put_be16(payload + 55, 1);
+    put_be16(payload + 77, 5117);
+    CHECK(tb_bc7_adaptive_parse(payload, length, &frame) == -1,
+          "adaptive destination bounds enforced");
+    put_be16(payload + 77, 5116);
+    put_be16(payload + 89, 2);
+    CHECK(tb_bc7_adaptive_parse(payload, length, &frame) == -1,
+          "adaptive source block alignment enforced");
+    put_be16(payload + 89, 4);
+    put_be16(payload + 85, 4);
+    CHECK(tb_bc7_adaptive_parse(payload, length, &frame) == -1,
+          "adaptive source atlas bounds enforced");
+    put_be16(payload + 85, 0);
+
+    const uint64_t declared_checksum = frame.atlas_checksum;
+    payload[93] ^= 1u;
+    CHECK(tb_bc7_adaptive_parse(payload, length, &frame) == 0,
+          "checksum validation remains a state-layer operation");
+    CHECK(tb_bc7_adaptive_checksum(frame.atlas_data, frame.atlas_data_length) !=
+              declared_checksum,
+          "corrupt adaptive atlas is detectable before apply");
+    payload[93] ^= 1u;
+
+    uint8_t native_payload[77 + 12 + 4096 + 16 + 16];
+    size_t native_length =
+        make_adaptive_payload(native_payload, sizeof(native_payload));
+    memmove(native_payload + 77 + 12 + 4096,
+            native_payload + 77,
+            native_length - 77);
+    put_be16(native_payload + 53, 1);
+    put_be16(native_payload + 77, 0);
+    put_be16(native_payload + 79, 0);
+    put_be16(native_payload + 81, 1);
+    put_be16(native_payload + 83, 64);
+    put_be32(native_payload + 85, 4095);
+    memset(native_payload + 89, 0x5a, 4096);
+    native_length += 12 + 4096;
+    CHECK(tb_bc7_adaptive_parse(native_payload, native_length, &frame) == -1,
+          "adaptive native run length mismatch rejected");
+}
+
 static void test_bc7_cursor_policy(void) {
     CHECK(tb_bc7_cursor_normalize_type(0) == 0, "arrow cursor preserved");
     CHECK(tb_bc7_cursor_normalize_type(1) == 1, "I-beam cursor preserved");
@@ -459,6 +698,7 @@ int main(void) {
     test_bc7_payload_validation();
     test_bc7_sequenced_keyframe_validation();
     test_bc7_delta_validation();
+    test_bc7_adaptive_validation();
     test_bc7_cursor_policy();
 
     if (g_failures == 0) {

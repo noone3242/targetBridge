@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bc7_adaptive.h"
+
 struct SDL_Window;
 struct tb_bc7_renderer;
 
@@ -43,6 +45,10 @@ int tb_bc7_renderer_upload_region(struct tb_bc7_renderer *renderer,
                                   uint32_t bytes_per_row);
 int tb_bc7_renderer_present(struct tb_bc7_renderer *renderer,
                             int wait_for_completion);
+int tb_bc7_renderer_apply_adaptive(
+    struct tb_bc7_renderer *renderer,
+    const struct tb_bc7_adaptive_frame *frame,
+    int wait_for_completion);
 
 void tb_bc7_renderer_set_cursor(struct tb_bc7_renderer *renderer,
                                 int x,

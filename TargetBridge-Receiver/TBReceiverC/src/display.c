@@ -1214,6 +1214,18 @@ int tb_disp_present_bc7(struct tb_display *d, int wait_for_completion) {
     return tb_bc7_renderer_present(d->bc7, wait_for_completion);
 }
 
+int tb_disp_apply_bc7_adaptive(
+    struct tb_display *d,
+    const struct tb_bc7_adaptive_frame *frame,
+    int wait_for_completion) {
+    if (!d || !d->bc7 || !frame) return -1;
+    tb_disp_set_connection_state(d, 1);
+    d->last_video_frame_time = SDL_GetTicks();
+    return tb_bc7_renderer_apply_adaptive(
+        d->bc7, frame, wait_for_completion
+    );
+}
+
 void tb_disp_set_cursor(struct tb_display *d,
                         int x, int y,
                         int source_w, int source_h,

@@ -16,6 +16,7 @@
 #include "net.h"
 #include "bc7_frame.h"
 #include "bc7_delta.h"
+#include "bc7_adaptive.h"
 #include "bc7_renderer.h"
 #include "decoder.h"
 #include "display.h"
@@ -76,6 +77,9 @@ struct app {
     uint64_t bc7_ack_requests;
     uint64_t bc7_acks_sent;
     uint64_t bc7_delta_frames;
+    uint64_t bc7_adaptive_frames;
+    uint64_t bc7_adaptive_invalid_frames;
+    uint64_t bc7_adaptive_stale_frames;
     uint64_t bc7_keyframe_requests;
     uint64_t bc7_applied_sequence;
     uint64_t bc7_checksum;
@@ -83,11 +87,16 @@ struct app {
     int bc7_keyframe_request_pending;
     uint8_t *bc7_shadow;
     uint64_t *bc7_tile_checksums;
+    uint64_t *bc7_candidate_tile_checksums;
+    uint8_t *bc7_degraded_tiles;
     size_t bc7_shadow_len;
     size_t bc7_tile_count;
     uint32_t bc7_width;
     uint32_t bc7_height;
     uint32_t bc7_bytes_per_row;
+    uint32_t bc7_adaptive_generation;
+    uint64_t bc7_adaptive_frame_id;
+    size_t bc7_degraded_tile_count;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      debug_enabled;
@@ -628,6 +637,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "supportsRawNV12", 1, "1");
     TXTRecordSetValue(&txt, "supportsBC7Mode6", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
     TXTRecordSetValue(&txt, "supportsBC7TileDelta", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
+    TXTRecordSetValue(&txt, "supportsBC7AdaptivePatches", 1, tb_disp_supports_bc7(a->disp) ? "1" : "0");
 
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) == 0) {
@@ -970,8 +980,12 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
 static void reset_bc7_delta_state(struct app *a) {
     free(a->bc7_shadow);
     free(a->bc7_tile_checksums);
+    free(a->bc7_candidate_tile_checksums);
+    free(a->bc7_degraded_tiles);
     a->bc7_shadow = NULL;
     a->bc7_tile_checksums = NULL;
+    a->bc7_candidate_tile_checksums = NULL;
+    a->bc7_degraded_tiles = NULL;
     a->bc7_shadow_len = 0;
     a->bc7_tile_count = 0;
     a->bc7_width = 0;
@@ -979,6 +993,9 @@ static void reset_bc7_delta_state(struct app *a) {
     a->bc7_bytes_per_row = 0;
     a->bc7_applied_sequence = 0;
     a->bc7_checksum = 0;
+    a->bc7_adaptive_generation = 0;
+    a->bc7_adaptive_frame_id = 0;
+    a->bc7_degraded_tile_count = 0;
 }
 
 static uint64_t checksum_bc7_tiles(const uint8_t *blocks,
@@ -1098,9 +1115,15 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
              TB_BC7_DELTA_TILE_SIZE);
         uint8_t *shadow = malloc(frame.blocks_len);
         uint64_t *tile_checksums = calloc(tile_count, sizeof(*tile_checksums));
-        if (!shadow || !tile_checksums) {
+        uint64_t *candidate_tile_checksums =
+            calloc(tile_count, sizeof(*candidate_tile_checksums));
+        uint8_t *degraded_tiles = calloc(tile_count, sizeof(*degraded_tiles));
+        if (!shadow || !tile_checksums || !candidate_tile_checksums ||
+            !degraded_tiles) {
             free(shadow);
             free(tile_checksums);
+            free(candidate_tile_checksums);
+            free(degraded_tiles);
             a->bc7_invalid_frames++;
             return;
         }
@@ -1111,6 +1134,8 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         if (checksum != frame.checksum) {
             free(shadow);
             free(tile_checksums);
+            free(candidate_tile_checksums);
+            free(degraded_tiles);
             a->bc7_invalid_frames++;
             request_bc7_keyframe(a, "keyframe-checksum");
             return;
@@ -1123,12 +1148,16 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
                                frame.bytes_per_row) != 0) {
             free(shadow);
             free(tile_checksums);
+            free(candidate_tile_checksums);
+            free(degraded_tiles);
             a->bc7_render_failures++;
             return;
         }
         reset_bc7_delta_state(a);
         a->bc7_shadow = shadow;
         a->bc7_tile_checksums = tile_checksums;
+        a->bc7_candidate_tile_checksums = candidate_tile_checksums;
+        a->bc7_degraded_tiles = degraded_tiles;
         a->bc7_shadow_len = frame.blocks_len;
         a->bc7_tile_count = tile_count;
         a->bc7_width = frame.width;
@@ -1136,17 +1165,23 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
         a->bc7_bytes_per_row = frame.bytes_per_row;
         a->bc7_applied_sequence = frame.sequence;
         a->bc7_checksum = checksum;
+        a->bc7_adaptive_generation = a->bc7_render_generation;
+        a->bc7_adaptive_frame_id = 0;
+        a->bc7_degraded_tile_count = 0;
         a->bc7_keyframe_request_pending = 0;
-    } else if (tb_disp_upload_bc7(a->disp,
-                                  frame.blocks,
-                                  frame.blocks_len,
-                                  frame.width,
-                                  frame.height,
-                                  frame.bytes_per_row) != 0) {
-        a->bc7_render_failures++;
-        fprintf(stderr, "[bc7] unable to upload %ux%u frame\n",
-                frame.width, frame.height);
-        return;
+    } else {
+        if (tb_disp_upload_bc7(a->disp,
+                               frame.blocks,
+                               frame.blocks_len,
+                               frame.width,
+                               frame.height,
+                               frame.bytes_per_row) != 0) {
+            a->bc7_render_failures++;
+            fprintf(stderr, "[bc7] unable to upload %ux%u frame\n",
+                    frame.width, frame.height);
+            return;
+        }
+        reset_bc7_delta_state(a);
     }
     if (tb_disp_present_bc7(a->disp, !a->bc7_render_ack_sent) != 0) {
         a->bc7_render_failures++;
@@ -1177,107 +1212,250 @@ static void handle_bc7_frame(struct app *a, const uint8_t *p, size_t len) {
 }
 
 static void handle_bc7_delta(struct app *a, const uint8_t *p, size_t len) {
-            struct tb_bc7_delta_frame frame;
-            if (tb_bc7_delta_parse(p, len, &frame) != 0 ||
-                !a->bc7_shadow || !a->bc7_tile_checksums ||
-                frame.width != a->bc7_width || frame.height != a->bc7_height ||
-                !tb_bc7_delta_sequence_valid(
-                    frame.sequence, frame.base_sequence, a->bc7_applied_sequence
-                )) {
-                a->bc7_invalid_frames++;
-                request_bc7_keyframe(a, "delta-base");
+    struct tb_bc7_delta_frame frame;
+    if (tb_bc7_delta_parse(p, len, &frame) != 0 ||
+        !a->bc7_shadow || !a->bc7_tile_checksums ||
+        !a->bc7_candidate_tile_checksums ||
+        frame.width != a->bc7_width || frame.height != a->bc7_height ||
+        !tb_bc7_delta_sequence_valid(
+            frame.sequence, frame.base_sequence, a->bc7_applied_sequence
+        )) {
+        a->bc7_invalid_frames++;
+        request_bc7_keyframe(a, "delta-base");
+        return;
+    }
+
+    uint64_t checksum = 0;
+    if (tb_bc7_delta_validate_candidate(
+            &frame,
+            a->bc7_tile_checksums,
+            a->bc7_tile_count,
+            a->bc7_checksum,
+            a->bc7_candidate_tile_checksums,
+            &checksum) != 0) {
+        a->bc7_invalid_frames++;
+        request_bc7_keyframe(a, "delta-checksum");
+        return;
+    }
+
+    const int full_upload =
+        tb_bc7_delta_prefers_full_upload(&frame, a->bc7_shadow_len);
+    if (full_upload &&
+        tb_bc7_delta_commit_to_shadow(
+            &frame,
+            a->bc7_shadow,
+            a->bc7_shadow_len,
+            a->bc7_bytes_per_row,
+            a->bc7_tile_checksums,
+            a->bc7_tile_count,
+            a->bc7_candidate_tile_checksums) != 0) {
+        a->bc7_invalid_frames++;
+        request_bc7_keyframe(a, "delta-commit");
+        return;
+    }
+
+    if (full_upload) {
+        if (tb_disp_upload_bc7(
+                a->disp,
+                a->bc7_shadow,
+                a->bc7_shadow_len,
+                frame.width,
+                frame.height,
+                a->bc7_bytes_per_row) != 0) {
+            a->bc7_render_failures++;
+            reset_bc7_delta_state(a);
+            request_bc7_keyframe(a, "delta-full-upload");
+            return;
+        }
+    } else {
+        for (uint16_t index = 0; index < frame.run_count; index++) {
+            const struct tb_bc7_delta_run *run = &frame.runs[index];
+            const uint32_t run_width =
+                (uint32_t)run->tile_count_x * frame.tile_size;
+            const uint32_t run_row_bytes = (run_width / 4u) * 16u;
+            if (tb_disp_upload_bc7_region(
+                    a->disp,
+                    run->data,
+                    run->data_length,
+                    frame.width,
+                    frame.height,
+                    (uint32_t)run->tile_x * frame.tile_size,
+                    (uint32_t)run->tile_y * frame.tile_size,
+                    run_width,
+                    run->pixel_height,
+                    run_row_bytes) != 0) {
+                a->bc7_render_failures++;
+                reset_bc7_delta_state(a);
+                request_bc7_keyframe(a, "delta-upload");
                 return;
             }
+        }
+        if (tb_bc7_delta_commit_to_shadow(
+                &frame,
+                a->bc7_shadow,
+                a->bc7_shadow_len,
+                a->bc7_bytes_per_row,
+                a->bc7_tile_checksums,
+                a->bc7_tile_count,
+                a->bc7_candidate_tile_checksums) != 0) {
+            a->bc7_invalid_frames++;
+            reset_bc7_delta_state(a);
+            request_bc7_keyframe(a, "delta-commit");
+            return;
+        }
+    }
 
-            uint8_t *candidate = malloc(a->bc7_shadow_len);
-            uint64_t *candidate_checksums =
-                malloc(a->bc7_tile_count * sizeof(*candidate_checksums));
-            if (!candidate || !candidate_checksums) {
-                free(candidate);
-                free(candidate_checksums);
-                a->bc7_invalid_frames++;
-                return;
-            }
-            memcpy(candidate, a->bc7_shadow, a->bc7_shadow_len);
-            memcpy(candidate_checksums,
-                   a->bc7_tile_checksums,
-                   a->bc7_tile_count * sizeof(*candidate_checksums));
-
-            uint64_t checksum = 0;
-            if (tb_bc7_delta_apply_to_shadow(
-                    &frame,
-                    candidate,
-                    a->bc7_shadow_len,
-                    a->bc7_bytes_per_row,
-                    candidate_checksums,
-                    a->bc7_tile_count,
-                    &checksum) != 0) {
-                free(candidate);
-                free(candidate_checksums);
-                a->bc7_invalid_frames++;
-                request_bc7_keyframe(a, "delta-checksum");
-                return;
-            }
-
-            if (tb_bc7_delta_prefers_full_upload(&frame, a->bc7_shadow_len)) {
-                if (tb_disp_upload_bc7(
-                        a->disp,
-                        candidate,
-                        a->bc7_shadow_len,
-                        frame.width,
-                        frame.height,
-                        a->bc7_bytes_per_row) != 0) {
-                    free(candidate);
-                    free(candidate_checksums);
-                    a->bc7_render_failures++;
-                    reset_bc7_delta_state(a);
-                    request_bc7_keyframe(a, "delta-full-upload");
-                    return;
+    if (a->bc7_degraded_tiles) {
+        const uint32_t tiles_wide =
+            frame.width / TB_BC7_DELTA_TILE_SIZE;
+        for (uint16_t index = 0; index < frame.run_count; index++) {
+            const struct tb_bc7_delta_run *run = &frame.runs[index];
+            for (uint16_t x = 0; x < run->tile_count_x; x++) {
+                const size_t tile_index =
+                    (size_t)run->tile_y * tiles_wide + run->tile_x + x;
+                if (a->bc7_degraded_tiles[tile_index]) {
+                    a->bc7_degraded_tiles[tile_index] = 0;
+                    a->bc7_degraded_tile_count--;
                 }
-            } else {
-                for (uint16_t index = 0; index < frame.run_count; index++) {
-                    const struct tb_bc7_delta_run *run = &frame.runs[index];
-                    const uint32_t run_width =
-                        (uint32_t)run->tile_count_x * frame.tile_size;
-                    const uint32_t run_row_bytes = (run_width / 4u) * 16u;
-                    if (tb_disp_upload_bc7_region(
-                            a->disp,
-                            run->data,
-                            run->data_length,
-                            frame.width,
-                            frame.height,
-                            (uint32_t)run->tile_x * frame.tile_size,
-                            (uint32_t)run->tile_y * frame.tile_size,
-                            run_width,
-                            run->pixel_height,
-                            run_row_bytes) != 0) {
-                        free(candidate);
-                        free(candidate_checksums);
-                        a->bc7_render_failures++;
-                        reset_bc7_delta_state(a);
-                        request_bc7_keyframe(a, "delta-upload");
-                        return;
-                    }
-                }
             }
-
-            free(a->bc7_shadow);
-            free(a->bc7_tile_checksums);
-            a->bc7_shadow = candidate;
-            a->bc7_tile_checksums = candidate_checksums;
-            a->bc7_applied_sequence = frame.sequence;
-            a->bc7_checksum = checksum;
-            a->frames++;
-            a->bc7_frames++;
-            a->bc7_delta_frames++;
-            a->bc7_bytes += len;
-            snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7-delta");
+        }
+    }
+    a->bc7_applied_sequence = frame.sequence;
+    a->bc7_checksum = checksum;
+    a->frames++;
+    a->bc7_frames++;
+    a->bc7_delta_frames++;
+    a->bc7_bytes += len;
+    snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7-delta");
     const int wait_for_ack = !a->bc7_render_ack_sent;
     if (tb_disp_present_bc7(a->disp, wait_for_ack) != 0) {
         a->bc7_render_failures++;
     } else {
         maybe_send_bc7_render_ack(a, frame.width, frame.height);
     }
+}
+
+static void handle_bc7_adaptive(struct app *a,
+                                const uint8_t *p,
+                                size_t len) {
+    struct tb_bc7_adaptive_frame frame;
+    if (tb_bc7_adaptive_parse(p, len, &frame) != 0 ||
+        !a->bc7_shadow || !a->bc7_tile_checksums ||
+        !a->bc7_candidate_tile_checksums || !a->bc7_degraded_tiles ||
+        frame.canvas_width != a->bc7_width ||
+        frame.canvas_height != a->bc7_height) {
+        a->bc7_invalid_frames++;
+        a->bc7_adaptive_invalid_frames++;
+        request_bc7_keyframe(a, "adaptive-structure");
+        return;
+    }
+    const struct tb_bc7_adaptive_state adaptive_state = {
+        .generation = a->bc7_adaptive_generation,
+        .frame_id = a->bc7_adaptive_frame_id,
+        .native_sequence = a->bc7_applied_sequence,
+        .native_checksum = a->bc7_checksum
+    };
+    uint64_t native_checksum = a->bc7_checksum;
+    const int state_validation = tb_bc7_adaptive_validate_state(
+        &frame,
+        &adaptive_state,
+        a->bc7_tile_checksums,
+        a->bc7_tile_count,
+        a->bc7_candidate_tile_checksums,
+        &native_checksum
+    );
+    if (state_validation == TB_BC7_ADAPTIVE_STALE) {
+        a->bc7_adaptive_stale_frames++;
+        return;
+    }
+    if (state_validation != TB_BC7_ADAPTIVE_VALID) {
+        a->bc7_invalid_frames++;
+        a->bc7_adaptive_invalid_frames++;
+        request_bc7_keyframe(a, "adaptive-state");
+        return;
+    }
+
+    struct tb_bc7_delta_frame native_delta = {
+        .sequence = frame.native_result_sequence,
+        .base_sequence = frame.native_base_sequence,
+        .checksum = frame.native_result_checksum,
+        .width = frame.canvas_width,
+        .height = frame.canvas_height,
+        .tile_size = TB_BC7_DELTA_TILE_SIZE,
+        .run_count = frame.native_run_count
+    };
+    memcpy(native_delta.runs,
+           frame.native_runs,
+           (size_t)frame.native_run_count * sizeof(frame.native_runs[0]));
+
+    if (tb_disp_apply_bc7_adaptive(a->disp, &frame, 1) != 0) {
+        a->bc7_render_failures++;
+        reset_bc7_delta_state(a);
+        request_bc7_keyframe(a, "adaptive-render");
+        return;
+    }
+    if (frame.native_run_count != 0 &&
+        tb_bc7_delta_commit_to_shadow(
+            &native_delta,
+            a->bc7_shadow,
+            a->bc7_shadow_len,
+            a->bc7_bytes_per_row,
+            a->bc7_tile_checksums,
+            a->bc7_tile_count,
+            a->bc7_candidate_tile_checksums) != 0) {
+        a->bc7_invalid_frames++;
+        a->bc7_adaptive_invalid_frames++;
+        reset_bc7_delta_state(a);
+        request_bc7_keyframe(a, "adaptive-commit");
+        return;
+    }
+
+    const uint32_t tiles_wide =
+        frame.canvas_width / TB_BC7_DELTA_TILE_SIZE;
+    for (uint16_t index = 0; index < frame.native_run_count; index++) {
+        const struct tb_bc7_delta_run *run = &frame.native_runs[index];
+        for (uint16_t x = 0; x < run->tile_count_x; x++) {
+            const size_t tile_index =
+                (size_t)run->tile_y * tiles_wide + run->tile_x + x;
+            if (a->bc7_degraded_tiles[tile_index]) {
+                a->bc7_degraded_tiles[tile_index] = 0;
+                a->bc7_degraded_tile_count--;
+            }
+        }
+    }
+    for (uint16_t index = 0; index < frame.patch_count; index++) {
+        const struct tb_bc7_adaptive_patch *patch = &frame.patches[index];
+        const uint32_t first_x =
+            patch->destination_x / TB_BC7_DELTA_TILE_SIZE;
+        const uint32_t first_y =
+            patch->destination_y / TB_BC7_DELTA_TILE_SIZE;
+        const uint32_t last_x =
+            ((uint32_t)patch->destination_x + patch->destination_width - 1u) /
+            TB_BC7_DELTA_TILE_SIZE;
+        const uint32_t last_y =
+            ((uint32_t)patch->destination_y + patch->destination_height - 1u) /
+            TB_BC7_DELTA_TILE_SIZE;
+        for (uint32_t tile_y = first_y; tile_y <= last_y; tile_y++) {
+            for (uint32_t tile_x = first_x; tile_x <= last_x; tile_x++) {
+                const size_t tile_index =
+                    (size_t)tile_y * tiles_wide + tile_x;
+                if (!a->bc7_degraded_tiles[tile_index]) {
+                    a->bc7_degraded_tiles[tile_index] = 1;
+                    a->bc7_degraded_tile_count++;
+                }
+            }
+        }
+    }
+
+    a->bc7_applied_sequence = frame.native_result_sequence;
+    a->bc7_checksum = native_checksum;
+    a->bc7_adaptive_frame_id = frame.frame_id;
+    a->frames++;
+    a->bc7_frames++;
+    a->bc7_adaptive_frames++;
+    a->bc7_bytes += len;
+    snprintf(a->active_transport, sizeof(a->active_transport), "%s", "bc7-adaptive");
+    maybe_send_bc7_render_ack(a, frame.canvas_width, frame.canvas_height);
 }
 
 static void ring_read(struct app *a, Uint8 *dst, int len) {
@@ -1437,6 +1615,10 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
     case TB_PKT_BC7_TILE_DELTA:
         a->session_active = 1;
         handle_bc7_delta(a, payload, len);
+        break;
+    case TB_PKT_BC7_ADAPTIVE_FRAME:
+        a->session_active = 1;
+        handle_bc7_adaptive(a, payload, len);
         break;
     case TB_PKT_BC7_ACK_REQUEST:
         if (len == 4) {
@@ -2026,7 +2208,7 @@ static void send_receiver_info(struct app *a) {
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
         "\"receiverVersion\":\"%s\",\"receiverBuild\":\"%s\",\"receiverCommit\":\"%s\","
         "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsBC7Mode6\":%s,"
-        "\"supportsBC7TileDelta\":%s,"
+        "\"supportsBC7TileDelta\":%s,\"supportsBC7AdaptivePatches\":%s,"
         "\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
         escaped_name,
         panel_w,
@@ -2039,6 +2221,7 @@ static void send_receiver_info(struct app *a) {
         TB_RECEIVER_BUILD,
         TB_RECEIVER_COMMIT,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
+        tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_disp_supports_bc7(a->disp) ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
@@ -2072,7 +2255,10 @@ static void send_receiver_metrics(struct app *a, double fps, double gbps) {
         sizeof(json),
         "{\"fps\":%.3f,\"networkGbps\":%.6f,\"packets\":%llu,"
         "\"bc7Frames\":%llu,\"bc7PayloadBytes\":%llu,\"bc7Invalid\":%llu,"
-        "\"renderFailures\":%llu,\"bc7Deltas\":%llu,\"appliedSequence\":%llu,"
+        "\"renderFailures\":%llu,\"bc7Deltas\":%llu,\"bc7AdaptiveFrames\":%llu,"
+        "\"adaptiveInvalid\":%llu,\"adaptiveStale\":%llu,"
+        "\"appliedSequence\":%llu,\"adaptiveGeneration\":%u,"
+        "\"adaptiveFrameID\":%llu,\"degradedTiles\":%zu,"
         "\"keyframeRequests\":%llu}",
         fps,
         gbps,
@@ -2082,7 +2268,13 @@ static void send_receiver_metrics(struct app *a, double fps, double gbps) {
         (unsigned long long)a->bc7_invalid_frames,
         (unsigned long long)a->bc7_render_failures,
         (unsigned long long)a->bc7_delta_frames,
+        (unsigned long long)a->bc7_adaptive_frames,
+        (unsigned long long)a->bc7_adaptive_invalid_frames,
+        (unsigned long long)a->bc7_adaptive_stale_frames,
         (unsigned long long)a->bc7_applied_sequence,
+        a->bc7_adaptive_generation,
+        (unsigned long long)a->bc7_adaptive_frame_id,
+        a->bc7_degraded_tile_count,
         (unsigned long long)a->bc7_keyframe_requests
     );
     if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
@@ -2100,7 +2292,9 @@ static void close_client(struct app *a) {
         fprintf(stderr,
                 "[diag] event=disconnect transport=%s frames=%llu packets=%llu "
                 "bytes=%llu bc7Frames=%llu bc7Invalid=%llu renderFailures=%llu "
-                "bc7Deltas=%llu appliedSequence=%llu keyframeRequests=%llu "
+                "bc7Deltas=%llu adaptiveFrames=%llu adaptiveInvalid=%llu "
+                "adaptiveStale=%llu appliedSequence=%llu adaptiveGeneration=%u "
+                "adaptiveFrameID=%llu degradedTiles=%zu keyframeRequests=%llu "
                 "ackRequests=%llu acksSent=%llu\n",
                 a->active_transport,
                 (unsigned long long)a->frames,
@@ -2110,7 +2304,13 @@ static void close_client(struct app *a) {
                 (unsigned long long)a->bc7_invalid_frames,
                 (unsigned long long)a->bc7_render_failures,
                 (unsigned long long)a->bc7_delta_frames,
+                (unsigned long long)a->bc7_adaptive_frames,
+                (unsigned long long)a->bc7_adaptive_invalid_frames,
+                (unsigned long long)a->bc7_adaptive_stale_frames,
                 (unsigned long long)a->bc7_applied_sequence,
+                a->bc7_adaptive_generation,
+                (unsigned long long)a->bc7_adaptive_frame_id,
+                a->bc7_degraded_tile_count,
                 (unsigned long long)a->bc7_keyframe_requests,
                 (unsigned long long)a->bc7_ack_requests,
                 (unsigned long long)a->bc7_acks_sent);
@@ -2207,12 +2407,14 @@ int main(int argc, char **argv) {
         printf(
             "{\"version\":\"%s\",\"build\":\"%s\",\"commit\":\"%s\",\"architecture\":\"%s\","
             "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
-            "\"supportsBC7TileDelta\":%s,\"supportsRawNV12\":true}\n",
+            "\"supportsBC7TileDelta\":%s,\"supportsBC7AdaptivePatches\":%s,"
+            "\"supportsRawNV12\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
             TB_RECEIVER_COMMIT,
             architecture,
             metal_device,
+            tb_bc7_renderer_supported() ? "true" : "false",
             tb_bc7_renderer_supported() ? "true" : "false",
             tb_bc7_renderer_supported() ? "true" : "false"
         );
@@ -2320,11 +2522,13 @@ int main(int argc, char **argv) {
         (void)tb_bc7_renderer_copy_device_name(metal_device, sizeof(metal_device));
         fprintf(stderr,
                 "[diag] event=startup version=%s build=%s commit=%s metalDevice=\"%s\" "
-                "supportsBC7=%s supportsRawNV12=true port=%d\n",
+                "supportsBC7=%s supportsBC7AdaptivePatches=%s "
+                "supportsRawNV12=true port=%d\n",
                 TB_RECEIVER_VERSION,
                 TB_RECEIVER_BUILD,
                 TB_RECEIVER_COMMIT,
                 metal_device,
+                tb_disp_supports_bc7(a.disp) ? "true" : "false",
                 tb_disp_supports_bc7(a.disp) ? "true" : "false",
                 TB_PORT);
     }
@@ -2392,6 +2596,9 @@ int main(int argc, char **argv) {
                 a.bc7_ack_requests = 0;
                 a.bc7_acks_sent = 0;
                 a.bc7_delta_frames = 0;
+                a.bc7_adaptive_frames = 0;
+                a.bc7_adaptive_invalid_frames = 0;
+                a.bc7_adaptive_stale_frames = 0;
                 a.bc7_keyframe_requests = 0;
                 snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
                 a.last_recv_ms = t;
@@ -2529,7 +2736,10 @@ int main(int argc, char **argv) {
                         "transport=%s fps=%.2f networkGbps=%.3f packets=%llu "
                         "bc7Frames=%llu bc7PayloadBytes=%llu bc7Invalid=%llu "
                         "renderFailures=%llu generation=%u ackPending=%s "
-                        "bc7Deltas=%llu appliedSequence=%llu keyframeRequests=%llu "
+                        "bc7Deltas=%llu adaptiveFrames=%llu adaptiveInvalid=%llu "
+                        "adaptiveStale=%llu appliedSequence=%llu "
+                        "adaptiveGeneration=%u adaptiveFrameID=%llu degradedTiles=%zu "
+                        "keyframeRequests=%llu "
                         "ackRequests=%llu acksSent=%llu\n",
                         a.client_fd >= 0 ? "true" : "false",
                         a.session_active ? "true" : "false",
@@ -2544,7 +2754,13 @@ int main(int argc, char **argv) {
                         a.bc7_render_generation,
                         (a.bc7_render_generation != 0 && !a.bc7_render_ack_sent) ? "true" : "false",
                         (unsigned long long)a.bc7_delta_frames,
+                        (unsigned long long)a.bc7_adaptive_frames,
+                        (unsigned long long)a.bc7_adaptive_invalid_frames,
+                        (unsigned long long)a.bc7_adaptive_stale_frames,
                         (unsigned long long)a.bc7_applied_sequence,
+                        a.bc7_adaptive_generation,
+                        (unsigned long long)a.bc7_adaptive_frame_id,
+                        a.bc7_degraded_tile_count,
                         (unsigned long long)a.bc7_keyframe_requests,
                         (unsigned long long)a.bc7_ack_requests,
                         (unsigned long long)a.bc7_acks_sent);

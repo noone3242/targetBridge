@@ -1,5 +1,6 @@
 #include "bc7_delta.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static uint16_t read_be16(const uint8_t *p) {
@@ -127,6 +128,92 @@ uint64_t tb_bc7_tile_checksum(const uint8_t *data,
     return hash;
 }
 
+int tb_bc7_delta_validate_candidate(
+    const struct tb_bc7_delta_frame *frame,
+    const uint64_t *tile_checksums,
+    size_t tile_count,
+    uint64_t current_checksum,
+    uint64_t *candidate_tile_checksums,
+    uint64_t *candidate_checksum) {
+    if (!frame || !tile_checksums || !candidate_tile_checksums ||
+        !candidate_checksum) {
+        return -1;
+    }
+    const uint32_t tiles_wide = frame->width / frame->tile_size;
+    const uint32_t tiles_high =
+        (frame->height + frame->tile_size - 1u) / frame->tile_size;
+    if (frame->tile_size != TB_BC7_DELTA_TILE_SIZE ||
+        tile_count != (size_t)tiles_wide * tiles_high) {
+        return -1;
+    }
+
+    uint64_t calculated = current_checksum;
+    for (uint16_t index = 0; index < frame->run_count; index++) {
+        const struct tb_bc7_delta_run *run = &frame->runs[index];
+        const uint32_t run_row_bytes =
+            (uint32_t)run->tile_count_x * (frame->tile_size / 4u) * 16u;
+        const uint32_t block_rows = run->pixel_height / 4u;
+        for (uint16_t x = 0; x < run->tile_count_x; x++) {
+            const size_t tile_index =
+                (size_t)run->tile_y * tiles_wide + run->tile_x + x;
+            const uint8_t *tile_data =
+                run->data + (size_t)x * (frame->tile_size / 4u) * 16u;
+            const uint64_t next = tb_bc7_tile_checksum(
+                tile_data, run_row_bytes, block_rows, (uint32_t)tile_index
+            );
+            candidate_tile_checksums[tile_index] = next;
+            calculated ^= tile_checksums[tile_index] ^ next;
+        }
+    }
+    if (calculated != frame->checksum) return -1;
+    *candidate_checksum = calculated;
+    return 0;
+}
+
+int tb_bc7_delta_commit_to_shadow(
+    const struct tb_bc7_delta_frame *frame,
+    uint8_t *shadow,
+    size_t shadow_len,
+    uint32_t bytes_per_row,
+    uint64_t *tile_checksums,
+    size_t tile_count,
+    const uint64_t *candidate_tile_checksums) {
+    if (!frame || !shadow || !tile_checksums || !candidate_tile_checksums ||
+        bytes_per_row != (frame->width / 4u) * 16u ||
+        shadow_len != (size_t)bytes_per_row * (frame->height / 4u)) {
+        return -1;
+    }
+    const uint32_t tiles_wide = frame->width / frame->tile_size;
+    const uint32_t tiles_high =
+        (frame->height + frame->tile_size - 1u) / frame->tile_size;
+    if (frame->tile_size != TB_BC7_DELTA_TILE_SIZE ||
+        tile_count != (size_t)tiles_wide * tiles_high) {
+        return -1;
+    }
+
+    for (uint16_t index = 0; index < frame->run_count; index++) {
+        const struct tb_bc7_delta_run *run = &frame->runs[index];
+        const uint32_t run_row_bytes =
+            (uint32_t)run->tile_count_x * (frame->tile_size / 4u) * 16u;
+        const uint32_t block_rows = run->pixel_height / 4u;
+        const size_t destination_x =
+            (size_t)run->tile_x * (frame->tile_size / 4u) * 16u;
+        const size_t destination_row =
+            (size_t)run->tile_y * (frame->tile_size / 4u);
+        for (uint32_t row = 0; row < block_rows; row++) {
+            memcpy(shadow + (destination_row + row) * bytes_per_row + destination_x,
+                   run->data + (size_t)row * run_row_bytes,
+                   run_row_bytes);
+        }
+        for (uint16_t x = 0; x < run->tile_count_x; x++) {
+            const size_t tile_index =
+                (size_t)run->tile_y * tiles_wide + run->tile_x + x;
+            tile_checksums[tile_index] = candidate_tile_checksums[tile_index];
+        }
+    }
+    return 0;
+}
+
 int tb_bc7_delta_apply_to_shadow(const struct tb_bc7_delta_frame *frame,
                                  uint8_t *shadow,
                                  size_t shadow_len,
@@ -144,40 +231,32 @@ int tb_bc7_delta_apply_to_shadow(const struct tb_bc7_delta_frame *frame,
         (frame->height + frame->tile_size - 1u) / frame->tile_size;
     if (tile_count != (size_t)tiles_wide * tiles_high) return -1;
 
-    for (uint16_t index = 0; index < frame->run_count; index++) {
-        const struct tb_bc7_delta_run *run = &frame->runs[index];
-        const uint32_t run_row_bytes =
-            (uint32_t)run->tile_count_x * (frame->tile_size / 4u) * 16u;
-        const uint32_t block_rows = run->pixel_height / 4u;
-        const size_t destination_x =
-            (size_t)run->tile_x * (frame->tile_size / 4u) * 16u;
-        const size_t destination_row =
-            (size_t)run->tile_y * (frame->tile_size / 4u);
-        for (uint32_t row = 0; row < block_rows; row++) {
-            memcpy(shadow + (destination_row + row) * bytes_per_row + destination_x,
-                   run->data + (size_t)row * run_row_bytes,
-                   run_row_bytes);
-        }
-        for (uint16_t x = 0; x < run->tile_count_x; x++) {
-            const uint32_t tile_x = run->tile_x + x;
-            const size_t tile_index = (size_t)run->tile_y * tiles_wide + tile_x;
-            const size_t tile_offset =
-                destination_row * bytes_per_row +
-                (size_t)tile_x * (frame->tile_size / 4u) * 16u;
-            tile_checksums[tile_index] = tb_bc7_tile_checksum(
-                shadow + tile_offset,
-                bytes_per_row,
-                block_rows,
-                (uint32_t)tile_index
-            );
-        }
-    }
-
-    uint64_t calculated = 0;
+    uint64_t *candidate =
+        malloc(tile_count * sizeof(*candidate));
+    if (!candidate) return -1;
+    uint64_t current = 0;
     for (size_t index = 0; index < tile_count; index++) {
-        calculated ^= tile_checksums[index];
+        current ^= tile_checksums[index];
     }
-    if (calculated != frame->checksum) return -1;
-    *checksum = calculated;
-    return 0;
+    int result = tb_bc7_delta_validate_candidate(
+        frame,
+        tile_checksums,
+        tile_count,
+        current,
+        candidate,
+        checksum
+    );
+    if (result == 0) {
+        result = tb_bc7_delta_commit_to_shadow(
+            frame,
+            shadow,
+            shadow_len,
+            bytes_per_row,
+            tile_checksums,
+            tile_count,
+            candidate
+        );
+    }
+    free(candidate);
+    return result;
 }

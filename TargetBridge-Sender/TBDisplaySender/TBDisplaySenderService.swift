@@ -90,6 +90,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case crisp2160p60
     case native5k
     case native5k60Experimental
+    case native5k90Adaptive
 
     var id: String { rawValue }
 
@@ -107,6 +108,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "5K"
         case .native5k60Experimental:
             return "5K 60 Experimental"
+        case .native5k90Adaptive:
+            return "5K 90 Adaptive"
         }
     }
 
@@ -124,6 +127,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "5120 × 2880 @ 48"
         case .native5k60Experimental:
             return "5120 × 2880 @ 60"
+        case .native5k90Adaptive:
+            return "5120 × 2880 @ 90 · local adaptive quality"
         }
     }
 
@@ -135,7 +140,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 3200
         case .crisp2160p60:
             return 3840
-        case .native5k, .native5k60Experimental:
+        case .native5k, .native5k60Experimental, .native5k90Adaptive:
             return 5120
         }
     }
@@ -148,7 +153,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1800
         case .crisp2160p60:
             return 2160
-        case .native5k, .native5k60Experimental:
+        case .native5k, .native5k60Experimental, .native5k90Adaptive:
             return 2880
         }
     }
@@ -167,6 +172,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 120_000_000
         case .native5k60Experimental:
             return 150_000_000
+        case .native5k90Adaptive:
+            return 225_000_000
         }
     }
 
@@ -174,7 +181,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return "H.264"
-        case .crisp2160p60, .native5k, .native5k60Experimental:
+        case .crisp2160p60, .native5k, .native5k60Experimental, .native5k90Adaptive:
             return "HEVC"
         }
     }
@@ -183,7 +190,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k, .native5k60Experimental:
+        case .crisp2160p60, .native5k, .native5k60Experimental, .native5k90Adaptive:
             return kCMVideoCodecType_HEVC
         }
     }
@@ -209,6 +216,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 48
         case .native5k60Experimental:
             return 60
+        case .native5k90Adaptive:
+            return 90
         }
     }
 
@@ -226,6 +235,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 48
         case .native5k60Experimental:
             return 60
+        case .native5k90Adaptive:
+            return 90
         }
     }
 
@@ -237,7 +248,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1
         case .smooth1800p60, .crisp2160p60:
             return 1
-        case .native5k, .native5k60Experimental:
+        case .native5k, .native5k60Experimental, .native5k90Adaptive:
             return 1
         }
     }
@@ -246,7 +257,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental, .native5k90Adaptive:
             return true
         }
     }
@@ -262,7 +273,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return 1
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental, .native5k90Adaptive:
             return 0
         }
     }
@@ -271,7 +282,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental, .native5k90Adaptive:
             return true
         }
     }
@@ -287,7 +298,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return .nominal
-        case .crisp2160p60, .native5k, .native5k60Experimental:
+        case .crisp2160p60, .native5k, .native5k60Experimental, .native5k90Adaptive:
             return .best
         }
     }
@@ -304,6 +315,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 48
         case .native5k60Experimental:
             return 60
+        case .native5k90Adaptive:
+            return 90
         }
     }
 
@@ -327,7 +340,8 @@ func tbSourceFramebufferSupportsNativeCapture(
     pixelWidth: Int,
     pixelHeight: Int
 ) -> Bool {
-    guard preset == .native5k || preset == .native5k60Experimental else { return true }
+    guard preset == .native5k || preset == .native5k60Experimental ||
+            preset == .native5k90Adaptive else { return true }
     return pixelWidth >= preset.width &&
         pixelHeight >= preset.height &&
         pixelWidth * preset.height == pixelHeight * preset.width
@@ -560,9 +574,99 @@ func tbBC7DirtyRects(
     )
 }
 
+func tbBC7AdaptivePatchRect(
+    tileIndices: Set<Int>,
+    width: Int,
+    height: Int,
+    tileSize: Int = TBBC7DeltaPlanner.tileSize
+) -> CGRect? {
+    guard !tileIndices.isEmpty, width > 0, height > 0,
+          width % tileSize == 0 else {
+        return nil
+    }
+    let tilesWide = width / tileSize
+    let tilesHigh = (height + tileSize - 1) / tileSize
+    var minX = tilesWide
+    var minY = tilesHigh
+    var maxX = -1
+    var maxY = -1
+    for index in tileIndices where index >= 0 && index < tilesWide * tilesHigh {
+        let tileX = index % tilesWide
+        let tileY = index / tilesWide
+        minX = min(minX, tileX)
+        minY = min(minY, tileY)
+        maxX = max(maxX, tileX)
+        maxY = max(maxY, tileY)
+    }
+    guard maxX >= minX, maxY >= minY else { return nil }
+    return CGRect(
+        x: minX * tileSize,
+        y: minY * tileSize,
+        width: (maxX - minX + 1) * tileSize,
+        height: min(height - minY * tileSize, (maxY - minY + 1) * tileSize)
+    )
+}
+
+func tbBC7AdaptiveModeEnabled(
+    preset: TBDisplayCapturePreset,
+    usesBC7Mode6: Bool,
+    receiverSupportsTileDelta: Bool,
+    receiverSupportsAdaptivePatches: Bool
+) -> Bool {
+    preset == .native5k90Adaptive &&
+        usesBC7Mode6 &&
+        receiverSupportsTileDelta &&
+        receiverSupportsAdaptivePatches
+}
+
+func tbShouldSendBC7AdaptivePatch(
+    requiresFullFrame: Bool,
+    dirtyTileCount: Int,
+    totalTileCount: Int
+) -> Bool {
+    !requiresFullFrame &&
+        totalTileCount > 0 &&
+        dirtyTileCount >= max(1, totalTileCount / 5)
+}
+
+func tbShouldProcessCaptureFrame(
+    status: SCFrameStatus?,
+    adaptiveRepairNeeded: Bool
+) -> Bool {
+    guard let status else { return true }
+    switch status {
+    case .complete, .started:
+        return true
+    case .idle:
+        return adaptiveRepairNeeded
+    case .blank, .suspended, .stopped:
+        return false
+    @unknown default:
+        return true
+    }
+}
+
+func tbBC7EncodeDirtyRects(
+    _ dirtyRects: [CGRect]?,
+    repairingAdaptiveFrame: Bool
+) -> [CGRect]? {
+    repairingAdaptiveFrame ? nil : dirtyRects
+}
+
 struct TBBC7TileAnalysis {
     let dirtyTiles: Set<Int>
     let checksums: [UInt64]
+}
+
+struct TBBC7ScaledPatch {
+    let destinationX: Int
+    let destinationY: Int
+    let destinationWidth: Int
+    let destinationHeight: Int
+    let encodedWidth: Int
+    let encodedHeight: Int
+    let bytesPerRow: Int
+    let data: Data
 }
 
 final class TBBC7Mode6Encoder {
@@ -570,12 +674,16 @@ final class TBBC7Mode6Encoder {
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private let tileAnalysisPipeline: MTLComputePipelineState
+    private let downsamplePipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
     private var outputBuffer: MTLBuffer?
     private var tileBaselineBuffer: MTLBuffer?
     private var tileChecksumBuffer: MTLBuffer?
     private var tileDirtyBuffer: MTLBuffer?
     private var tileIndexBuffer: MTLBuffer?
+    private var patchTexture: MTLTexture?
+    private var patchOutputBuffer: MTLBuffer?
+    private var patchOutputLength = 0
     private var outputBufferLength = 0
     private var tileBufferCount = 0
     private var tileIndexCapacity = 0
@@ -763,6 +871,26 @@ final class TBBC7Mode6Encoder {
         dirty_flags[tile_index] = differs ? 1u : 0u;
         checksums[tile_index] = hash;
     }
+
+    kernel void downsample_patch_2x(
+        texture2d<float, access::read> source [[texture(0)]],
+        texture2d<float, access::write> destination [[texture(1)]],
+        constant uint2 &source_origin [[buffer(0)]],
+        uint2 position [[thread_position_in_grid]]
+    ) {
+        if (position.x >= destination.get_width() ||
+            position.y >= destination.get_height()) {
+            return;
+        }
+        uint2 source_position = source_origin + position * 2u;
+        uint2 source_limit = uint2(source.get_width() - 1u, source.get_height() - 1u);
+        float4 color =
+            source.read(min(source_position, source_limit)) +
+            source.read(min(source_position + uint2(1u, 0u), source_limit)) +
+            source.read(min(source_position + uint2(0u, 1u), source_limit)) +
+            source.read(min(source_position + uint2(1u, 1u), source_limit));
+        destination.write(color * 0.25f, position);
+    }
     """
 
     init?() {
@@ -775,13 +903,17 @@ final class TBBC7Mode6Encoder {
         do {
             let library = try device.makeLibrary(source: Self.source, options: nil)
             guard let function = library.makeFunction(name: "bc7_mode6_encode"),
-                  let tileAnalysisFunction = library.makeFunction(name: "bc7_tile_analyze")
+                  let tileAnalysisFunction = library.makeFunction(name: "bc7_tile_analyze"),
+                  let downsampleFunction = library.makeFunction(name: "downsample_patch_2x")
             else {
                 return nil
             }
             pipeline = try device.makeComputePipelineState(function: function)
             tileAnalysisPipeline = try device.makeComputePipelineState(
                 function: tileAnalysisFunction
+            )
+            downsamplePipeline = try device.makeComputePipelineState(
+                function: downsampleFunction
             )
         } catch {
             NSLog("TargetBridge: unable to compile BC7 Mode 6 Metal encoder: %@", error.localizedDescription)
@@ -1000,6 +1132,129 @@ final class TBBC7Mode6Encoder {
             tileAnalysis
         )
     }
+
+    func encodeHalfScalePatch(
+        pixelBuffer: CVPixelBuffer,
+        destinationRect: CGRect
+    ) -> TBBC7ScaledPatch? {
+        let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let x = max(0, Int(destinationRect.minX))
+        let y = max(0, Int(destinationRect.minY))
+        let width = min(sourceWidth - x, Int(destinationRect.width))
+        let height = min(sourceHeight - y, Int(destinationRect.height))
+        guard width > 0, height > 0, width % 8 == 0, height % 8 == 0,
+              CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
+              let textureCache
+        else {
+            return nil
+        }
+
+        var cvTexture: CVMetalTexture?
+        guard CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            textureCache,
+            pixelBuffer,
+            nil,
+            .bgra8Unorm,
+            sourceWidth,
+            sourceHeight,
+            0,
+            &cvTexture
+        ) == kCVReturnSuccess,
+        let cvTexture,
+        let sourceTexture = CVMetalTextureGetTexture(cvTexture)
+        else {
+            return nil
+        }
+
+        let encodedWidth = width / 2
+        let encodedHeight = height / 2
+        let bytesPerRow = (encodedWidth / 4) * 16
+        let outputLength = bytesPerRow * (encodedHeight / 4)
+        if patchTexture == nil ||
+            patchTexture?.width != encodedWidth ||
+            patchTexture?.height != encodedHeight {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: encodedWidth,
+                height: encodedHeight,
+                mipmapped: false
+            )
+            descriptor.storageMode = .private
+            descriptor.usage = [.shaderRead, .shaderWrite]
+            patchTexture = device.makeTexture(descriptor: descriptor)
+        }
+        if patchOutputBuffer == nil || patchOutputLength != outputLength {
+            patchOutputBuffer = device.makeBuffer(
+                length: outputLength,
+                options: .storageModeShared
+            )
+            patchOutputLength = outputLength
+        }
+        guard let patchTexture,
+              let patchOutputBuffer,
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let downsample = commandBuffer.makeComputeCommandEncoder()
+        else {
+            return nil
+        }
+
+        var sourceOrigin = SIMD2<UInt32>(UInt32(x), UInt32(y))
+        downsample.setComputePipelineState(downsamplePipeline)
+        downsample.setTexture(sourceTexture, index: 0)
+        downsample.setTexture(patchTexture, index: 1)
+        downsample.setBytes(
+            &sourceOrigin,
+            length: MemoryLayout<SIMD2<UInt32>>.stride,
+            index: 0
+        )
+        downsample.dispatchThreads(
+            MTLSize(width: encodedWidth, height: encodedHeight, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1)
+        )
+        downsample.endEncoding()
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            return nil
+        }
+        var imageSize = SIMD2<UInt32>(UInt32(encodedWidth), UInt32(encodedHeight))
+        var blockOrigin = SIMD2<UInt32>(0, 0)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(patchTexture, index: 0)
+        encoder.setBuffer(patchOutputBuffer, offset: 0, index: 0)
+        encoder.setBytes(
+            &imageSize,
+            length: MemoryLayout<SIMD2<UInt32>>.stride,
+            index: 1
+        )
+        encoder.setBytes(
+            &blockOrigin,
+            length: MemoryLayout<SIMD2<UInt32>>.stride,
+            index: 2
+        )
+        encoder.dispatchThreads(
+            MTLSize(width: encodedWidth / 4, height: encodedHeight / 4, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else {
+            return nil
+        }
+
+        return TBBC7ScaledPatch(
+            destinationX: x,
+            destinationY: y,
+            destinationWidth: width,
+            destinationHeight: height,
+            encodedWidth: encodedWidth,
+            encodedHeight: encodedHeight,
+            bytesPerRow: bytesPerRow,
+            data: Data(bytes: patchOutputBuffer.contents(), count: outputLength)
+        )
+    }
 }
 
 struct TBBC7DeltaRun: Equatable {
@@ -1035,6 +1290,12 @@ final class TBBC7DeltaPlanner {
 
     var requiresFullFrame: Bool {
         forceKeyframe || baseline == nil || framesSinceKeyframe >= keyframeIntervalFrames
+    }
+
+    var committedSequence: UInt64 { sequence }
+
+    var committedChecksum: UInt64 {
+        tileChecksums.reduce(0, ^)
     }
 
     func reset() {
@@ -1382,6 +1643,110 @@ func tbMakeBC7DeltaPacket(
     return completed ? packet : nil
 }
 
+func tbBC7PayloadChecksum(_ data: Data) -> UInt64 {
+    var hash = UInt64(14_695_981_039_346_656_037)
+    for byte in data {
+        hash ^= UInt64(byte)
+        hash &*= 1_099_511_628_211
+    }
+    return hash
+}
+
+func tbMakeBC7AdaptivePatchPacket(
+    patch: TBBC7ScaledPatch,
+    canvasWidth: Int,
+    canvasHeight: Int,
+    generation: UInt32,
+    frameID: UInt64,
+    captureTimestampNanoseconds: UInt64,
+    nativeSequence: UInt64,
+    nativeChecksum: UInt64
+) -> Data? {
+    let fixedHeaderLength = 77
+    let patchDescriptorLength = 16
+    guard canvasWidth > 0, canvasHeight > 0,
+          canvasWidth <= Int(UInt32.max), canvasHeight <= Int(UInt32.max),
+          patch.destinationX >= 0, patch.destinationY >= 0,
+          patch.destinationWidth > 0, patch.destinationHeight > 0,
+          patch.destinationX + patch.destinationWidth <= canvasWidth,
+          patch.destinationY + patch.destinationHeight <= canvasHeight,
+          patch.encodedWidth > 0, patch.encodedHeight > 0,
+          patch.encodedWidth <= Int(UInt16.max),
+          patch.encodedHeight <= Int(UInt16.max),
+          patch.destinationX <= Int(UInt16.max),
+          patch.destinationY <= Int(UInt16.max),
+          patch.destinationWidth <= Int(UInt16.max),
+          patch.destinationHeight <= Int(UInt16.max),
+          patch.bytesPerRow == (patch.encodedWidth / 4) * 16,
+          patch.data.count == patch.bytesPerRow * (patch.encodedHeight / 4)
+    else {
+        return nil
+    }
+
+    let payloadLength = fixedHeaderLength + patchDescriptorLength + patch.data.count
+    let declaredLength = 1 + payloadLength
+    guard declaredLength <= Int(TBMonitorProtocol.maxPacketLength) else {
+        return nil
+    }
+    var packet = Data(count: 4 + declaredLength)
+    let completed = packet.withUnsafeMutableBytes { bytes -> Bool in
+        guard let destination = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self)
+        else { return false }
+        func writeBE16(_ value: UInt16, at offset: Int) {
+            destination[offset] = UInt8((value >> 8) & 0xff)
+            destination[offset + 1] = UInt8(value & 0xff)
+        }
+        func writeBE32(_ value: UInt32, at offset: Int) {
+            destination[offset] = UInt8((value >> 24) & 0xff)
+            destination[offset + 1] = UInt8((value >> 16) & 0xff)
+            destination[offset + 2] = UInt8((value >> 8) & 0xff)
+            destination[offset + 3] = UInt8(value & 0xff)
+        }
+        func writeBE64(_ value: UInt64, at offset: Int) {
+            for index in 0..<8 {
+                destination[offset + index] = UInt8(
+                    (value >> UInt64((7 - index) * 8)) & 0xff
+                )
+            }
+        }
+
+        writeBE32(UInt32(declaredLength), at: 0)
+        destination[4] = TBMonitorPacketType.bc7AdaptiveFrame.rawValue
+        destination[5] = 1
+        writeBE32(generation, at: 6)
+        writeBE64(frameID, at: 10)
+        writeBE64(captureTimestampNanoseconds, at: 18)
+        writeBE32(UInt32(canvasWidth), at: 26)
+        writeBE32(UInt32(canvasHeight), at: 30)
+        writeBE64(nativeSequence, at: 34)
+        writeBE64(nativeSequence, at: 42)
+        writeBE64(nativeChecksum, at: 50)
+        writeBE16(0, at: 58)
+        writeBE16(1, at: 60)
+        writeBE16(UInt16(patch.encodedWidth), at: 62)
+        writeBE16(UInt16(patch.encodedHeight), at: 64)
+        writeBE32(UInt32(patch.bytesPerRow), at: 66)
+        writeBE32(UInt32(patch.data.count), at: 70)
+        writeBE64(tbBC7PayloadChecksum(patch.data), at: 74)
+
+        let descriptorOffset = 82
+        writeBE16(UInt16(patch.destinationX), at: descriptorOffset)
+        writeBE16(UInt16(patch.destinationY), at: descriptorOffset + 2)
+        writeBE16(UInt16(patch.destinationWidth), at: descriptorOffset + 4)
+        writeBE16(UInt16(patch.destinationHeight), at: descriptorOffset + 6)
+        writeBE16(0, at: descriptorOffset + 8)
+        writeBE16(0, at: descriptorOffset + 10)
+        writeBE16(UInt16(patch.encodedWidth), at: descriptorOffset + 12)
+        writeBE16(UInt16(patch.encodedHeight), at: descriptorOffset + 14)
+        patch.data.copyBytes(
+            to: destination.advanced(by: descriptorOffset + patchDescriptorLength),
+            count: patch.data.count
+        )
+        return true
+    }
+    return completed ? packet : nil
+}
+
 final class TBLatestFrameSlot<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var pendingValue: Value?
@@ -1443,6 +1808,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let usesRawNV12: Bool
     private let usesBC7Mode6: Bool
     private let usesBC7TileDelta: Bool
+    private let usesBC7AdaptivePatches: Bool
+    private let adaptiveGeneration: UInt32
     private let onFirstFrame: @Sendable (Int, Int) -> Void
 
     // Confined to `queue`.
@@ -1457,6 +1824,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var bc7DeltaFrames = 0
     private var bc7DirtyTiles = 0
     private var bc7FullEncodeFallbacks = 0
+    private var bc7AdaptiveFrames = 0
+    private var bc7AdaptiveScaledTiles = 0
+    private var adaptiveFrameID: UInt64 = 0
+    private var adaptiveActive = false
     private var displayStreamFrameSequence: CMTimeValue = 0
     private var lastEncodedDisplayPTS: CMTime?
     private var ackSent: Bool
@@ -1474,6 +1845,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _bc7PlanNanoseconds: UInt64 = 0
     private var _bc7PacketNanoseconds: UInt64 = 0
     private var _bc7GPUAnalyzedFrames = 0
+    private var _bc7AdaptiveActive = false
     private var _bc7SendCompletedFrames = 0
     private var _bc7SendNanoseconds: UInt64 = 0
     private var _bc7SendErrors = 0
@@ -1487,6 +1859,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
          usesRawNV12: Bool,
          usesBC7Mode6: Bool,
          usesBC7TileDelta: Bool,
+         usesBC7AdaptivePatches: Bool,
+         adaptiveGeneration: UInt32,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable (Int, Int) -> Void) {
         self.preset = preset
@@ -1497,6 +1871,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.usesRawNV12 = usesRawNV12
         self.usesBC7Mode6 = usesBC7Mode6
         self.usesBC7TileDelta = usesBC7TileDelta
+        self.usesBC7AdaptivePatches = usesBC7AdaptivePatches
+        self.adaptiveGeneration = adaptiveGeneration
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
     }
@@ -1533,6 +1909,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     func stop() {
         queue.sync {
             running = false
+            adaptiveActive = false
+            lock.lock()
+            _bc7AdaptiveActive = false
+            lock.unlock()
             latestBC7Frame.cancel()
             if let encoder = vtEncoder { VTCompressionSessionInvalidate(encoder) }
             vtEncoder = nil
@@ -1574,6 +1954,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
         bc7DeltaFrames: Int,
         bc7DirtyTiles: Int,
         bc7FullEncodeFallbacks: Int,
+        bc7AdaptiveFrames: Int,
+        bc7AdaptiveScaledTiles: Int,
+        bc7AdaptiveActive: Bool,
         bc7ProcessedFrames: Int,
         bc7EncodeNanoseconds: UInt64,
         bc7PlanNanoseconds: UInt64,
@@ -1603,6 +1986,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 bc7DeltaFrames: bc7DeltaFrames,
                 bc7DirtyTiles: bc7DirtyTiles,
                 bc7FullEncodeFallbacks: bc7FullEncodeFallbacks,
+                bc7AdaptiveFrames: bc7AdaptiveFrames,
+                bc7AdaptiveScaledTiles: bc7AdaptiveScaledTiles,
+                bc7AdaptiveActive: adaptiveActive,
                 bc7ProcessedFrames: processedFrames,
                 bc7EncodeNanoseconds: encodeNanoseconds,
                 bc7PlanNanoseconds: planNanoseconds,
@@ -1620,6 +2006,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
         _capturedFrames += 1
         _lastCaptureFrameAt = Date()
         lock.unlock()
+    }
+
+    var adaptiveRepairNeededSnapshot: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _bc7AdaptiveActive
     }
 
     private func recordBC7Timing(
@@ -1951,11 +2342,87 @@ private final class TBVideoPipeline: @unchecked Sendable {
         if usesBC7TileDelta && !requiresFullFrame && dirtyRects == nil {
             bc7FullEncodeFallbacks += 1
         }
+        if usesBC7AdaptivePatches,
+           !requiresFullFrame,
+           let dirtyRects,
+           let encoder = bc7Encoder {
+            let dirtyPlan = tbBC7DirtyRegionPlan(
+                dirtyRects: dirtyRects,
+                width: CVPixelBufferGetWidth(pixelBuffer),
+                height: CVPixelBufferGetHeight(pixelBuffer)
+            )
+            let totalTiles =
+                (CVPixelBufferGetWidth(pixelBuffer) / TBBC7DeltaPlanner.tileSize) *
+                ((CVPixelBufferGetHeight(pixelBuffer) + TBBC7DeltaPlanner.tileSize - 1) /
+                 TBBC7DeltaPlanner.tileSize)
+            let shouldScale = tbShouldSendBC7AdaptivePatch(
+                requiresFullFrame: requiresFullFrame,
+                dirtyTileCount: dirtyPlan.tileIndices.count,
+                totalTileCount: totalTiles
+            )
+            if shouldScale,
+               let patchRect = tbBC7AdaptivePatchRect(
+                   tileIndices: dirtyPlan.tileIndices,
+                   width: CVPixelBufferGetWidth(pixelBuffer),
+                   height: CVPixelBufferGetHeight(pixelBuffer)
+               ) {
+                let encodeStarted = DispatchTime.now().uptimeNanoseconds
+                guard let patch = encoder.encodeHalfScalePatch(
+                    pixelBuffer: pixelBuffer,
+                    destinationRect: patchRect
+                ) else {
+                    bc7DeltaPlanner?.markSendFailure()
+                    return
+                }
+                let encodeFinished = DispatchTime.now().uptimeNanoseconds
+                adaptiveFrameID &+= 1
+                let packetStarted = encodeFinished
+                guard let packet = tbMakeBC7AdaptivePatchPacket(
+                    patch: patch,
+                    canvasWidth: CVPixelBufferGetWidth(pixelBuffer),
+                    canvasHeight: CVPixelBufferGetHeight(pixelBuffer),
+                    generation: adaptiveGeneration,
+                    frameID: adaptiveFrameID,
+                    captureTimestampNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                    nativeSequence: bc7DeltaPlanner?.committedSequence ?? 0,
+                    nativeChecksum: bc7DeltaPlanner?.committedChecksum ?? 0
+                ) else {
+                    bc7DeltaPlanner?.markSendFailure()
+                    return
+                }
+                let packetFinished = DispatchTime.now().uptimeNanoseconds
+                adaptiveActive = true
+                lock.lock()
+                _bc7AdaptiveActive = true
+                lock.unlock()
+                bc7AdaptiveFrames += 1
+                bc7AdaptiveScaledTiles += dirtyPlan.tileIndices.count
+                notifyFirstFrameIfNeeded(
+                    width: CVPixelBufferGetWidth(pixelBuffer),
+                    height: CVPixelBufferGetHeight(pixelBuffer)
+                )
+                recordBC7Timing(
+                    encodeNanoseconds: encodeFinished - encodeStarted,
+                    planNanoseconds: 0,
+                    packetNanoseconds: packetFinished - packetStarted,
+                    usedGPUAnalysis: true
+                )
+                sendBC7Packet(packet)
+                return
+            }
+        }
+        let repairingAdaptiveFrame = adaptiveActive
+        if repairingAdaptiveFrame {
+            bc7DeltaPlanner?.markSendFailure()
+        }
         let encodeStarted = DispatchTime.now().uptimeNanoseconds
         guard
               let encoded = bc7Encoder?.encode(
                   pixelBuffer: pixelBuffer,
-                  dirtyRects: dirtyRects
+                  dirtyRects: tbBC7EncodeDirtyRects(
+                      dirtyRects,
+                      repairingAdaptiveFrame: repairingAdaptiveFrame
+                  )
               )
         else {
             return
@@ -2030,6 +2497,17 @@ private final class TBVideoPipeline: @unchecked Sendable {
             packetNanoseconds: packetFinished - packetStarted,
             usedGPUAnalysis: encoded.tileAnalysis != nil
         )
+        sendBC7Packet(
+            packet,
+            adaptiveRepairFrameID:
+                repairingAdaptiveFrame ? adaptiveFrameID : nil
+        )
+    }
+
+    private func sendBC7Packet(
+        _ packet: Data,
+        adaptiveRepairFrameID: UInt64? = nil
+    ) {
         pendingVideoPackets += 1
         let sendStarted = DispatchTime.now().uptimeNanoseconds
         let packetBytes = packet.count
@@ -2046,6 +2524,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     self._bc7SendErrors += 1
                     self.lock.unlock()
                 } else {
+                    if let adaptiveRepairFrameID,
+                       self.adaptiveFrameID == adaptiveRepairFrameID {
+                        self.adaptiveActive = false
+                        self.lock.lock()
+                        self._bc7AdaptiveActive = false
+                        self.lock.unlock()
+                    }
                     self.lock.lock()
                     self._bc7SendCompletedFrames += 1
                     self._bc7SendNanoseconds &+= sendNanoseconds
@@ -2497,6 +2982,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var bc7PlanNanosecondsSnapshot: UInt64 = 0
     private var bc7PacketNanosecondsSnapshot: UInt64 = 0
     private var bc7GPUAnalyzedSnapshot = 0
+    private var bc7AdaptiveFramesSnapshot = 0
+    private var bc7AdaptiveScaledTilesSnapshot = 0
     private var bc7SendCompletedSnapshot = 0
     private var bc7SendNanosecondsSnapshot: UInt64 = 0
     private var fpsSnapshotAt = Date()
@@ -2563,8 +3050,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         var onFrame: ((CMSampleBuffer) -> Void)?
         var onAudio: ((CMSampleBuffer) -> Void)?
         var onError: ((Error) -> Void)?
+        var adaptiveRepairNeeded: (() -> Bool)?
 
-        private static func shouldProcessFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        private func shouldProcessFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
             guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
                 as? [[SCStreamFrameInfo: Any]],
                   let rawStatus = attachments.first?[SCStreamFrameInfo.status] as? Int,
@@ -2573,14 +3061,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return true
             }
 
-            switch status {
-            case .complete, .started:
-                return true
-            case .idle, .blank, .suspended, .stopped:
-                return false
-            @unknown default:
-                return true
-            }
+            return tbShouldProcessCaptureFrame(
+                status: status,
+                adaptiveRepairNeeded: adaptiveRepairNeeded?() == true
+            )
         }
 
         nonisolated func stream(_ stream: SCStream,
@@ -2591,7 +3075,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
             guard type == .screen else { return }
-            guard Self.shouldProcessFrame(sampleBuffer) else { return }
+            guard shouldProcessFrame(sampleBuffer) else { return }
             onFrame?(sampleBuffer)
         }
 
@@ -2694,7 +3178,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return kCMVideoCodecType_HEVC
             }
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k, .native5k60Experimental:
+        case .crisp2160p60, .native5k, .native5k60Experimental, .native5k90Adaptive:
             return preset.codecType
         }
     }
@@ -2890,7 +3374,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         videoTransportMode = .bc7Mode6
-        if capturePreset == .native5k || capturePreset == .native5k60Experimental {
+        if capturePreset == .native5k || capturePreset == .native5k60Experimental ||
+            capturePreset == .native5k90Adaptive {
             captureSource = .extendedDesktop
             matchRenderToStream = true
         }
@@ -3086,6 +3571,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         bc7PlanNanosecondsSnapshot = 0
         bc7PacketNanosecondsSnapshot = 0
         bc7GPUAnalyzedSnapshot = 0
+        bc7AdaptiveFramesSnapshot = 0
+        bc7AdaptiveScaledTilesSnapshot = 0
         bc7SendCompletedSnapshot = 0
         bc7SendNanosecondsSnapshot = 0
         transportDiagnosticsText = "pending=0 · in-flight=0 · dropped=0 · 0.00 Gbit/s"
@@ -3861,6 +4348,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
             let usesBC7Mode6 = bc7Mode6Enabled(for: profile)
             let usesRawNV12 = !usesBC7Mode6 && rawNV12Enabled(for: profile)
+            let usesBC7AdaptivePatches = tbBC7AdaptiveModeEnabled(
+                preset: preset,
+                usesBC7Mode6: usesBC7Mode6,
+                receiverSupportsTileDelta:
+                    profile.supportsBC7TileDelta == true,
+                receiverSupportsAdaptivePatches:
+                    profile.supportsBC7AdaptivePatches == true
+            )
+            if preset == .native5k90Adaptive && !usesBC7AdaptivePatches {
+                setStatus(.connectionFailed(
+                    "5K 90 Adaptive requires BC7 mode and a compatible Receiver."
+                ))
+                return false
+            }
             let codecType = resolvedCodecType(for: preset, profile: profile)
             let codecName = usesBC7Mode6 ? "BC7 Mode 6" : (usesRawNV12 ? "NV12 RAW" : codecName(for: codecType))
             activeCodecType = (usesRawNV12 || usesBC7Mode6) ? nil : codecType
@@ -3868,6 +4369,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             guard let connection else { return false }
             captureGeneration &+= 1
             let generation = captureGeneration
+            let adaptiveGeneration = usesBC7Mode6
+                ? bc7RenderGeneration &+ 1
+                : bc7RenderGeneration
             pipelineHasFirstFrame = false
 
             // The encode/send pipeline runs entirely on its own serial queue,
@@ -3883,6 +4387,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 usesRawNV12: usesRawNV12,
                 usesBC7Mode6: usesBC7Mode6,
                 usesBC7TileDelta: usesBC7Mode6 && profile.supportsBC7TileDelta == true,
+                usesBC7AdaptivePatches: usesBC7AdaptivePatches,
+                adaptiveGeneration: adaptiveGeneration,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] width, height in
                     Task { @MainActor in
@@ -3896,7 +4402,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             )
             if usesBC7Mode6 {
                 bc7RenderConfirmed = false
-                bc7RenderGeneration &+= 1
+                bc7RenderGeneration = adaptiveGeneration
                 var requestPayload = Data()
                 TBMonitorProtocol.appendBE32(&requestPayload, bc7RenderGeneration)
                 connection.send(
@@ -3937,7 +4443,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     display = try await waitForCaptureDisplay()
                 }
             }
-            if preset == .native5k || preset == .native5k60Experimental {
+            if preset == .native5k || preset == .native5k60Experimental ||
+                preset == .native5k90Adaptive {
                 guard let sourceMode = CGDisplayCopyDisplayMode(display.displayID),
                       tbSourceFramebufferSupportsNativeCapture(
                           preset: preset,
@@ -3980,6 +4487,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             )
 
             let delegate = CaptureDelegate()
+            delegate.adaptiveRepairNeeded = {
+                pipeline.adaptiveRepairNeededSnapshot
+            }
             delegate.onFrame = { sampleBuffer in
                 pipeline.submitCapturedFrame(sampleBuffer)
             }
@@ -4600,14 +5110,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let diag = pipeline?.diagnosticsSnapshot() ?? (
             pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
             bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0,
-            bc7FullEncodeFallbacks: 0, bc7ProcessedFrames: 0,
+            bc7FullEncodeFallbacks: 0,
+            bc7AdaptiveFrames: 0, bc7AdaptiveScaledTiles: 0,
+            bc7AdaptiveActive: false,
+            bc7ProcessedFrames: 0,
             bc7EncodeNanoseconds: 0, bc7PlanNanoseconds: 0,
             bc7PacketNanoseconds: 0, bc7GPUAnalyzedFrames: 0,
             bc7SendCompletedFrames: 0,
             bc7SendNanoseconds: 0, bc7SendErrors: 0
         )
         NSLog(
-            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d dropped=%d ptsSeq=%lld bc7Keyframes=%d bc7Deltas=%d bc7DirtyTiles=%d bc7FullEncodeFallbacks=%d",
+            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d dropped=%d ptsSeq=%lld bc7Keyframes=%d bc7Deltas=%d bc7DirtyTiles=%d bc7FullEncodeFallbacks=%d bc7AdaptiveFrames=%d bc7AdaptiveTiles=%d bc7AdaptiveActive=%@",
             isStreaming ? "yes" : "no",
             liveMetrics.senderFPS,
             session.displayID,
@@ -4619,7 +5132,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             diag.bc7Keyframes,
             diag.bc7DeltaFrames,
             diag.bc7DirtyTiles,
-            diag.bc7FullEncodeFallbacks
+            diag.bc7FullEncodeFallbacks,
+            diag.bc7AdaptiveFrames,
+            diag.bc7AdaptiveScaledTiles,
+            diag.bc7AdaptiveActive ? "yes" : "no"
         )
     }
 
@@ -4695,6 +5211,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         bc7PlanNanosecondsSnapshot = 0
         bc7PacketNanosecondsSnapshot = 0
         bc7GPUAnalyzedSnapshot = 0
+        bc7AdaptiveFramesSnapshot = 0
+        bc7AdaptiveScaledTilesSnapshot = 0
         bc7SendCompletedSnapshot = 0
         bc7SendNanosecondsSnapshot = 0
         transportDiagnosticsText = "pending=0 · in-flight=0 · dropped=0 · 0.00 Gbit/s"
@@ -4722,7 +5240,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         TBLog.connection.info("capture: first encoded frame received")
         actualStreamText = "\(width) × \(height) · \(activeCodecName ?? capturePreset.codecName)"
         recordSessionEvent("First encoded frame: \(actualStreamText)")
-        if capturePreset == .native5k || capturePreset == .native5k60Experimental,
+        if capturePreset == .native5k || capturePreset == .native5k60Experimental ||
+            capturePreset == .native5k90Adaptive,
            (width != capturePreset.width || height != capturePreset.height) {
             let message =
                 "5K validation failed: captured frame is \(width)×\(height), expected \(capturePreset.width)×\(capturePreset.height)."
@@ -4744,6 +5263,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         bc7PlanNanosecondsSnapshot = initialDiagnostics?.bc7PlanNanoseconds ?? 0
         bc7PacketNanosecondsSnapshot = initialDiagnostics?.bc7PacketNanoseconds ?? 0
         bc7GPUAnalyzedSnapshot = initialDiagnostics?.bc7GPUAnalyzedFrames ?? 0
+        bc7AdaptiveFramesSnapshot = initialDiagnostics?.bc7AdaptiveFrames ?? 0
+        bc7AdaptiveScaledTilesSnapshot =
+            initialDiagnostics?.bc7AdaptiveScaledTiles ?? 0
         bc7SendCompletedSnapshot = initialDiagnostics?.bc7SendCompletedFrames ?? 0
         bc7SendNanosecondsSnapshot = initialDiagnostics?.bc7SendNanoseconds ?? 0
         fpsSnapshotAt = Date()
@@ -4764,7 +5286,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 let diagnostics = pipeline?.diagnosticsSnapshot() ?? (
                     pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
                     bc7Keyframes: 0, bc7DeltaFrames: 0, bc7DirtyTiles: 0,
-                    bc7FullEncodeFallbacks: 0, bc7ProcessedFrames: 0,
+                    bc7FullEncodeFallbacks: 0,
+                    bc7AdaptiveFrames: 0, bc7AdaptiveScaledTiles: 0,
+                    bc7AdaptiveActive: false,
+                    bc7ProcessedFrames: 0,
                     bc7EncodeNanoseconds: 0, bc7PlanNanoseconds: 0,
                     bc7PacketNanoseconds: 0, bc7GPUAnalyzedFrames: 0,
                     bc7SendCompletedFrames: 0,
@@ -4790,6 +5315,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     0,
                     diagnostics.bc7GPUAnalyzedFrames - bc7GPUAnalyzedSnapshot
                 )
+                let adaptiveFrames = max(
+                    0,
+                    diagnostics.bc7AdaptiveFrames - bc7AdaptiveFramesSnapshot
+                )
+                let adaptiveScaledTiles = max(
+                    0,
+                    diagnostics.bc7AdaptiveScaledTiles -
+                        bc7AdaptiveScaledTilesSnapshot
+                )
                 let encodeMilliseconds = processedFrames > 0
                     ? Double(encodeNanoseconds) / Double(processedFrames) / 1_000_000.0
                     : 0
@@ -4814,17 +5348,22 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 bc7PlanNanosecondsSnapshot = diagnostics.bc7PlanNanoseconds
                 bc7PacketNanosecondsSnapshot = diagnostics.bc7PacketNanoseconds
                 bc7GPUAnalyzedSnapshot = diagnostics.bc7GPUAnalyzedFrames
+                bc7AdaptiveFramesSnapshot = diagnostics.bc7AdaptiveFrames
+                bc7AdaptiveScaledTilesSnapshot = diagnostics.bc7AdaptiveScaledTiles
                 bc7SendCompletedSnapshot = diagnostics.bc7SendCompletedFrames
                 bc7SendNanosecondsSnapshot = diagnostics.bc7SendNanoseconds
                 fpsSnapshotAt = now
                 transportDiagnosticsText = String(
-                    format: "capture=%.1f · sent=%.1f · completed=%.1f · pending=%d · dropped=%d · errors=%d · encode=%.2f ms · plan=%.2f ms · packet=%.2f ms · send=%.2f ms · %.2f Gbit/s",
+                    format: "capture=%.1f · sent=%.1f · completed=%.1f · pending=%d · dropped=%d · errors=%d · adaptive=%d/%d tiles active=%@ · encode=%.2f ms · plan=%.2f ms · packet=%.2f ms · send=%.2f ms · %.2f Gbit/s",
                     captureHz,
                     sentHz,
                     completedHz,
                     diagnostics.pending,
                     diagnostics.dropped,
                     diagnostics.bc7SendErrors,
+                    adaptiveFrames,
+                    adaptiveScaledTiles,
+                    diagnostics.bc7AdaptiveActive ? "yes" : "no",
                     encodeMilliseconds,
                     planMilliseconds,
                     packetMilliseconds,
@@ -4832,7 +5371,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     bytesPerSecond * 8.0 / 1_000_000_000.0
                 )
                 TBLog.connection.info(
-                    "metrics intervalMs=\(intervalSeconds * 1000.0, format: .fixed(precision: 1), privacy: .public) captureHz=\(captureHz, format: .fixed(precision: 2), privacy: .public) sentHz=\(sentHz, format: .fixed(precision: 2), privacy: .public) completedHz=\(completedHz, format: .fixed(precision: 2), privacy: .public) gpuAnalyzed=\(gpuAnalyzedFrames, privacy: .public)/\(processedFrames, privacy: .public) pending=\(diagnostics.pending, privacy: .public) inFlight=\(diagnostics.inFlight, privacy: .public) dropped=\(diagnostics.dropped, privacy: .public) sendErrors=\(diagnostics.bc7SendErrors, privacy: .public) key=\(diagnostics.bc7Keyframes, privacy: .public) delta=\(diagnostics.bc7DeltaFrames, privacy: .public) dirty=\(diagnostics.bc7DirtyTiles, privacy: .public) fallback=\(diagnostics.bc7FullEncodeFallbacks, privacy: .public) encodeMs=\(encodeMilliseconds, format: .fixed(precision: 2), privacy: .public) planMs=\(planMilliseconds, format: .fixed(precision: 2), privacy: .public) packetMs=\(packetMilliseconds, format: .fixed(precision: 2), privacy: .public) sendMs=\(sendMilliseconds, format: .fixed(precision: 2), privacy: .public) networkGbps=\(bytesPerSecond * 8.0 / 1_000_000_000.0, format: .fixed(precision: 3), privacy: .public)"
+                    "metrics intervalMs=\(intervalSeconds * 1000.0, format: .fixed(precision: 1), privacy: .public) captureHz=\(captureHz, format: .fixed(precision: 2), privacy: .public) sentHz=\(sentHz, format: .fixed(precision: 2), privacy: .public) completedHz=\(completedHz, format: .fixed(precision: 2), privacy: .public) gpuAnalyzed=\(gpuAnalyzedFrames, privacy: .public)/\(processedFrames, privacy: .public) pending=\(diagnostics.pending, privacy: .public) inFlight=\(diagnostics.inFlight, privacy: .public) dropped=\(diagnostics.dropped, privacy: .public) sendErrors=\(diagnostics.bc7SendErrors, privacy: .public) key=\(diagnostics.bc7Keyframes, privacy: .public) delta=\(diagnostics.bc7DeltaFrames, privacy: .public) dirty=\(diagnostics.bc7DirtyTiles, privacy: .public) fallback=\(diagnostics.bc7FullEncodeFallbacks, privacy: .public) adaptiveFrames=\(adaptiveFrames, privacy: .public) adaptiveTiles=\(adaptiveScaledTiles, privacy: .public) adaptiveActive=\(diagnostics.bc7AdaptiveActive, privacy: .public) encodeMs=\(encodeMilliseconds, format: .fixed(precision: 2), privacy: .public) planMs=\(planMilliseconds, format: .fixed(precision: 2), privacy: .public) packetMs=\(packetMilliseconds, format: .fixed(precision: 2), privacy: .public) sendMs=\(sendMilliseconds, format: .fixed(precision: 2), privacy: .public) networkGbps=\(bytesPerSecond * 8.0 / 1_000_000_000.0, format: .fixed(precision: 3), privacy: .public)"
                 )
             }
         }
@@ -4859,7 +5398,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 guard isStreaming, !pipelineHasFirstFrame else { return }
                 let sentFrames = self.pipeline?.sentFramesSnapshot ?? 0
                 TBLog.connection.error("capture: first-frame timeout preset=\(self.capturePreset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) connected=\(self.isConnected, privacy: .public) sentFrames=\(sentFrames, privacy: .public)")
-                if self.capturePreset == .native5k || self.capturePreset == .native5k60Experimental {
+                if self.capturePreset == .native5k ||
+                    self.capturePreset == .native5k60Experimental ||
+                    self.capturePreset == .native5k90Adaptive {
                     setStatus(.hevcNoFrames)
                 } else {
                     setStatus(.noFirstFrame)

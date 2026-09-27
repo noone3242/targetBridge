@@ -30,6 +30,9 @@
  *   payload = [4 BE uint32 generation][4 BE uint32 width][4 BE uint32 height]
  * type 0x26 = request acknowledgment for the next successfully rendered BC7 frame
  *   payload = [4 BE uint32 generation]
+ * type 0x27 = native BC7 tile delta
+ * type 0x28 = request native BC7 keyframe
+ * type 0x29 = atomic native-delta plus scaled BC7 atlas patches
  *
  * type 0x30 = heartbeat (JSON)
  * type 0x31 = teardown (JSON)
@@ -63,6 +66,7 @@
 #define TB_PKT_BC7_ACK_REQUEST  0x26
 #define TB_PKT_BC7_TILE_DELTA   0x27
 #define TB_PKT_BC7_KEYFRAME_REQUEST 0x28
+#define TB_PKT_BC7_ADAPTIVE_FRAME 0x29
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31
 #define TB_PKT_CURSOR           0x32

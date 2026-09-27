@@ -57,6 +57,7 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         XCTAssertEqual(TBSenderAutomation.parsePreset("crisp2160p60"), .crisp2160p60)
         XCTAssertEqual(TBSenderAutomation.parsePreset("native5k"), .native5k)
         XCTAssertEqual(TBSenderAutomation.parsePreset("native5k60Experimental"), .native5k60Experimental)
+        XCTAssertEqual(TBSenderAutomation.parsePreset("native5k90Adaptive"), .native5k90Adaptive)
     }
 
     func testParsePresetAliases() {
@@ -69,6 +70,7 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         XCTAssertEqual(TBSenderAutomation.parsePreset("crisp"), .crisp2160p60)
         XCTAssertEqual(TBSenderAutomation.parsePreset("5k60"), .native5k60Experimental)
         XCTAssertEqual(TBSenderAutomation.parsePreset("native5k60"), .native5k60Experimental)
+        XCTAssertEqual(TBSenderAutomation.parsePreset("5k90"), .native5k90Adaptive)
         XCTAssertEqual(TBSenderAutomation.parsePreset("5k"), .native5k)
         XCTAssertEqual(TBSenderAutomation.parsePreset("5K"), .native5k, "aliases are case-insensitive")
         XCTAssertEqual(TBSenderAutomation.parsePreset("native"), .native5k)
@@ -91,6 +93,17 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         XCTAssertEqual(preset.virtualDisplayRefreshRate, 60)
         XCTAssertEqual(preset.codecName, "HEVC")
         XCTAssertEqual(preset.averageBitRate, 150_000_000)
+    }
+
+    func testAdaptive5K90UsesIndependent90FPSSettings() {
+        let preset = TBDisplayCapturePreset.native5k90Adaptive
+
+        XCTAssertEqual(preset.width, 5120)
+        XCTAssertEqual(preset.height, 2880)
+        XCTAssertEqual(preset.expectedFrameRate, 90)
+        XCTAssertEqual(preset.virtualDisplayRefreshRate, 90)
+        XCTAssertEqual(preset.codecName, "HEVC")
+        XCTAssertEqual(preset.averageBitRate, 225_000_000)
     }
 
     // MARK: - matches (receiver selection for --receiver <value>)
