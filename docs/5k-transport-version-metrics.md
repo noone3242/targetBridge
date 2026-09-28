@@ -69,6 +69,28 @@ fba7473  BC7 stable baseline
 
 ## Stage measurements
 
+### `45d10a7` disconnected Receiver idle scheduling
+
+Measured locally on the same Apple Silicon Mac with the Receiver window open,
+no Sender connected, and 10 one-second `ps` CPU samples per build:
+
+```text
+Previous Receiver (`9f52243`): 33.59% average CPU
+Optimized Receiver (`45d10a7`): 1.02% average CPU
+Relative reduction:             97.0%
+```
+
+The optimized build changes only disconnected idle work:
+
+- no-client loop delay: 1 ms to 16 ms;
+- unchanged waiting status: no repeated SDL present;
+- unchanged AppKit overlay: no repeated window scan/property update;
+- audio device: paused until the first audio payload and paused again on
+  disconnect.
+
+Connected-before-first-frame and active streaming polling remain at the
+previous 1 ms cadence.
+
 ### `54a1836` BC7 GPU planner
 
 ```text
