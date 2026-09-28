@@ -19,6 +19,7 @@
 #include "bc7_supercompression.h"
 #include "bc7_renderer.h"
 #include "nv12_tile_runs.h"
+#include "idle_policy.h"
 #include "decoder.h"
 #include "display.h"
 #include "proto.h"
@@ -177,6 +178,7 @@ struct app {
     int      input_tap_consumes_events;
 
     SDL_AudioDeviceID audio_device;
+    int               audio_playing;
 
     uint8_t audio_buf[AUDIO_BUF_CAP];
     int     audio_buf_head;
@@ -2091,6 +2093,7 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_AUDIO_FRAME:
         if (a->audio_device != 0) {
+            int queued_audio = 0;
             SDL_LockAudioDevice(a->audio_device);
 
             // Limit audio backlog to 150ms (150 * 192 = 28800 bytes) to cushion
@@ -2113,9 +2116,16 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
                 }
                 a->audio_buf_head = (a->audio_buf_head + (int)len) % AUDIO_BUF_CAP;
                 a->audio_buf_size += (int)len;
+                queued_audio = 1;
             }
 
             SDL_UnlockAudioDevice(a->audio_device);
+            if (tb_receiver_audio_should_start(
+                    a->audio_playing,
+                    queued_audio ? len : 0)) {
+                SDL_PauseAudioDevice(a->audio_device, 0);
+                a->audio_playing = 1;
+            }
         }
         break;
     case TB_PKT_INPUT_EVENT:
@@ -2820,6 +2830,10 @@ static void close_client(struct app *a) {
     tb_parser_init(&a->parser, on_packet, a);
     tb_dec_reset(a->dec);   /* fresh decoder for next session */
     if (a->audio_device != 0) {
+        if (tb_receiver_audio_should_pause(0, a->audio_playing)) {
+            SDL_PauseAudioDevice(a->audio_device, 1);
+            a->audio_playing = 0;
+        }
         SDL_LockAudioDevice(a->audio_device);
         a->audio_buf_head = 0;
         a->audio_buf_tail = 0;
@@ -2978,8 +2992,7 @@ int main(int argc, char **argv) {
     SDL_AudioSpec obtained;
     a.audio_device = SDL_OpenAudioDevice(NULL, 0, &spec, &obtained, 0);
     if (a.audio_device != 0) {
-        SDL_PauseAudioDevice(a.audio_device, 0); // Start playing (unpaused)
-        fprintf(stderr, "[main] SDL audio device opened: 48000Hz stereo 16-bit PCM (obtained %d samples)\n", obtained.samples);
+        fprintf(stderr, "[main] SDL audio device opened paused: 48000Hz stereo 16-bit PCM (obtained %d samples)\n", obtained.samples);
     } else {
         fprintf(stderr, "[main] warning: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
     }
@@ -3322,11 +3335,14 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Yield when idle or when a nonblocking active socket had no data,
-         * otherwise the receiver can busy-spin between incoming frame packets. */
-        if (a.client_fd < 0 || !a.have_video_frame || socket_activity == 0) {
-            SDL_Delay(1);
-        }
+        /* Keep connected streaming latency unchanged, but do not poll and
+         * repaint a static disconnected/connecting window at ~1000 Hz. */
+        const uint32_t loop_delay_ms = tb_receiver_loop_delay_ms(
+            a.client_fd >= 0,
+            a.have_video_frame,
+            socket_activity
+        );
+        if (loop_delay_ms > 0) SDL_Delay(loop_delay_ms);
     }
 
     if (a.client_fd >= 0) close(a.client_fd);

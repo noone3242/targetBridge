@@ -12,6 +12,7 @@
 #include "../src/bc7_supercompression.h"
 #include "../src/bc7_cursor.h"
 #include "../src/nv12_tile_runs.h"
+#include "../src/idle_policy.h"
 #include "../src/window_policy.h"
 
 #include <compression.h>
@@ -955,6 +956,38 @@ static void test_window_close_quit_policy(void) {
           "later independent quit remains available");
 }
 
+static void test_receiver_idle_policy(void) {
+    CHECK(tb_receiver_loop_delay_ms(0, 0, 0) ==
+              TB_RECEIVER_DISCONNECTED_DELAY_MS,
+          "disconnected receiver uses low-frequency loop");
+    CHECK(tb_receiver_loop_delay_ms(1, 0, 0) ==
+              TB_RECEIVER_CONNECTING_DELAY_MS,
+          "connecting receiver uses bounded refresh cadence");
+    CHECK(tb_receiver_loop_delay_ms(1, 1, 0) ==
+              TB_RECEIVER_ACTIVE_IDLE_DELAY_MS,
+          "active receiver preserves low-latency idle polling");
+    CHECK(tb_receiver_loop_delay_ms(1, 1, 1) == 0,
+          "active socket work is not delayed");
+
+    CHECK(tb_receiver_status_should_present(0, 1) == 0,
+          "unchanged visible status is not presented again");
+    CHECK(tb_receiver_status_should_present(1, 1) == 1,
+          "changed status is presented");
+    CHECK(tb_receiver_status_should_present(0, 0) == 1,
+          "hidden status is presented once");
+
+    CHECK(tb_receiver_audio_should_start(0, 4096) == 1,
+          "first audio packet starts playback");
+    CHECK(tb_receiver_audio_should_start(1, 4096) == 0,
+          "active audio device is not restarted for every packet");
+    CHECK(tb_receiver_audio_should_start(0, 0) == 0,
+          "empty audio packet does not start playback");
+    CHECK(tb_receiver_audio_should_pause(0, 1) == 1,
+          "disconnect pauses active audio");
+    CHECK(tb_receiver_audio_should_pause(1, 1) == 0,
+          "connected audio remains active");
+}
+
 int main(void) {
     test_single_packet_whole_feed();
     test_byte_by_byte_feed();
@@ -970,6 +1003,7 @@ int main(void) {
     test_bc7_cursor_policy();
     test_nv12_tile_run_validation();
     test_window_close_quit_policy();
+    test_receiver_idle_policy();
 
     if (g_failures == 0) {
         printf("net parser tests: %d checks passed\n", g_checks);

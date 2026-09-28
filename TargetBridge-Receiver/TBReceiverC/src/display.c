@@ -11,6 +11,7 @@
 #include "bc7_renderer.h"
 #include "tb_i18n.h"
 #include "tb_gesture_bridge.h"
+#include "idle_policy.h"
 #include "window_policy.h"
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -73,6 +74,7 @@ struct tb_display {
     int           last_drawable_w;
     int           last_drawable_h;
     int           status_is_connecting;
+    int           status_ui_visible;
 };
 
 static uint16_t tb_disp_mac_keycode_for_sdl_scancode(SDL_Scancode scancode) {
@@ -1613,8 +1615,15 @@ static void tb_disp_set_stream_state(struct tb_display *d, int connected, int co
 }
 
 void tb_disp_set_connection_state(struct tb_display *d, int connected) {
+    if (!d) return;
+    const int should_hide_status =
+        connected &&
+        (d->status_ui_visible || !d->is_connected || d->is_connecting);
     tb_disp_set_stream_state(d, connected ? 1 : 0, 0);
-    if (connected) tb_native_status_hide();
+    if (should_hide_status) {
+        tb_native_status_hide();
+        d->status_ui_visible = 0;
+    }
 }
 
 static void tb_disp_set_connecting_state(struct tb_display *d, int connecting) {
@@ -1677,7 +1686,8 @@ void tb_disp_render_status(struct tb_display *d,
         drawable_h = 620;
     }
 
-    if (strcmp(d->last_ip, ip) != 0 ||
+    const int content_changed =
+        strcmp(d->last_ip, ip) != 0 ||
         strcmp(d->last_status, status) != 0 ||
         strcmp(d->last_sender, sender) != 0 ||
         strcmp(d->last_panel, panel) != 0 ||
@@ -1687,7 +1697,9 @@ void tb_disp_render_status(struct tb_display *d,
         d->last_drawable_w != drawable_w ||
         d->last_drawable_h != drawable_h ||
         d->status_tex == NULL ||
-        d->status_is_connecting) {
+        d->status_is_connecting;
+
+    if (content_changed) {
         snprintf(d->last_ip, sizeof(d->last_ip), "%s", ip);
         snprintf(d->last_status, sizeof(d->last_status), "%s", status);
         snprintf(d->last_sender, sizeof(d->last_sender), "%s", sender);
@@ -1700,6 +1712,12 @@ void tb_disp_render_status(struct tb_display *d,
         d->status_is_connecting = 0;
         tb_disp_rebuild_status_texture(d, ip, status, sender, panel, mode, language, permissions,
                                        drawable_w, drawable_h, 0);
+    }
+
+    if (!tb_receiver_status_should_present(
+            content_changed,
+            d->status_ui_visible)) {
+        return;
     }
 
     char title[256];
@@ -1722,6 +1740,7 @@ void tb_disp_render_status(struct tb_display *d,
         "",
         ""
     );
+    d->status_ui_visible = 1;
 }
 
 void tb_disp_render_connecting(struct tb_display *d) {
@@ -1738,10 +1757,12 @@ void tb_disp_render_connecting(struct tb_display *d) {
         drawable_h = 620;
     }
 
-    if (d->status_tex == NULL ||
+    const int content_changed =
+        d->status_tex == NULL ||
         !d->status_is_connecting ||
         d->last_drawable_w != drawable_w ||
-        d->last_drawable_h != drawable_h) {
+        d->last_drawable_h != drawable_h;
+    if (content_changed) {
         d->last_drawable_w = drawable_w;
         d->last_drawable_h = drawable_h;
         d->status_is_connecting = 1;
@@ -1754,19 +1775,22 @@ void tb_disp_render_connecting(struct tb_display *d) {
     if (d->status_tex) SDL_RenderCopy(d->ren, d->status_tex, NULL, NULL);
     tb_disp_draw_connecting_spinner(d, drawable_w, drawable_h);
     SDL_RenderPresent(d->ren);
-    tb_native_status_show(
-        d->win,
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        1,
-        tb_i18n_get("receiver.splash.connecting"),
-        tb_i18n_get("receiver.splash.waiting_first_frame")
-    );
+    if (content_changed || !d->status_ui_visible) {
+        tb_native_status_show(
+            d->win,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            1,
+            tb_i18n_get("receiver.splash.connecting"),
+            tb_i18n_get("receiver.splash.waiting_first_frame")
+        );
+        d->status_ui_visible = 1;
+    }
 }
 
 void tb_disp_set_brightness(struct tb_display *d, double level) {
