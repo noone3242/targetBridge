@@ -154,6 +154,74 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testStatusMenuActionWaitsUntilNextRunLoopAfterClose() async {
+        let queue = TBMenuDismissalActionQueue()
+        let menu = NSObject()
+        let menuID = ObjectIdentifier(menu)
+        var executionCount = 0
+        let executed = expectation(description: "menu action executed")
+
+        queue.schedule(for: menuID) {
+            executionCount += 1
+            executed.fulfill()
+        }
+
+        XCTAssertEqual(executionCount, 0)
+        XCTAssertTrue(queue.menuDidClose(menuID))
+        XCTAssertEqual(executionCount, 0)
+
+        await fulfillment(of: [executed], timeout: 1.0)
+        XCTAssertEqual(executionCount, 1)
+    }
+
+    @MainActor
+    func testStatusMenuActionIgnoresLateCloseFromReplacedMenu() async {
+        let queue = TBMenuDismissalActionQueue()
+        let firstMenu = NSObject()
+        let secondMenu = NSObject()
+        var firstActionRan = false
+        var secondActionRan = false
+        let secondExecuted = expectation(description: "replacement menu action executed")
+
+        queue.schedule(for: ObjectIdentifier(firstMenu)) {
+            firstActionRan = true
+        }
+        queue.schedule(for: ObjectIdentifier(secondMenu)) {
+            secondActionRan = true
+            secondExecuted.fulfill()
+        }
+
+        XCTAssertFalse(queue.menuDidClose(ObjectIdentifier(firstMenu)))
+        XCTAssertFalse(firstActionRan)
+        XCTAssertFalse(secondActionRan)
+
+        XCTAssertTrue(queue.menuDidClose(ObjectIdentifier(secondMenu)))
+        await fulfillment(of: [secondExecuted], timeout: 1.0)
+        XCTAssertFalse(firstActionRan)
+        XCTAssertTrue(secondActionRan)
+    }
+
+    @MainActor
+    func testStatusMenuActionCanBeCancelledAfterCloseBeforeRunLoop() async {
+        let queue = TBMenuDismissalActionQueue()
+        let menu = NSObject()
+        let menuID = ObjectIdentifier(menu)
+        var executionCount = 0
+        let executed = expectation(description: "cancelled action must not execute")
+        executed.isInverted = true
+
+        queue.schedule(for: menuID) {
+            executionCount += 1
+            executed.fulfill()
+        }
+        XCTAssertTrue(queue.menuDidClose(menuID))
+        queue.cancel()
+
+        await fulfillment(of: [executed], timeout: 0.1)
+        XCTAssertEqual(executionCount, 0)
+    }
+
     // MARK: - currentIPv4Interfaces (live snapshot; environment-tolerant)
 
     func testCurrentIPv4InterfacesExcludesLoopbackAndHasNames() {

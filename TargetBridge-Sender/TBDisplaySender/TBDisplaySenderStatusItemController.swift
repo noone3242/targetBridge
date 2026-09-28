@@ -1,6 +1,62 @@
 import AppKit
 import Combine
 
+@MainActor
+final class TBMenuDismissalActionQueue {
+    private enum Phase {
+        case waitingForClose
+        case ready
+    }
+
+    private struct PendingAction {
+        let menuID: ObjectIdentifier
+        let action: () -> Void
+        var phase: Phase
+    }
+
+    private var pendingAction: PendingAction?
+
+    func schedule(for menuID: ObjectIdentifier, action: @escaping () -> Void) {
+        pendingAction = PendingAction(
+            menuID: menuID,
+            action: action,
+            phase: .waitingForClose
+        )
+    }
+
+    func menuDidClose(_ menuID: ObjectIdentifier) -> Bool {
+        guard var pendingAction,
+              pendingAction.menuID == menuID,
+              pendingAction.phase == .waitingForClose
+        else {
+            return false
+        }
+        pendingAction.phase = .ready
+        self.pendingAction = pendingAction
+        RunLoop.main.perform(inModes: [.common]) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.executeReadyAction(for: menuID)
+            }
+        }
+        return true
+    }
+
+    private func executeReadyAction(for menuID: ObjectIdentifier) {
+        guard let pendingAction,
+              pendingAction.menuID == menuID,
+              pendingAction.phase == .ready
+        else {
+            return
+        }
+        self.pendingAction = nil
+        pendingAction.action()
+    }
+
+    func cancel() {
+        pendingAction = nil
+    }
+}
+
 func tbMenuBarByteRateText(gigabitsPerSecond: Double) -> String {
     let bytesPerSecond = max(0, gigabitsPerSecond) * 1_000_000_000 / 8
     if bytesPerSecond >= 1_000_000_000 {
@@ -22,6 +78,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
     private var cancellables = Set<AnyCancellable>()
     private var hasActivated = false
     nonisolated(unsafe) private var statsTimer: Timer?
+    private let deferredMenuAction = TBMenuDismissalActionQueue()
 
     init(service: TBDisplaySenderService) {
         self.service = service
@@ -108,6 +165,8 @@ final class TBDisplaySenderStatusItemController: NSObject {
 
     private func removeStatusItem() {
         guard let item = statusItem else { return }
+        deferredMenuAction.cancel()
+        NSObject.cancelPreviousPerformRequests(withTarget: self)
         NSStatusBar.system.removeStatusItem(item)
         statusItem = nil
     }
@@ -223,21 +282,29 @@ final class TBDisplaySenderStatusItemController: NSObject {
         menu.addItem(quitItem)
     }
 
-    // Menu-item handlers run while the menu is still dismissing. Doing work
-    // synchronously here (activating the app, ordering windows front, mutating
-    // observed session state) interrupts the menu window's fade-out: its alpha
-    // animates to 0 but the window is never closed, leaving an invisible
-    // menu-layer window that swallows clicks at the menu's footprint. Deferring
-    // to the next runloop tick lets the menu fully tear down first.
+    // AppKit can spend multiple runloop turns fading out a status-item menu.
+    // Running actions before menuDidClose can strand its transparent window in
+    // the WindowServer, where it continues intercepting clicks.
     private func runAfterMenuDismissal(_ action: @escaping () -> Void) {
-        DispatchQueue.main.async(execute: action)
+        guard let menu = statusItem?.menu else {
+            action()
+            return
+        }
+        deferredMenuAction.schedule(
+            for: ObjectIdentifier(menu),
+            action: action
+        )
     }
 
     @objc
     private func showMainWindow() {
         runAfterMenuDismissal {
             NSApp.activate(ignoringOtherApps: true)
-            for window in NSApp.windows {
+            for window in NSApp.windows
+                where window.level == .normal &&
+                window.canBecomeKey &&
+                !window.isSheet
+            {
                 window.makeKeyAndOrderFront(nil)
             }
         }
@@ -275,5 +342,10 @@ final class TBDisplaySenderStatusItemController: NSObject {
 extension TBDisplaySenderStatusItemController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         rebuildMenuItems(in: menu)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard statusItem?.menu === menu else { return }
+        _ = deferredMenuAction.menuDidClose(ObjectIdentifier(menu))
     }
 }
