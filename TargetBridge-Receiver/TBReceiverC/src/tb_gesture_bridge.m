@@ -362,6 +362,10 @@ static void tb_native_status_show_main(NSString *ip,
     NSWindow *window = tb_find_content_window();
     if (!window || !window.contentView) return;
 
+    NSButton *closeButton = [window standardWindowButton:NSWindowCloseButton];
+    closeButton.enabled = NO;
+    closeButton.toolTip = @"Receiver keeps running; use Escape or Quit to exit.";
+
     if (!g_status_overlay || g_status_window != window) {
         [g_status_overlay removeFromSuperview];
         g_status_overlay = [[TBReceiverStatusView alloc] initWithFrame:window.contentView.bounds];

@@ -64,7 +64,7 @@ clean:
 TEST_CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
 TEST_BIN = test_net_parser
 
-$(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h src/bc7_frame.c src/bc7_frame.h src/bc7_delta.c src/bc7_delta.h src/bc7_supercompression.c src/bc7_supercompression.h src/bc7_cursor.c src/bc7_cursor.h src/nv12_tile_runs.c src/nv12_tile_runs.h
+$(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h src/bc7_frame.c src/bc7_frame.h src/bc7_delta.c src/bc7_delta.h src/bc7_supercompression.c src/bc7_supercompression.h src/bc7_cursor.c src/bc7_cursor.h src/nv12_tile_runs.c src/nv12_tile_runs.h src/window_policy.h
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c src/bc7_frame.c src/bc7_delta.c src/bc7_supercompression.c src/bc7_cursor.c src/nv12_tile_runs.c -lcompression -o $@
 
 test: $(TEST_BIN)

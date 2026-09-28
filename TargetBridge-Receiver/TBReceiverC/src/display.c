@@ -11,6 +11,7 @@
 #include "bc7_renderer.h"
 #include "tb_i18n.h"
 #include "tb_gesture_bridge.h"
+#include "window_policy.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -53,6 +54,7 @@ struct tb_display {
     uint32_t      last_target_switch_tick;
     uint32_t      last_space_switch_tick;
     uint32_t      last_space_gesture_tick;
+    uint32_t      last_window_close_tick;
     int           space_gesture_accum_x;
     int           cursor_x, cursor_y;
     int           cursor_source_w, cursor_source_h;
@@ -1402,7 +1404,20 @@ unsigned int tb_disp_poll_actions(struct tb_display *d) {
     unsigned int actions = TB_DISP_ACTION_NONE;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) d->quit = 1;
+        if (ev.type == SDL_WINDOWEVENT &&
+            ev.window.event == SDL_WINDOWEVENT_CLOSE) {
+            d->last_window_close_tick = SDL_GetTicks();
+            SDL_RaiseWindow(d->win);
+        }
+        else if (ev.type == SDL_QUIT) {
+            uint32_t now = SDL_GetTicks();
+            if (tb_window_should_honor_quit(
+                    now,
+                    d->last_window_close_tick)) {
+                d->quit = 1;
+            }
+            d->last_window_close_tick = 0;
+        }
         else if (!d->input_capture_active &&
                  !d->input_intercept_active &&
                  ev.type == SDL_KEYDOWN &&

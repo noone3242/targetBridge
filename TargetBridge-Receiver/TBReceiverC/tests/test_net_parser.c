@@ -12,6 +12,7 @@
 #include "../src/bc7_supercompression.h"
 #include "../src/bc7_cursor.h"
 #include "../src/nv12_tile_runs.h"
+#include "../src/window_policy.h"
 
 #include <compression.h>
 #include <stdio.h>
@@ -939,6 +940,21 @@ static void test_nv12_tile_run_validation(void) {
           "NV12 tile-run count exceeding capacity rejected");
 }
 
+static void test_window_close_quit_policy(void) {
+    CHECK(tb_window_should_honor_quit(1000, 0) == 1,
+          "ordinary SDL quit remains available");
+    CHECK(tb_window_should_honor_quit(1000, 1000) == 0,
+          "quit emitted with window close is suppressed");
+    CHECK(tb_window_should_honor_quit(
+              1000 + TB_WINDOW_CLOSE_QUIT_SUPPRESSION_MS,
+              1000) == 0,
+          "window-close quit remains suppressed through grace period");
+    CHECK(tb_window_should_honor_quit(
+              1001 + TB_WINDOW_CLOSE_QUIT_SUPPRESSION_MS,
+              1000) == 1,
+          "later independent quit remains available");
+}
+
 int main(void) {
     test_single_packet_whole_feed();
     test_byte_by_byte_feed();
@@ -953,6 +969,7 @@ int main(void) {
     test_bc7_delta_validation();
     test_bc7_cursor_policy();
     test_nv12_tile_run_validation();
+    test_window_close_quit_policy();
 
     if (g_failures == 0) {
         printf("net parser tests: %d checks passed\n", g_checks);
