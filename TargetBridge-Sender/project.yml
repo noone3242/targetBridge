@@ -20,6 +20,14 @@ targets:
         excludes:
           - "**/*.md"
       - path: TargetBridgeSupport/Assets.xcassets
+      - path: ../ThirdPartyNotices/MonitorControl-MIT.txt
+        buildPhase: resources
+    dependencies:
+      - sdk: IOKit.framework
+      - framework: /System/Library/Frameworks/CoreDisplay.framework
+        embed: false
+      - framework: /System/Library/PrivateFrameworks/DisplayServices.framework
+        embed: false
     settings:
       base:
         PRODUCT_NAME: "TargetBridge"

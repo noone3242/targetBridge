@@ -35,6 +35,7 @@ keeping the established multi-Mac workspace features:
 - `Input Dockstation` with master/slave keyboard and mouse control
 - text clipboard sync tied to the active input master
 - remote brightness control from the sender
+- per-display hardware brightness for the Sender's built-in and DDC/CI monitors
 - automatic receiver discovery and extended-layout restore
 - remote connection automation via URL scheme, CLI wrapper, launch args, and SSH recipes
 - remembers the selected virtual-display resolution for each receiver
@@ -54,7 +55,7 @@ keeping the established multi-Mac workspace features:
 - Network Link (experimental): [docs/Features.md#network-link-experimental](docs/Features.md#network-link-experimental)
 - Audio Relay: [docs/Features.md#audio-relay](docs/Features.md#audio-relay)
 - Input Dockstation, clipboard sync, master/slave roles, and Receiver Master shortcuts: [docs/Features.md#input-dockstation](docs/Features.md#input-dockstation)
-- Remote brightness control: [docs/Features.md#remote-brightness-control](docs/Features.md#remote-brightness-control)
+- Local physical-display and Receiver brightness control: [docs/Features.md#remote-brightness-control](docs/Features.md#remote-brightness-control)
 - Remote connection & automation (URL scheme, launch args, SSH, login/wake): [docs/Automation.md](docs/Automation.md)
 - Shared translations (English, Italian, German, French, and Chinese): [docs/Features.md#shared-translations](docs/Features.md#shared-translations)
 - Thunderbolt networking extras (SSH/SFTP, file sharing, Internet Sharing): [docs/Features.md#thunderbolt-networking-extras](docs/Features.md#thunderbolt-networking-extras)

@@ -2,12 +2,18 @@ import SwiftUI
 
 struct TBDisplaySenderContentView: View {
     @ObservedObject var service: TBDisplaySenderService
+    @StateObject private var physicalBrightness =
+        TBPhysicalDisplayBrightnessService.shared
     @State private var showingAbout = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 headerCard
+                TBPhysicalDisplayBrightnessView(
+                    service: physicalBrightness,
+                    language: service.language
+                )
                 controlDeck
 
                 ForEach(service.sessions) { session in
@@ -579,11 +585,11 @@ private struct TBDisplaySenderSessionCard: View {
 
     private var brightnessTitle: String {
         switch service.language {
-        case .italian: return "Luminosità"
-        case .english: return "Brightness"
-        case .german: return "Helligkeit"
-        case .french: return "Luminosité"
-        case .chinese: return "亮度"
+        case .italian: return "Luminosità Receiver"
+        case .english: return "Receiver brightness"
+        case .german: return "Receiver-Helligkeit"
+        case .french: return "Luminosité Receiver"
+        case .chinese: return "接收端亮度"
         }
     }
 

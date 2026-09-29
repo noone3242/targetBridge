@@ -11,6 +11,8 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOKit/IOKitLib.h>
+#import <IOKit/i2c/IOI2CInterface.h>
 
 static inline uint64_t TBChecksum64(const void *data, size_t length) {
     const uint8_t *bytes = (const uint8_t *)data;
@@ -78,7 +80,7 @@ extern CGSConnectionID_t CGSMainConnectionID(void);
 
 // MARK: - IOAVService Private API (Apple Silicon DDC)
 
-typedef void * IOAVServiceRef;
+typedef CFTypeRef IOAVServiceRef;
 extern IOAVServiceRef IOAVServiceCreate(CFAllocatorRef allocator);
 extern IOAVServiceRef IOAVServiceCreateWithService(CFAllocatorRef allocator, io_service_t service);
 extern IOReturn IOAVServiceReadI2C(IOAVServiceRef service,
@@ -91,5 +93,10 @@ extern IOReturn IOAVServiceWriteI2C(IOAVServiceRef service,
                                     uint32_t dataAddress,
                                     void *inputBuffer,
                                     uint32_t inputBufferSize);
+
+extern CFDictionaryRef CoreDisplay_DisplayCreateInfoDictionary(CGDirectDisplayID display);
+extern int DisplayServicesGetBrightness(CGDirectDisplayID display, float *brightness);
+extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightness);
+extern void CGSServiceForDisplayNumber(CGDirectDisplayID display, io_service_t *service);
 
 #endif /* TargetBridge_Bridging_Header_h */

@@ -131,11 +131,23 @@ Related reading:
 
 ## Remote Brightness Control
 
-The sender can adjust receiver panel brightness directly from the session UI.
+The Sender exposes two separate hardware-brightness controls:
 
-This makes it easier to treat the receiver as part of the same workspace without manually opening receiver-side display settings each time.
+- **Local physical displays** appear at the top of the Sender window. Built-in
+  and Apple displays use the native macOS brightness service; supported external
+  displays use DDC/CI. Each physical display has its own compact slider.
+- **Receiver brightness** remains part of each TargetBridge session and sends
+  the selected value over the session protocol to the connected Receiver.
 
-The current implementation sends brightness updates over the session protocol and applies them on the receiver side.
+TargetBridge-created virtual displays are excluded from the local list. Local
+controls represent real panel brightness only: TargetBridge does not add gamma,
+shade, or overlay-based software dimming. A physical display that does not
+support native brightness or DDC/CI is shown as unsupported with a disabled
+slider.
+
+Hardware writes are serialized per display and rapid slider changes are
+coalesced so one slow DDC monitor cannot block the interface or build an I2C
+backlog.
 
 ## Shared Translations
 
