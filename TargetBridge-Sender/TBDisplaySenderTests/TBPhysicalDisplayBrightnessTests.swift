@@ -144,6 +144,52 @@ final class TBPhysicalDisplayBrightnessTests: XCTestCase {
         wait(for: [completed], timeout: 0.15)
         XCTAssertTrue(backend.values.isEmpty)
     }
+
+    @MainActor
+    func testMenuSliderUpdatesValueWithoutClosingMenuActionPath() {
+        let device = TBPhysicalDisplayBrightnessDevice(
+            id: "display",
+            displayID: 1,
+            name: "Color LCD",
+            isBuiltIn: true,
+            brightness: 0.41,
+            confirmedBrightness: 0.41,
+            availability: .native,
+            isWriting: false
+        )
+        var received: Double?
+        let view = TBMenuBrightnessSliderView(device: device) {
+            received = $0
+        }
+
+        XCTAssertTrue(view.sliderEnabledForTesting)
+        XCTAssertEqual(view.percentageTextForTesting, "41%")
+
+        view.setBrightnessForTesting(0.73)
+
+        XCTAssertEqual(received ?? -1, 0.73, accuracy: 0.0001)
+        XCTAssertEqual(view.percentageTextForTesting, "73%")
+    }
+
+    @MainActor
+    func testMenuSliderDisablesUnsupportedHardware() {
+        let device = TBPhysicalDisplayBrightnessDevice(
+            id: "unsupported",
+            displayID: 2,
+            name: "Unsupported",
+            isBuiltIn: false,
+            brightness: 1,
+            confirmedBrightness: 1,
+            availability: .unsupported,
+            isWriting: false
+        )
+        let view = TBMenuBrightnessSliderView(device: device) { _ in
+            XCTFail("disabled slider must not emit hardware writes")
+        }
+
+        XCTAssertFalse(view.sliderEnabledForTesting)
+        XCTAssertEqual(view.percentageTextForTesting, "100%")
+    }
 }
 
 private final class MockBrightnessBackend:

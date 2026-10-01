@@ -295,3 +295,53 @@ Mutation tests：
 - session brightness功能和Receiver协议完全保持。
 - 不连接Receiver时不产生新的持续CPU负载。
 - DDC错误不会导致Sender崩溃、卡住或影响streaming。
+
+## 10. 菜单栏下拉框
+
+现有 TargetBridge status item 的 `NSMenu` 顶部增加本机物理显示器亮度控制。
+
+首版只显示 Sender 本机物理显示器，不在菜单中重复 session Receiver 亮度，避免下拉框
+过高和语义混淆。
+
+布局：
+
+```text
+TargetBridge
+状态
+网络
+
+本机显示器
+Color LCD       [sun.min ─ slider ─ sun.max] 41%
+DELL P2725QE    [sun.min ─ slider ─ sun.max] 71%
+DELL P3225QE    [sun.min ─ slider ─ sun.max] 86%
+
+显示主窗口
+新增会话
+...
+```
+
+实现使用 `NSMenuItem.view` 承载紧凑 AppKit slider row，并复用
+`TBPhysicalDisplayBrightnessService`：
+
+- 不重新探测显示器。
+- 不创建第二套DDC backend。
+- 不使用软件调暗。
+- 不支持硬件亮度的显示器显示禁用slider。
+- 拖动slider时菜单保持打开。
+- 亮度写入继续使用现有50 ms coalescing。
+
+slider action不能调用`runAfterMenuDismissal`，也不能激活/提升窗口；它只更新亮度service。
+因此不会进入此前造成透明`NSMenu`残留的“菜单关闭期间执行窗口动作”路径。
+
+菜单仍使用同一个长期存在的`NSMenu`实例，在`menuNeedsUpdate`时重建item。自定义slider view
+由对应menu item持有，菜单关闭后正常释放。显示主窗口、添加会话、停止、隐藏和退出等动作
+继续使用已经修复的`menuDidClose → next runloop`时序。
+
+新增测试：
+
+- 每台物理显示器生成一个slider row。
+- 虚拟显示器不生成menu row。
+- slider变化调用相同service和display ID。
+- unsupported设备slider disabled。
+- slider action不排队菜单关闭动作。
+- 多次打开菜单不残留旧slider target/view。

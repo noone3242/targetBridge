@@ -74,6 +74,7 @@ func tbMenuBarByteRateText(gigabitsPerSecond: Double) -> String {
 @MainActor
 final class TBDisplaySenderStatusItemController: NSObject {
     private let service: TBDisplaySenderService
+    private let brightnessService = TBPhysicalDisplayBrightnessService.shared
     nonisolated(unsafe) private var statusItem: NSStatusItem?
     private var cancellables = Set<AnyCancellable>()
     private var hasActivated = false
@@ -241,6 +242,34 @@ final class TBDisplaySenderStatusItemController: NSObject {
         }
 
         menu.addItem(.separator())
+
+        if !brightnessService.displays.isEmpty {
+            let displaysTitle = NSMenuItem(
+                title: service.language == .chinese
+                    ? "本机显示器亮度"
+                    : "Local display brightness",
+                action: nil,
+                keyEquivalent: ""
+            )
+            displaysTitle.isEnabled = false
+            menu.addItem(displaysTitle)
+
+            for display in brightnessService.displays {
+                let item = NSMenuItem()
+                item.view = TBMenuBrightnessSliderView(
+                    device: display,
+                    onChange: { [weak brightnessService] value in
+                        brightnessService?.setBrightness(
+                            value,
+                            for: display.id
+                        )
+                    }
+                )
+                menu.addItem(item)
+            }
+
+            menu.addItem(.separator())
+        }
 
         let openItem = NSMenuItem(
             title: TBDisplaySenderL10n.showMainWindow(service.language),
