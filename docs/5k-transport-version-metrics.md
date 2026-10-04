@@ -48,6 +48,7 @@ fba7473  BC7 stable baseline
 | `bc7-5k-gpu-planner-stable-2026-09-26` | `54a1836c81e5` | GPU BC7 encode and GPU tile analysis | Sender 45.33 Hz; Receiver 47.31 FPS average and 56.77 FPS peak; Sender average/peak bandwidth 1.841/3.228 Gbit/s; Receiver peak 2.928 Gbit/s; no drops or protocol/render errors |
 | `bc7-5k-lz4-low-bandwidth-checkpoint-2026-09-27` | `52b4ece57f1a` | Changed BC7 tile runs in one Raw-BC7 LZ4 stream | Sender 53.90 Hz; Receiver 36.37 FPS; average/peak bandwidth 0.417/0.518 Gbit/s; Sender LZ4 p95 about 3.83 ms; Receiver decompression p95 about 3.15 ms; visible stutter remained |
 | `nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27` | `b90430696861` | Raw NV12 bounding-region LZ4, partial texture upload, checksum disabled | High-load average Sender/Receiver 51.72/51.79 FPS; average/peak bandwidth 1.133/3.074 Gbit/s; a consistent drag interval reached about 55–58 FPS; no invalid frames, render failures, or keyframe requests |
+| `nv12-5k-copy-rect-stable-2026-10-04` | `c39ccd6f7a57` | Raw NV12 format 5 Copy-Rect, two-thread liblz4, zero-copy packet slots | 120-sample real window-drag run: Sender/Receiver peak 58.06/58.24 FPS; average/peak bandwidth 0.276/2.633 Gbit/s; 2,941 Copy-Rect frames and 4.234M copied tiles; zero fallbacks, drops, invalid frames, decode/render failures, keyframe requests, heartbeat misses, or TCP resets |
 
 ## Experiment table
 
@@ -66,6 +67,7 @@ fba7473  BC7 stable baseline
 | `b90430696861` | NV12 checksum disabled | `nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27` | 80 | 1.133 Gbit/s | 3.074 Gbit/s | Sender 51.72 Hz; Receiver 51.79 FPS; selected intervals reached 55–58 FPS |
 | `7c03537705c4` | GPU-detected NV12 64×64 tile runs | No tag | 48 high-load windows | 0.812 Gbit/s | 1.780 Gbit/s | Sender 55.04 Hz; Receiver 53.33 FPS; tile detection p95 snapshot average 2.84 ms; no protocol or render errors |
 | `29c13bed2a52` | GPU-packed NV12 runs | No tag; rejected experiment | 77 high-load windows | 1.152 Gbit/s | 2.323 Gbit/s | Sender 45.19 Hz; Receiver 45.03 FPS; GPU packing p95 snapshot average 6.88 ms; no protocol or render errors |
+| `c39ccd6f7a57` | NV12 Copy-Rect + parallel liblz4 | `nv12-5k-copy-rect-stable-2026-10-04` | 120 one-second samples | 0.276 Gbit/s | 2.633 Gbit/s | Sender capture/sent 50.67/47.02 Hz average and 58.05/58.06 peak; Receiver 46.65 average and 58.24 peak FPS; Copy-Rect search p95 max 2.85 ms; 47.5% of zero-copy packets used format 5; no errors or recovery requests |
 
 ## Stage measurements
 
@@ -210,6 +212,48 @@ The experiment was therefore rejected and retained in Git history rather than
 used as the active implementation. Workloads were not identical, but the
 direct packing-stage regression was large enough to reject this form.
 
+### `c39ccd6` NV12 Copy-Rect and parallel liblz4
+
+Real MacBook Sender to Intel iMac Receiver window-drag run. The capture retained
+120 per-second metrics samples; TCP was `ESTABLISHED` in all 120 samples.
+
+```text
+Sender capture average/peak:       50.67 / 58.05 Hz
+Sender sent average/peak:          47.02 / 58.06 Hz
+Receiver present average/peak:     46.65 / 58.24 FPS
+network average/peak:              0.276 / 2.633 Gbit/s
+pending / dropped max:             1 / 0
+
+Copy-Rect frames:                  2,941
+copied tiles:                      4,234,385
+average copied tiles/frame:        about 1,440 of 3,600
+Copy-Rect / zero-copy packets:     about 47.5%
+Copy-Rect rejects / fallbacks:     0 / 0
+skipped searches:                  478
+Copy-Rect search p50/p95 max:      1.54 / 2.85 ms
+
+GPU tile detection p95 max:        3.49 ms
+fresh tile copy p95 max:           1.76 ms
+parallel liblz4 p95 max:           7.08 ms
+packet assembly p95 max:           0.016 ms
+fresh run count p95 max:           213
+
+Receiver decode p95 max:           2.59 ms
+Receiver shadow update p95 max:    2.33 ms
+Receiver apply p95 max:            9.27 ms
+Receiver present p95 max:          6.97 ms
+
+Sender process CPU average/peak:   28.1% / 59.5%
+Sender RSS peak:                   319 MB
+invalid/decode/render/key requests:0 / 0 / 0 / 0
+missed heartbeat ACK / TCP resets: 0 / 0
+```
+
+The prior format 4 drag observation measured 1.013/4.006 Gbit/s average/peak
+versus 0.276/2.633 Gbit/s here, an observed decrease of about 73%/34%. The
+drag content was not replayed identically, so this is a field comparison rather
+than a controlled A/B attribution.
+
 ## Branch heads
 
 | Branch | Head |
@@ -231,8 +275,8 @@ requirements, not measured performance claims.
 | GPU tile-run packing into a shared `MTLBuffer` | Implemented in `29c13be`, measured, and rejected | CPU run copy p95 averaged 2.26 ms in `7c03537`; GPU packing measured 6.88 ms | A second Metal pass and synchronous wait cost more than CPU row copy | Retained in Git history; a future attempt would need fused detection/compaction/packing in one GPU submission |
 | Candidate-only GPU tile comparison | Not implemented | Full-frame exact tile detection p95 averaged 2.84 ms | SCK dirty rectangles must be accumulated across dropped frames; periodic full scans may still be required | Missed-damage mutation tests, candidate tile count and detection p95 |
 | GPU run compaction | Not implemented | CPU reads tile flags and constructs horizontal run descriptors | Variable-length GPU output and synchronization | Run descriptors byte-exact against CPU planner; command count and wall time |
-| Independent compression chunks | Blocked on codec choice | Sender LZ4 p95 averaged 7.11 ms; Receiver LZ4 p95 averaged 3.25 ms | Separate chunks reset compression history and may increase wire bytes | Compression wall time, total CPU time, chunk count, wire/raw ratio and malformed-chunk recovery |
-| Multicore Sender compression | Not implemented | Single-stream CPU LZ4 compression | Requires independent chunk wire format | Same-frame byte-exact decode, p50/p95 wall time, per-core CPU and bandwidth |
+| Independent compression chunks | Implemented inside the existing Apple LZ4 block stream in `b800e74` | Sender LZ4 p95 averaged 7.11 ms in `7c03537` | Chunk boundaries add independent block history but do not change the wire format | Same-content one-thread/two-thread A/B remains useful for total CPU and ratio |
+| Multicore Sender compression | Implemented with two liblz4 chunks in `b800e74` | Single-stream CPU LZ4 compression | Reduces wall latency by using a second core; total CPU is not reduced | Real drag run validated decode/stability; controlled one-thread/two-thread content replay remains outstanding |
 | Multicore Receiver decompression | Not implemented | Single-stream CPU LZ4 decode | Requires independent chunks and atomic completion before texture mutation | Decode wall time, failed-chunk recovery and no partial texture commit |
 | Alternative lossless tile codec | Undecided | LZ4 CPU cost and 22.2% average wire/raw ratio | Metal has no public LZ4/zstd hardware API; a custom GPU codec needs match finding and variable-output compaction | Cross-architecture decoder, bit-exact corpus, malformed data and throughput |
 | Hardware HEVC path | Existing product path, not evaluated as a replacement for format 4 | Could replace tile LZ4 with media-engine video coding | Lossy video semantics, frame dependencies and different latency/recovery behavior | Identical 5K drag/video workload, encode/decode hardware status, quality and end-to-end latency |
