@@ -1859,6 +1859,7 @@ struct TBPipelineDiagnosticsSnapshot {
     let nv12CopyRectSkippedSearches: Int
     let nv12CopyRectSearchTime: TBMetricSummary
     let nv12CopyRectLastVector: String
+    let nv12CopyRectStats: TBNV12CopyRectStats
 
     static let empty = TBPipelineDiagnosticsSnapshot(
         pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
@@ -1889,7 +1890,8 @@ struct TBPipelineDiagnosticsSnapshot {
         nv12LZ4Encoder: "off",
         nv12CopyRectFrames: 0, nv12CopyRectTiles: 0, nv12CopyRectRejects: 0,
         nv12CopyRectWriterFailures: 0, nv12CopyRectSkippedSearches: 0,
-        nv12CopyRectSearchTime: .empty, nv12CopyRectLastVector: "none"
+        nv12CopyRectSearchTime: .empty, nv12CopyRectLastVector: "none",
+        nv12CopyRectStats: TBNV12CopyRectStats()
     )
 }
 
@@ -1945,6 +1947,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var rawNV12ParallelLZ4: TBNV12ParallelLZ4Encoder?
     private var rawNV12LastCopyVector: SIMD2<Int>?
     private var rawNV12CopyRectBackoff = TBNV12CopyRectBackoff()
+    private var rawNV12LastPointer: CGPoint?
+    /// Pointer move since the previous frame, in captured pixels.
+    private var rawNV12PointerDelta: SIMD2<Int>?
     private let latestBC7Frame = TBLatestFrameSlot<TBCapturedFrame>()
     private let latestRawNV12Frame = TBLatestFrameSlot<TBCapturedFrame>()
 
@@ -2006,6 +2011,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _nv12CopyRectSkippedSearches = 0
     private var _nv12CopyRectSearchTimeWindow = TBRollingMetricWindow()
     private var _nv12CopyRectLastVector: SIMD2<Int>?
+    private var _nv12CopyRectStats = TBNV12CopyRectStats()
     private var _lastCaptureFrameAt = Date()
 
     init(preset: TBDisplayCapturePreset,
@@ -2218,7 +2224,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 nv12CopyRectLastVector: usesRawNV12CopyRect
                     ? _nv12CopyRectLastVector.map { "\($0.x),\($0.y)" } ??
                         "none"
-                    : "off"
+                    : "off",
+                nv12CopyRectStats: _nv12CopyRectStats
             )
         }
     }
@@ -2641,6 +2648,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
             rawNV12Width = width
             rawNV12Height = height
         }
+        sampleRawNV12Pointer(width: width, height: height)
         let detectorHadBaseline = rawNV12TileDetector?.hasBaseline == true
         let detectedTiles: Set<Int>?
         var shouldCommitTileCandidate = false
@@ -3015,15 +3023,24 @@ private final class TBVideoPipeline: @unchecked Sendable {
             rawNV12CopyRectBackoff.reset()
             return nil
         }
+        let pointerDelta = rawNV12PointerDelta ?? .zero
         guard rawNV12CopyRectBackoff.shouldSearch(
-            at: DispatchTime.now().uptimeNanoseconds
+            at: DispatchTime.now().uptimeNanoseconds,
+            pointerMoving: pointerDelta != .zero
         ) else {
-            lock.lock(); _nv12CopyRectSkippedSearches += 1; lock.unlock()
+            lock.lock()
+            _nv12CopyRectSkippedSearches += 1
+            _nv12CopyRectStats.skippedTiles += dirtyTiles.count
+            lock.unlock()
             return nil
         }
         let searchStarted = DispatchTime.now().uptimeNanoseconds
         let copyRect = detector.findCopyRect(
-            dirtyTiles: dirtyTiles, preferred: rawNV12LastCopyVector
+            dirtyTiles: dirtyTiles,
+            preferred: rawNV12LastCopyVector,
+            predictions: [rawNV12LastCopyVector, rawNV12PointerDelta]
+                .compactMap { $0 }
+                .filter { $0 != .zero }
         )
         let searchElapsed = DispatchTime.now().uptimeNanoseconds - searchStarted
         lock.lock(); _nv12CopyRectSearchTimeWindow.record(searchElapsed); lock.unlock()
@@ -3031,6 +3048,18 @@ private final class TBVideoPipeline: @unchecked Sendable {
         else {
             rawNV12LastCopyVector = nil
             rawNV12CopyRectBackoff.recordMiss()
+            lock.lock()
+            if copyRect == nil {
+                _nv12CopyRectStats.noVectorFrames += 1
+            } else {
+                _nv12CopyRectStats.lowCoverageFrames += 1
+            }
+            if max(abs(pointerDelta.x), abs(pointerDelta.y)) >
+                TBNV12TileDetector.CopyRectSearch.dragRadius {
+                _nv12CopyRectStats.fastPointerMisses += 1
+            }
+            _nv12CopyRectStats.missedTiles += dirtyTiles.count
+            lock.unlock()
             return nil
         }
         let freshTiles = dirtyTiles.subtracting(copyRect.tiles)
@@ -3040,7 +3069,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
               freshRunCount <= 256
         else {
             rawNV12CopyRectBackoff.recordMiss()
-            lock.lock(); _nv12CopyRectRejects += 1; lock.unlock()
+            lock.lock()
+            _nv12CopyRectRejects += 1
+            _nv12CopyRectStats.missedTiles += dirtyTiles.count
+            lock.unlock()
             return nil
         }
         // A busy writer slot says nothing about the content, so it does not
@@ -3059,7 +3091,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                   checksumPolicy: rawNV12ChecksumPolicy
               )
         else {
-            lock.lock(); _nv12CopyRectWriterFailures += 1; lock.unlock()
+            lock.lock()
+            _nv12CopyRectWriterFailures += 1
+            _nv12CopyRectStats.missedTiles += dirtyTiles.count
+            lock.unlock()
             return nil
         }
         let vector = SIMD2(copyRect.dx, copyRect.dy)
@@ -3070,8 +3105,34 @@ private final class TBVideoPipeline: @unchecked Sendable {
         _nv12CopyRectFrames += 1
         _nv12CopyRectTiles += copyRect.tiles.count
         _nv12CopyRectLastVector = vector
+        _nv12CopyRectStats.recordHit(
+            dx: copyRect.dx, dy: copyRect.dy,
+            copyTiles: copyRect.tiles, freshTiles: freshTiles,
+            tilesWide: width / TBNV12Compression.tileSize,
+            tilesHigh: height / TBNV12Compression.tileSize
+        )
         lock.unlock()
         return result
+    }
+
+    /// Records how far the pointer moved since the previous frame, scaled
+    /// to captured pixels. A window drag moves the window by the same
+    /// amount, so the move is a search prediction even beyond the drag box.
+    private func sampleRawNV12Pointer(width: Int, height: Int) {
+        let pointer = CGEvent(source: nil)?.location
+        let bounds = CGDisplayBounds(displayID)
+        if let pointer, let last = rawNV12LastPointer,
+           bounds.width > 0, bounds.height > 0 {
+            rawNV12PointerDelta = SIMD2(
+                Int(((pointer.x - last.x) * CGFloat(width) / bounds.width)
+                    .rounded()),
+                Int(((pointer.y - last.y) * CGFloat(height) / bounds.height)
+                    .rounded())
+            )
+        } else {
+            rawNV12PointerDelta = nil
+        }
+        rawNV12LastPointer = pointer
     }
 
     func requestRawNV12Keyframe() {
@@ -6517,6 +6578,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     "nv12CopyRectLastVector":
                         diagnostics.nv12CopyRectLastVector
                 ]
+                metricsJSON.merge(diagnostics.nv12CopyRectStats.metrics) { $1 }
                 let livenessNow = DispatchTime.now().uptimeNanoseconds
                 let liveness = tbHeartbeatLivenessEvaluation(
                     supportsHeartbeatAck:

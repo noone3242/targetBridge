@@ -60,6 +60,18 @@ The work runs on the GPU in two synchronous command buffers.
    - purely vertical offsets up to ±1440 px (scrolls);
    - purely horizontal offsets up to ±1024 px.
 
+   On top of these, each frame adds every even offset within ±64 px of up
+   to two predictions that the fixed table lacks:
+   - the previous frame's vector;
+   - the pointer's move since the previous frame, scaled from display points
+     to captured pixels. A window being dragged moves with the pointer, so
+     this catches fast diagonal drags beyond the ±192 px box. The ±64 px
+     margin absorbs the gap between when the pointer is sampled and when
+     the frame was composited.
+
+   Duplicates are dropped so no anchor counts a vector twice. That adds at
+   most 8,450 offsets (about 20% more search work).
+
    Each anchor records up to 8 matching offsets.
 3. **Vote.** An anchor that matches more than 8 offsets is repetitive
    content and gets no vote. Every other match is one vote. The winning
@@ -104,6 +116,11 @@ would be wasted.
 That way a scroll that starts after the screen was quiet is searched at once.
 A reject (too many fresh runs) counts as a miss; a busy writer slot does
 not, since it says nothing about the content.
+
+While the pointer moved since the previous frame, a skipped frame searches
+anyway: a window may be dragging, and a skipped drag frame resends the whole
+window. Moving the pointer over a video therefore searches every frame, which
+costs the search time but nothing on the link.
 
 ## 7. Wire format 5
 
@@ -202,6 +219,19 @@ Sender:
 | `nv12CopyRectSearchP50Ms`, `nv12CopyRectSearchP95Ms` | Search plus verify time |
 | `nv12CopyRectLastVector` | Last vector used |
 
+Where the tiles of eligible frames went (cumulative), to tell which part of a
+drag or scroll still costs bandwidth:
+
+| Metric | Meaning |
+|---|---|
+| `nv12CopyRectSkippedTiles` | Dirty tiles of frames whose search the backoff skipped |
+| `nv12CopyRectMissedTiles` | Dirty tiles of searched frames that still went as format 4 (no vector, too little coverage, reject, writer failure) |
+| `nv12CopyRectEdgeTiles` | Fresh tiles in format 5 frames with a copied tile among their 8 neighbours: a moved edge or its shadow, only partly new |
+| `nv12CopyRectFreshAreaTiles` | All other fresh tiles in format 5 frames: revealed background, new content |
+| `nv12CopyRectNoVectorFrames`, `nv12CopyRectLowCoverageFrames` | Misses by cause |
+| `nv12CopyRectFastPointerMisses` | Misses while the pointer moved more than 192 px in a frame |
+| `nv12CopyRectNearVectors`, `nv12CopyRectDragVectors`, `nv12CopyRectScrollVectors`, `nv12CopyRectPredictedVectors` | Vectors sent: within 64 px, within the ±192 px box, on a scroll axis, or found only around a prediction |
+
 Receiver:
 - `rawCopyRectFrames` and `rawCopiedTiles`; format 5 frames also count in
   `rawRegionFrames`, and their fresh runs in `rawTileRuns`;
@@ -235,7 +265,10 @@ Sender (`TBNV12CopyRectTests`):
 - the writer round-trips through the test decoder, including copy-only
   frames, and rejects invalid copies;
 - the decoder rejects malformed packets;
-- the backoff schedule.
+- the predicted offsets are even, unique and disjoint from the fixed table,
+  and a diagonal drag of (300, −240) is found only with a nearby prediction;
+- the edge / fresh-area split and the vector buckets;
+- the backoff schedule, including searching on while the pointer moves.
 
 Receiver (`tests/test_net_parser.c`):
 - parse accept and reject cases;
@@ -251,6 +284,12 @@ plus search-time numbers at 5K.
 
 - One vector per frame. Two windows moving in different directions get only
   the stronger vector; the rest is sent fresh.
+- Copies are whole 64×64 tiles. Tiles on a moved window's edge mix window and
+  background, and its shadow blends with whatever is underneath, so a drag
+  always resends a ring of tiles around the window. `nv12CopyRectEdgeTiles`
+  measures it.
+- A drag faster than ±192 px per frame on both axes, without the pointer
+  moving the same way (scripted moves, keyboard), is not found.
 - Odd-pixel shifts cannot be copied (the UV plane is half resolution) and
   fall back to format 4.
 - Content that is scaled or changes while it moves (zoom, fade, smooth

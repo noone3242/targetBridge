@@ -26,6 +26,52 @@ final class TBNV12TileDetector {
         /// Sample-to-sample luma changes an anchor needs among its 64 samples
         /// so flat tiles, which match almost any offset, are skipped.
         static let minimumAnchorTransitions: UInt32 = 8
+        /// Predictions (the last vector, the pointer's move): any offset
+        /// within this box around each, so fast diagonal drags beyond
+        /// `dragRadius` are still found.
+        static let predictionRadius = 64
+        static let maxPredictions = 2
+        static let predictionCapacity =
+            maxPredictions * (predictionRadius + 1) * (predictionRadius + 1)
+
+        /// Whether `offsets()` contains (`dx`, `dy`).
+        static func isBaseOffset(dx: Int, dy: Int) -> Bool {
+            guard dx % 2 == 0, dy % 2 == 0, dx != 0 || dy != 0 else {
+                return false
+            }
+            if abs(dx) <= dragRadius, abs(dy) <= dragRadius { return true }
+            if dx == 0 { return abs(dy) <= verticalScrollRange }
+            if dy == 0 { return abs(dx) <= horizontalScrollRange }
+            return false
+        }
+
+        /// Even offsets around each prediction that `offsets()` lacks, each
+        /// once, so no anchor sees the same vector twice.
+        static func predictedOffsets(
+            around predictions: [SIMD2<Int>]
+        ) -> [SIMD2<Int32>] {
+            var seen = Set<SIMD2<Int>>()
+            var result: [SIMD2<Int32>] = []
+            for prediction in predictions.prefix(maxPredictions) {
+                // Round down to even, so the box stays on the even grid.
+                let centre = SIMD2(prediction.x & ~1, prediction.y & ~1)
+                for dy in stride(
+                    from: centre.y - predictionRadius,
+                    through: centre.y + predictionRadius, by: 2
+                ) {
+                    for dx in stride(
+                        from: centre.x - predictionRadius,
+                        through: centre.x + predictionRadius, by: 2
+                    )
+                    where (dx != 0 || dy != 0) &&
+                        !isBaseOffset(dx: dx, dy: dy) &&
+                        seen.insert(SIMD2(dx, dy)).inserted {
+                        result.append(SIMD2(Int32(dx), Int32(dy)))
+                    }
+                }
+            }
+            return result
+        }
 
         static func offsets() -> [SIMD2<Int32>] {
             var offsets: [SIMD2<Int32>] = []
@@ -311,9 +357,10 @@ final class TBNV12TileDetector {
         }
         let offsets = CopyRectSearch.offsets()
         let maxAnchors = CopyRectSearch.maxAnchors
+        // The fixed offsets, then room for the per-frame predicted ones.
         guard let offsetBuffer = device.makeBuffer(
-                  bytes: offsets,
-                  length: offsets.count * MemoryLayout<SIMD2<Int32>>.stride,
+                  length: (offsets.count + CopyRectSearch.predictionCapacity) *
+                      MemoryLayout<SIMD2<Int32>>.stride,
                   options: .storageModeShared
               ),
               let anchorBuffer = device.makeBuffer(
@@ -335,6 +382,11 @@ final class TBNV12TileDetector {
               )
         else {
             return nil
+        }
+        offsets.withUnsafeBytes {
+            offsetBuffer.contents().copyMemory(
+                from: $0.baseAddress!, byteCount: $0.count
+            )
         }
         offsetCount = offsets.count
         self.offsetBuffer = offsetBuffer
@@ -495,10 +547,12 @@ final class TBNV12TileDetector {
     func findCopyRect(
         dirtyTiles: Set<Int>,
         preferred: SIMD2<Int>? = nil,
+        predictions: [SIMD2<Int>] = [],
         minimumTiles: Int = 16
     ) -> CopyRect? {
         guard let shift = searchShift(
-            dirtyTiles: dirtyTiles, preferred: preferred
+            dirtyTiles: dirtyTiles, preferred: preferred,
+            predictions: predictions
         ),
         let tiles = verifyShift(
             dx: shift.x, dy: shift.y, tiles: dirtyTiles
@@ -511,10 +565,12 @@ final class TBNV12TileDetector {
     }
 
     /// Votes over sparse matches of up to `maxAnchors` textured dirty tiles
-    /// against every candidate offset. Only a hint: `verifyShift` decides.
+    /// against every candidate offset, plus a box around each prediction.
+    /// Only a hint: `verifyShift` decides.
     func searchShift(
         dirtyTiles: Set<Int>,
-        preferred: SIMD2<Int>? = nil
+        preferred: SIMD2<Int>? = nil,
+        predictions: [SIMD2<Int>] = []
     ) -> SIMD2<Int>? {
         guard hasStagedCandidate, hasBaseline,
               let candidateY, let committedY,
@@ -539,9 +595,17 @@ final class TBNV12TileDetector {
                 UInt32(tile / tilesWide * Self.tileSize)
             )
         }
+        let predicted = CopyRectSearch.predictedOffsets(around: predictions)
+        predicted.withUnsafeBytes {
+            guard let base = $0.baseAddress else { return }
+            offsetBuffer.contents()
+                .advanced(by: offsetCount * MemoryLayout<SIMD2<Int32>>.stride)
+                .copyMemory(from: base, byteCount: $0.count)
+        }
+        let searchCount = offsetCount + predicted.count
         memset(matchCountBuffer.contents(), 0, matchCountBuffer.length)
         var params = SIMD4<UInt32>(
-            UInt32(offsetCount),
+            UInt32(searchCount),
             UInt32(anchorCount),
             CopyRectSearch.minimumAnchorTransitions,
             0
@@ -571,7 +635,7 @@ final class TBNV12TileDetector {
             &params, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 5
         )
         encoder.dispatchThreads(
-            MTLSize(width: offsetCount, height: anchorCount, depth: 1),
+            MTLSize(width: searchCount, height: anchorCount, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: min(256, searchPipeline.maxTotalThreadsPerThreadgroup),
                 height: 1, depth: 1
@@ -775,8 +839,12 @@ struct TBNV12CopyRectBackoff {
     private var lastFrameAt: UInt64?
 
     /// Whether a frame large enough to search should run the search; a
-    /// skipped frame counts down the current backoff.
-    mutating func shouldSearch(at nanoseconds: UInt64) -> Bool {
+    /// skipped frame counts down the current backoff. While the pointer
+    /// moves, a window may be dragging, so every frame still searches.
+    mutating func shouldSearch(
+        at nanoseconds: UInt64,
+        pointerMoving: Bool = false
+    ) -> Bool {
         if let lastFrameAt,
            nanoseconds &- lastFrameAt > Self.idleResetNanoseconds {
             reset()
@@ -784,7 +852,7 @@ struct TBNV12CopyRectBackoff {
         lastFrameAt = nanoseconds
         guard remainingSkips == 0 else {
             remainingSkips -= 1
-            return false
+            return pointerMoving
         }
         return true
     }
@@ -806,5 +874,88 @@ struct TBNV12CopyRectBackoff {
         consecutiveMisses = 0
         skipLength = 0
         remainingSkips = 0
+    }
+}
+
+/// Where the tiles of frames eligible for copy-rect went, cumulative, so a
+/// capture shows which part of a drag or scroll still costs bandwidth.
+struct TBNV12CopyRectStats: Equatable {
+    /// Frames sent as tile runs: the backoff skipped the search, or the
+    /// search found nothing usable (no vector, too little copied, too many
+    /// fresh runs, no free writer slot).
+    var skippedTiles = 0
+    var missedTiles = 0
+    /// Copy-rect frames: fresh tiles next to a copied tile (a moved edge or
+    /// its shadow, only partly new), and fresh tiles elsewhere.
+    var edgeTiles = 0
+    var freshAreaTiles = 0
+    /// Searches that found no vector, or one that copied too little.
+    var noVectorFrames = 0
+    var lowCoverageFrames = 0
+    /// Misses while the pointer moved further than `dragRadius` in a frame.
+    var fastPointerMisses = 0
+    /// Vectors sent: within 64 pixels, within the drag box, on a scroll
+    /// axis, or found only around a prediction.
+    var nearVectors = 0
+    var dragVectors = 0
+    var scrollVectors = 0
+    var predictedVectors = 0
+
+    mutating func recordHit(
+        dx: Int, dy: Int,
+        copyTiles: Set<Int>, freshTiles: Set<Int>,
+        tilesWide: Int, tilesHigh: Int
+    ) {
+        let edges = Self.edgeTileCount(
+            freshTiles: freshTiles, copyTiles: copyTiles,
+            tilesWide: tilesWide, tilesHigh: tilesHigh
+        )
+        edgeTiles += edges
+        freshAreaTiles += freshTiles.count - edges
+        let search = TBNV12TileDetector.CopyRectSearch.self
+        let reach = max(abs(dx), abs(dy))
+        if !search.isBaseOffset(dx: dx, dy: dy) {
+            predictedVectors += 1
+        } else if reach <= 64 {
+            nearVectors += 1
+        } else if reach <= search.dragRadius {
+            dragVectors += 1
+        } else {
+            scrollVectors += 1
+        }
+    }
+
+    /// Fresh tiles with a copied tile among their eight neighbours.
+    static func edgeTileCount(
+        freshTiles: Set<Int>, copyTiles: Set<Int>,
+        tilesWide: Int, tilesHigh: Int
+    ) -> Int {
+        freshTiles.filter { tile in
+            let x = tile % tilesWide
+            let y = tile / tilesWide
+            for ny in max(0, y - 1)...min(tilesHigh - 1, y + 1) {
+                for nx in max(0, x - 1)...min(tilesWide - 1, x + 1)
+                where copyTiles.contains(ny * tilesWide + nx) {
+                    return true
+                }
+            }
+            return false
+        }.count
+    }
+
+    var metrics: [String: Int] {
+        [
+            "nv12CopyRectSkippedTiles": skippedTiles,
+            "nv12CopyRectMissedTiles": missedTiles,
+            "nv12CopyRectEdgeTiles": edgeTiles,
+            "nv12CopyRectFreshAreaTiles": freshAreaTiles,
+            "nv12CopyRectNoVectorFrames": noVectorFrames,
+            "nv12CopyRectLowCoverageFrames": lowCoverageFrames,
+            "nv12CopyRectFastPointerMisses": fastPointerMisses,
+            "nv12CopyRectNearVectors": nearVectors,
+            "nv12CopyRectDragVectors": dragVectors,
+            "nv12CopyRectScrollVectors": scrollVectors,
+            "nv12CopyRectPredictedVectors": predictedVectors,
+        ]
     }
 }

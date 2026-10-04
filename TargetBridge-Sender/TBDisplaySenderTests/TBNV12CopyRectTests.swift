@@ -499,4 +499,115 @@ final class TBNV12CopyRectTests: XCTestCase {
         backoff.reset()
         XCTAssertTrue(search(true))
     }
+
+    func testPredictedOffsetsExtendTheTableWithoutDuplicates() {
+        typealias Search = TBNV12TileDetector.CopyRectSearch
+        let base = Set(Search.offsets().map { [Int($0.x), Int($0.y)] })
+        let predicted = Search.predictedOffsets(
+            around: [SIMD2(301, -239), SIMD2(330, -250), SIMD2(10, 0)]
+        )
+        let pairs = predicted.map { [Int($0.x), Int($0.y)] }
+        XCTAssertEqual(Set(pairs).count, pairs.count)
+        XCTAssertTrue(Set(pairs).isDisjoint(with: base))
+        XCTAssertLessThanOrEqual(predicted.count, Search.predictionCapacity)
+        XCTAssertTrue(predicted.allSatisfy { $0.x % 2 == 0 && $0.y % 2 == 0 })
+        // The box around (300, -240) is in; the base table covers (10, 0).
+        XCTAssertTrue(pairs.contains([300, -240]))
+        XCTAssertTrue(pairs.contains([364, -176]))
+        XCTAssertFalse(pairs.contains([10, 0]))
+        for pair in base.prefix(1000) {
+            XCTAssertTrue(Search.isBaseOffset(dx: pair[0], dy: pair[1]))
+        }
+        XCTAssertFalse(Search.isBaseOffset(dx: 194, dy: 2))
+        XCTAssertFalse(Search.isBaseOffset(dx: 0, dy: 0))
+        XCTAssertFalse(Search.isBaseOffset(dx: 3, dy: 0))
+    }
+
+    func testDetectorFindsFastDiagonalDragAroundPrediction() throws {
+        guard let detector = TBNV12TileDetector() else {
+            throw XCTSkip("Metal NV12 tile detector unavailable")
+        }
+        var desktop = NV12Frame(width: width, height: height)
+        desktop.paintNoise(x: 80, y: 380, width: 512, height: 384, seed: 6)
+        var dragged = NV12Frame(width: width, height: height)
+        dragged.copyRect(
+            from: desktop, x: 380, y: 140, width: 512, height: 384,
+            dx: 300, dy: -240
+        )
+        _ = try XCTUnwrap(detector.analyze(pixelBuffer: desktop.makePixelBuffer()))
+        detector.commitCandidate()
+        let dirty = try XCTUnwrap(
+            detector.analyze(pixelBuffer: dragged.makePixelBuffer())
+        )
+        // Beyond the drag box on both axes, the fixed table misses it.
+        XCTAssertNil(detector.findCopyRect(dirtyTiles: dirty))
+        // A prediction within 64 pixels, e.g. the pointer's move, finds it.
+        let found = try XCTUnwrap(
+            detector.findCopyRect(
+                dirtyTiles: dirty, predictions: [SIMD2(331, -207)]
+            )
+        )
+        XCTAssertEqual(found.dx, 300)
+        XCTAssertEqual(found.dy, -240)
+        XCTAssertEqual(
+            found.tiles,
+            dragged.copyableTiles(
+                from: desktop, among: dirty, dx: 300, dy: -240
+            )
+        )
+    }
+
+    func testStatsSplitFreshTilesAndVectors() {
+        // A 4x3 grid: tiles 5 and 6 copied.
+        //   0  1  2  3
+        //   4 [5][6] 7
+        //   8  9 10 11
+        let edges = TBNV12CopyRectStats.edgeTileCount(
+            freshTiles: [0, 3, 7, 8, 11], copyTiles: [5, 6],
+            tilesWide: 4, tilesHigh: 3
+        )
+        XCTAssertEqual(edges, 5)
+        XCTAssertEqual(
+            TBNV12CopyRectStats.edgeTileCount(
+                freshTiles: [3, 7, 11], copyTiles: [4, 8],
+                tilesWide: 4, tilesHigh: 3
+            ),
+            0
+        )
+        var stats = TBNV12CopyRectStats()
+        for (dx, dy) in [(4, -2), (100, 120), (0, -600), (300, -240)] {
+            stats.recordHit(
+                dx: dx, dy: dy, copyTiles: [5], freshTiles: [0, 3],
+                tilesWide: 4, tilesHigh: 3
+            )
+        }
+        XCTAssertEqual(stats.nearVectors, 1)
+        XCTAssertEqual(stats.dragVectors, 1)
+        XCTAssertEqual(stats.scrollVectors, 1)
+        XCTAssertEqual(stats.predictedVectors, 1)
+        XCTAssertEqual(stats.edgeTiles, 4)
+        XCTAssertEqual(stats.freshAreaTiles, 4)
+        XCTAssertEqual(stats.metrics["nv12CopyRectEdgeTiles"], 4)
+    }
+
+    func testBackoffKeepsSearchingWhileThePointerMoves() {
+        var backoff = TBNV12CopyRectBackoff()
+        var now: UInt64 = 0
+        func search(missed: Bool, pointerMoving: Bool) -> Bool {
+            now += 16_666_667
+            guard backoff.shouldSearch(
+                at: now, pointerMoving: pointerMoving
+            ) else { return false }
+            if missed { backoff.recordMiss() } else { backoff.reset() }
+            return true
+        }
+        XCTAssertTrue(search(missed: true, pointerMoving: false))
+        XCTAssertTrue(search(missed: true, pointerMoving: false))
+        XCTAssertFalse(search(missed: true, pointerMoving: false))
+        // A drag starts during the skip: every frame probes, and a hit
+        // ends the backoff.
+        XCTAssertTrue(search(missed: true, pointerMoving: true))
+        XCTAssertTrue(search(missed: false, pointerMoving: true))
+        XCTAssertTrue(search(missed: true, pointerMoving: false))
+    }
 }
