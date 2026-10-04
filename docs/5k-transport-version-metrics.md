@@ -49,6 +49,7 @@ fba7473  BC7 stable baseline
 | `bc7-5k-lz4-low-bandwidth-checkpoint-2026-09-27` | `52b4ece57f1a` | Changed BC7 tile runs in one Raw-BC7 LZ4 stream | Sender 53.90 Hz; Receiver 36.37 FPS; average/peak bandwidth 0.417/0.518 Gbit/s; Sender LZ4 p95 about 3.83 ms; Receiver decompression p95 about 3.15 ms; visible stutter remained |
 | `nv12-5k-high-fps-high-bandwidth-checkpoint-2026-09-27` | `b90430696861` | Raw NV12 bounding-region LZ4, partial texture upload, checksum disabled | High-load average Sender/Receiver 51.72/51.79 FPS; average/peak bandwidth 1.133/3.074 Gbit/s; a consistent drag interval reached about 55–58 FPS; no invalid frames, render failures, or keyframe requests |
 | `nv12-5k-copy-rect-stable-2026-10-04` | `c39ccd6f7a57` | Raw NV12 format 5 Copy-Rect, two-thread liblz4, zero-copy packet slots | 120-sample real window-drag run: Sender/Receiver peak 58.06/58.24 FPS; average/peak bandwidth 0.276/2.633 Gbit/s; 2,941 Copy-Rect frames and 4.234M copied tiles; zero fallbacks, drops, invalid frames, decode/render failures, keyframe requests, heartbeat misses, or TCP resets |
+| `nv12-5k-pointer-copy-rect-stable-2026-10-04` | `08a790bb9d93` | Copy-Rect with pointer-predicted fast-drag search and detailed miss/fresh-area metrics | 120-sample varied-window drag run: 222 predicted-vector frames, Sender/Receiver peak 58.09/59.94 FPS; high-load average 53.32/52.39 FPS; average/peak bandwidth 0.305/1.879 Gbit/s; search p95 max 3.76 ms; zero drops, fallbacks, protocol/render errors, keyframe requests, heartbeat misses, or TCP resets |
 
 ## Experiment table
 
@@ -68,6 +69,7 @@ fba7473  BC7 stable baseline
 | `7c03537705c4` | GPU-detected NV12 64×64 tile runs | No tag | 48 high-load windows | 0.812 Gbit/s | 1.780 Gbit/s | Sender 55.04 Hz; Receiver 53.33 FPS; tile detection p95 snapshot average 2.84 ms; no protocol or render errors |
 | `29c13bed2a52` | GPU-packed NV12 runs | No tag; rejected experiment | 77 high-load windows | 1.152 Gbit/s | 2.323 Gbit/s | Sender 45.19 Hz; Receiver 45.03 FPS; GPU packing p95 snapshot average 6.88 ms; no protocol or render errors |
 | `c39ccd6f7a57` | NV12 Copy-Rect + parallel liblz4 | `nv12-5k-copy-rect-stable-2026-10-04` | 120 one-second samples | 0.276 Gbit/s | 2.633 Gbit/s | Sender capture/sent 50.67/47.02 Hz average and 58.05/58.06 peak; Receiver 46.65 average and 58.24 peak FPS; Copy-Rect search p95 max 2.85 ms; 47.5% of zero-copy packets used format 5; no errors or recovery requests |
+| `08a790bb9d93` | Pointer-predicted NV12 Copy-Rect | `nv12-5k-pointer-copy-rect-stable-2026-10-04` | 120 one-second samples | 0.305 Gbit/s | 1.879 Gbit/s | 222 predicted-vector frames; Sender sent 44.89 average and 58.09 peak Hz; Receiver 45.10 average and 59.94 peak FPS; high-load average 53.32/52.39 FPS; search p95 max 3.76 ms; no errors or recovery requests |
 
 ## Stage measurements
 
@@ -253,6 +255,51 @@ The prior format 4 drag observation measured 1.013/4.006 Gbit/s average/peak
 versus 0.276/2.633 Gbit/s here, an observed decrease of about 73%/34%. The
 drag content was not replayed identically, so this is a field comparison rather
 than a controlled A/B attribution.
+
+### `08a790b` pointer-predicted Copy-Rect
+
+This Sender-only update adds search candidates around the previous Copy-Rect
+vector and the pointer's per-frame movement while the left button is down on
+the captured display. It also records Copy-Rect miss causes and fresh-tile
+categories. The Receiver remained at `c39ccd6`.
+
+```text
+Sender capture average/peak:       48.87 / 58.01 Hz
+Sender sent average/peak:          44.89 / 58.09 Hz
+Receiver present average/peak:     45.10 / 59.94 FPS
+high-load sent/present average:    53.32 / 52.39 FPS
+high-load sent p50/p90/p95:        56.00 / 58.00 / 58.00 FPS
+high-load present p50/p90/max:     55.94 / 57.94 / 59.94 FPS
+network average/peak:              0.305 / 1.879 Gbit/s
+
+Copy-Rect frames:                  3,227
+copied tiles:                      4,544,653
+predicted-vector frames:           222 (about 6.9% of Copy-Rect frames)
+near / drag / scroll vectors:      1,230 / 1,131 / 644
+fast-pointer misses:               130
+skipped / missed tiles:            123,069 / 574,797
+edge / fresh-area tiles:           475,112 / 863,285
+no-vector / low-coverage frames:   485 / 57
+Copy-Rect rejects / writer errors: 0 / 0
+
+Copy-Rect search p50/p95 max:      1.84 / 3.76 ms
+GPU detection p95 max:             3.79 ms
+fresh copy p95 max:                2.00 ms
+parallel liblz4 p95 max:           7.46 ms
+Receiver decode/shadow p95 max:    2.73 / 2.19 ms
+Receiver apply/present p95 max:    9.66 / 7.16 ms
+
+Sender process CPU average/peak:   28.27% / 61.60%
+Sender RSS peak:                   343 MB
+invalid/decode/render/key requests:0 / 0 / 0 / 0
+missed heartbeat ACK / TCP resets: 0 / 0
+```
+
+Compared with `c39ccd6`, the maximum observed Copy-Rect search p95 increased
+from 2.85 to 3.76 ms while average process CPU remained effectively unchanged
+(28.09% versus 28.27%). The drag content was not replayed identically, so the
+FPS and bandwidth differences are observational rather than controlled A/B
+effects.
 
 ## Branch heads
 
