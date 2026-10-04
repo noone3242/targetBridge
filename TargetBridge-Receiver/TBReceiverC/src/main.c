@@ -18,6 +18,7 @@
 #include "bc7_delta.h"
 #include "bc7_supercompression.h"
 #include "bc7_renderer.h"
+#include "nv12_copy_rect.h"
 #include "nv12_tile_runs.h"
 #include "idle_policy.h"
 #include "receiver_diagnostics.h"
@@ -113,6 +114,11 @@ struct app {
     uint32_t raw_width, raw_height, raw_y_stride, raw_uv_stride;
     uint8_t *raw_decode_buffer;
     size_t raw_decode_capacity;
+    /* Copy of the displayed raw frame (tight strides) that format 5 copies
+     * shift in place. Always maintained for raw frames. */
+    int raw_shadow_valid;
+    uint8_t *raw_shadow;
+    size_t raw_shadow_capacity;
     uint64_t raw_last_keyframe_request_ms;
     int raw_keyframe_request_pending;
     uint64_t bc7_last_keyframe_request_ms;
@@ -144,6 +150,8 @@ struct app {
     uint64_t raw_region_frames;
     uint64_t raw_tile_run_frames;
     uint64_t raw_tile_runs;
+    uint64_t raw_copy_rect_frames;
+    uint64_t raw_copied_tiles;
     struct tb_metric_window raw_shadow_commit_ns;
     struct tb_metric_window raw_upload_ns;
     struct tb_metric_window raw_checksum_ns;
@@ -1075,12 +1083,197 @@ static void on_frame(const uint8_t *y, int y_stride,
     a->frames++;
 }
 
+static uint8_t *raw_shadow_uv(struct app *a) {
+    return a->raw_shadow + (size_t)a->raw_width * a->raw_height;
+}
+
+/* Copies a rectangle of NV12 planes into the same place in the shadow. */
+static void raw_shadow_store_rect(struct app *a,
+                                  const uint8_t *y, size_t y_stride,
+                                  const uint8_t *uv, size_t uv_stride,
+                                  uint32_t x, uint32_t y_pos,
+                                  uint32_t width, uint32_t height) {
+    const size_t shadow_stride = a->raw_width;
+    uint8_t *shadow_uv = raw_shadow_uv(a);
+    for (uint32_t row = 0; row < height; row++) {
+        memcpy(a->raw_shadow + (size_t)(y_pos + row) * shadow_stride + x,
+               y + (size_t)row * y_stride, width);
+    }
+    for (uint32_t row = 0; row < height / 2u; row++) {
+        memcpy(shadow_uv + (size_t)(y_pos / 2u + row) * shadow_stride + x,
+               uv + (size_t)row * uv_stride, width);
+    }
+}
+
+/* Restarts the shadow from a full frame; raw_width and raw_height must
+ * already describe it. On allocation failure the shadow stays invalid and
+ * format 5 frames request a keyframe. */
+static void raw_shadow_store_frame(struct app *a,
+                                   const uint8_t *y, size_t y_stride,
+                                   const uint8_t *uv, size_t uv_stride) {
+    a->raw_shadow_valid = 0;
+    const size_t length = (size_t)a->raw_width * a->raw_height * 3u / 2u;
+    if (a->raw_shadow_capacity < length) {
+        uint8_t *resized = realloc(a->raw_shadow, length);
+        if (!resized) return;
+        a->raw_shadow = resized;
+        a->raw_shadow_capacity = length;
+    }
+    const uint64_t started = now_ns();
+    raw_shadow_store_rect(
+        a, y, y_stride, uv, uv_stride, 0, 0, a->raw_width, a->raw_height
+    );
+    metric_record(&a->raw_shadow_commit_ns, now_ns() - started);
+    a->raw_shadow_valid = 1;
+}
+
+static void record_raw_present(struct app *a,
+                               uint64_t upload_started,
+                               uint64_t upload_finished) {
+    metric_record(&a->raw_upload_ns, upload_finished - upload_started);
+    metric_record(&a->bc7_present_ns, upload_finished - upload_started);
+    if (a->bc7_last_present_ns != 0) {
+        metric_record(
+            &a->bc7_present_interval_ns,
+            upload_finished - a->bc7_last_present_ns
+        );
+    }
+    a->bc7_last_present_ns = upload_finished;
+    a->bc7_presented_frames++;
+    a->have_video_frame = 1;
+    a->frames++;
+}
+
+/* Format 5: shift the shadow by the frame's copy vector, write the fresh
+ * tile runs over it, then upload every touched span from the shadow. */
+static void handle_raw_copy_rect_frame(struct app *a,
+                                       const uint8_t *p,
+                                       size_t len,
+                                       uint64_t apply_started) {
+    if (!a->raw_has_baseline || !a->raw_shadow_valid) {
+        request_raw_keyframe(a, "copy-rect-base");
+        return;
+    }
+    struct tb_nv12_copy_rect_frame frame;
+    struct tb_nv12_copy_run copies[TB_NV12_TILE_RUN_MAX_RUNS];
+    struct tb_nv12_tile_run fresh[TB_NV12_TILE_RUN_MAX_RUNS];
+    if (tb_nv12_copy_rect_parse(
+            p, len, &frame,
+            copies, TB_NV12_TILE_RUN_MAX_RUNS,
+            fresh, TB_NV12_TILE_RUN_MAX_RUNS) != 0 ||
+        frame.width != a->raw_width ||
+        frame.height != a->raw_height) {
+        request_raw_keyframe(a, "copy-rect-format");
+        return;
+    }
+
+    if (frame.raw_length > 0) {
+        if (a->raw_decode_capacity < frame.raw_length) {
+            uint8_t *resized = realloc(
+                a->raw_decode_buffer, frame.raw_length
+            );
+            if (!resized) {
+                request_raw_keyframe(a, "copy-rect-allocation");
+                return;
+            }
+            a->raw_decode_buffer = resized;
+            a->raw_decode_capacity = frame.raw_length;
+        }
+        const uint64_t decode_started = now_ns();
+        const size_t decoded = compression_decode_buffer(
+            a->raw_decode_buffer,
+            frame.raw_length,
+            frame.compressed,
+            frame.compressed_length,
+            NULL,
+            COMPRESSION_LZ4
+        );
+        metric_record(
+            &a->bc7_decompression_ns, now_ns() - decode_started
+        );
+        if (decoded != frame.raw_length) {
+            request_raw_keyframe(a, "copy-rect-decode");
+            return;
+        }
+        if (frame.checksum != 0) {
+            const uint64_t checksum_started = now_ns();
+            const int matches = tb_checksum64_matches_optional(
+                a->raw_decode_buffer, frame.raw_length, frame.checksum
+            );
+            metric_record(
+                &a->raw_checksum_ns, now_ns() - checksum_started
+            );
+            if (!matches) {
+                request_raw_keyframe(a, "copy-rect-checksum");
+                return;
+            }
+        }
+    }
+
+    const size_t stride = a->raw_width;
+    uint8_t *shadow_y = a->raw_shadow;
+    uint8_t *shadow_uv = raw_shadow_uv(a);
+    const uint64_t shadow_started = now_ns();
+    tb_nv12_copy_rect_apply_copies(
+        &frame, copies, shadow_y, stride, shadow_uv, stride
+    );
+    tb_nv12_tile_runs_write(
+        fresh, frame.fresh_count, a->raw_decode_buffer,
+        shadow_y, stride, shadow_uv, stride
+    );
+    metric_record(&a->raw_shadow_commit_ns, now_ns() - shadow_started);
+
+    struct tb_nv12_rect rects[TB_NV12_COPY_RECT_MAX_TILES_PER_SIDE];
+    const size_t rect_count = tb_nv12_copy_rect_dirty_rects(
+        &frame, copies, fresh, rects,
+        sizeof(rects) / sizeof(rects[0])
+    );
+    const uint64_t upload_started = now_ns();
+    for (size_t index = 0; index < rect_count; index++) {
+        const struct tb_nv12_rect *rect = &rects[index];
+        if (tb_disp_update_nv12_region(
+                a->disp,
+                shadow_y + (size_t)rect->y * stride + rect->x,
+                (int)stride,
+                shadow_uv + (size_t)(rect->y / 2u) * stride + rect->x,
+                (int)stride,
+                (int)frame.width,
+                (int)frame.height,
+                (int)rect->x,
+                (int)rect->y,
+                (int)rect->width,
+                (int)rect->height) != 0) {
+            request_raw_keyframe(a, "copy-rect-upload");
+            return;
+        }
+    }
+    if (tb_disp_present_nv12(a->disp) != 0) {
+        request_raw_keyframe(a, "copy-rect-present");
+        return;
+    }
+    record_raw_present(a, upload_started, now_ns());
+
+    uint64_t copied_tiles = 0;
+    for (uint32_t index = 0; index < frame.copy_count; index++) {
+        copied_tiles += copies[index].tile_count_x;
+    }
+    a->raw_region_frames++;
+    a->raw_copy_rect_frames++;
+    a->raw_copied_tiles += copied_tiles;
+    a->raw_tile_runs += frame.fresh_count;
+    metric_record(&a->bc7_apply_ns, now_ns() - apply_started);
+}
+
 /* Raw passthrough: render received NV12 planes directly, bypassing the decoder.
  * Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
  *          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)] */
 static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     const uint64_t apply_started = now_ns();
     record_bc7_packet_arrival(a, apply_started);
+    if (len > 0 && p[0] == TB_NV12_COPY_RECT_FORMAT) {
+        handle_raw_copy_rect_frame(a, p, len, apply_started);
+        return;
+    }
     if (len > 0 && p[0] == TB_NV12_TILE_RUN_FORMAT) {
         if (!a->raw_has_baseline) {
             request_raw_keyframe(a, "tile-runs-base");
@@ -1141,6 +1334,17 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             }
         }
 
+        uint64_t shadow_ns = 0;
+        if (a->raw_shadow_valid) {
+            const uint64_t shadow_started = now_ns();
+            tb_nv12_tile_runs_write(
+                runs, frame.run_count, raw,
+                a->raw_shadow, a->raw_width,
+                raw_shadow_uv(a), a->raw_width
+            );
+            shadow_ns = now_ns() - shadow_started;
+        }
+
         const uint64_t upload_started = now_ns();
         for (uint32_t index = 0; index < frame.run_count; index++) {
             const struct tb_nv12_tile_run *run = &runs[index];
@@ -1170,7 +1374,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             return;
         }
         const uint64_t upload_finished = now_ns();
-        metric_record(&a->raw_shadow_commit_ns, 0);
+        metric_record(&a->raw_shadow_commit_ns, shadow_ns);
         metric_record(
             &a->raw_upload_ns, upload_finished - upload_started
         );
@@ -1264,6 +1468,12 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             }
         }
         uint8_t *uv=raw+ylen;
+        uint64_t shadow_ns = 0;
+        if (a->raw_shadow_valid) {
+            const uint64_t shadow_started = now_ns();
+            raw_shadow_store_rect(a, raw, rw, uv, rw, x, y, rw, rh);
+            shadow_ns = now_ns() - shadow_started;
+        }
         const uint64_t present_started = now_ns();
         if (tb_disp_render_nv12_region(
                 a->disp, raw, (int)rw, uv, (int)rw,
@@ -1272,7 +1482,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
             return;
         }
         const uint64_t present_finished = now_ns();
-        metric_record(&a->raw_shadow_commit_ns, 0);
+        metric_record(&a->raw_shadow_commit_ns, shadow_ns);
         metric_record(&a->raw_upload_ns, present_finished - present_started);
         metric_record(&a->bc7_present_ns, present_finished - present_started);
         if (a->bc7_last_present_ns != 0) {
@@ -1372,6 +1582,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         a->raw_has_baseline = 1;
         a->raw_y_len=y_size; a->raw_uv_len=uv_size;
         a->raw_width=w; a->raw_height=h; a->raw_y_stride=ys; a->raw_uv_stride=us;
+        raw_shadow_store_frame(a, raw, ys, raw + y_size, us);
         metric_record(&a->raw_upload_ns, upload_finished - upload_started);
         metric_record(&a->bc7_present_ns, upload_finished - upload_started);
         if (a->bc7_last_present_ns != 0) {
@@ -1430,6 +1641,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     a->raw_y_len = y_size; a->raw_uv_len = uv_size;
     a->raw_width = w; a->raw_height = h;
     a->raw_y_stride = ys; a->raw_uv_stride = us;
+    raw_shadow_store_frame(a, y, ys, uv, us);
     metric_record(&a->raw_upload_ns, upload_finished - upload_started);
     metric_record(&a->bc7_present_ns, upload_finished - upload_started);
     if (a->bc7_last_present_ns != 0) {
@@ -1473,6 +1685,10 @@ static void reset_raw_state(struct app *a) {
     free(a->raw_decode_buffer);
     a->raw_decode_buffer = NULL;
     a->raw_decode_capacity = 0;
+    a->raw_shadow_valid = 0;
+    free(a->raw_shadow);
+    a->raw_shadow = NULL;
+    a->raw_shadow_capacity = 0;
 }
 
 static uint64_t checksum_bc7_tiles(const uint8_t *blocks,
@@ -1540,6 +1756,7 @@ static void request_bc7_keyframe(struct app *a, const char *reason) {
 
 static void request_raw_keyframe(struct app *a, const char *reason) {
     a->raw_has_baseline = 0;
+    a->raw_shadow_valid = 0;
     const uint64_t now = now_ms();
     if (a->client_fd < 0 || a->raw_keyframe_request_pending ||
         (a->raw_last_keyframe_request_ms != 0 &&
@@ -2908,7 +3125,8 @@ static int send_receiver_metrics(
         "\"inverseTransformP50Ms\":%.3f,\"inverseTransformP95Ms\":%.3f,"
         "\"inverseTransformP99Ms\":%.3f,\"rawFullFrames\":%llu,"
         "\"rawRegionFrames\":%llu,\"rawTileRunFrames\":%llu,"
-        "\"rawTileRuns\":%llu,\"rawShadowCommitP50Ms\":%.3f,"
+        "\"rawTileRuns\":%llu,\"rawCopyRectFrames\":%llu,"
+        "\"rawCopiedTiles\":%llu,\"rawShadowCommitP50Ms\":%.3f,"
         "\"rawShadowCommitP95Ms\":%.3f,\"rawShadowCommitP99Ms\":%.3f,"
         "\"rawUploadP50Ms\":%.3f,\"rawUploadP95Ms\":%.3f,"
         "\"rawUploadP99Ms\":%.3f,\"rawChecksumP50Ms\":%.3f,"
@@ -2955,6 +3173,8 @@ static int send_receiver_metrics(
         (unsigned long long)a->raw_region_frames,
         (unsigned long long)a->raw_tile_run_frames,
         (unsigned long long)a->raw_tile_runs,
+        (unsigned long long)a->raw_copy_rect_frames,
+        (unsigned long long)a->raw_copied_tiles,
         ns_to_ms(raw_shadow.p50),
         ns_to_ms(raw_shadow.p95),
         ns_to_ms(raw_shadow.p99),
@@ -3577,6 +3797,8 @@ int main(int argc, char **argv) {
                 a.bc7_keyframe_requests = 0;
                 a.raw_full_frames = 0;
                 a.raw_region_frames = 0;
+                a.raw_copy_rect_frames = 0;
+                a.raw_copied_tiles = 0;
                 a.bc7_last_packet_ns = 0;
                 a.bc7_last_present_ns = 0;
                 a.bc7_presented_frames = 0;

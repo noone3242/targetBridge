@@ -11,6 +11,7 @@
 #include "../src/bc7_delta.h"
 #include "../src/bc7_supercompression.h"
 #include "../src/bc7_cursor.h"
+#include "../src/nv12_copy_rect.h"
 #include "../src/nv12_tile_runs.h"
 #include "../src/idle_policy.h"
 #include "../src/receiver_diagnostics.h"
@@ -948,6 +949,388 @@ static void test_nv12_tile_run_validation(void) {
           "NV12 tile-run count exceeding capacity rejected");
 }
 
+/* ---- NV12 copy-rect (format 5) ---------------------------------------- */
+
+#define CR_W 384u
+#define CR_H 320u
+#define CR_TILE TB_NV12_TILE_RUN_SIZE
+#define CR_TILES_WIDE (CR_W / CR_TILE)
+#define CR_Y_BYTES ((size_t)CR_W * CR_H)
+#define CR_FRAME_BYTES (CR_Y_BYTES * 3u / 2u)
+#define CR_PAYLOAD_CAPACITY (CR_FRAME_BYTES * 2u + 65536u)
+
+struct cr_run {
+    uint16_t tile_x;
+    uint16_t tile_y;
+    uint16_t tile_count_x;
+};
+
+static void cr_fill_noise(uint8_t *bytes, size_t length, uint32_t seed) {
+    uint32_t state = seed * 2654435761u + 1u;
+    for (size_t index = 0; index < length; index++) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        bytes[index] = (uint8_t)state;
+    }
+}
+
+/* Builds a format 5 payload whose fresh runs carry `next`'s pixels. */
+static size_t cr_build_payload(uint8_t *payload,
+                               int dx,
+                               int dy,
+                               const struct cr_run *copies,
+                               uint32_t copy_count,
+                               const struct cr_run *fresh,
+                               uint32_t fresh_count,
+                               const uint8_t *next) {
+    uint8_t *raw = malloc(CR_FRAME_BYTES);
+    size_t raw_length = 0;
+    uint8_t *descriptor =
+        payload + TB_NV12_COPY_RECT_HEADER_BYTES +
+        (size_t)copy_count * TB_NV12_COPY_RECT_COPY_DESCRIPTOR_BYTES;
+    for (uint32_t index = 0; index < fresh_count; index++) {
+        const struct cr_run *run = &fresh[index];
+        const size_t width = (size_t)run->tile_count_x * CR_TILE;
+        const size_t x = (size_t)run->tile_x * CR_TILE;
+        const size_t y = (size_t)run->tile_y * CR_TILE;
+        const size_t offset = raw_length;
+        for (size_t row = 0; row < CR_TILE; row++) {
+            memcpy(raw + raw_length, next + (y + row) * CR_W + x, width);
+            raw_length += width;
+        }
+        for (size_t row = 0; row < CR_TILE / 2u; row++) {
+            memcpy(raw + raw_length,
+                   next + CR_Y_BYTES + (y / 2u + row) * CR_W + x, width);
+            raw_length += width;
+        }
+        put_be16(descriptor, run->tile_x);
+        put_be16(descriptor + 2, run->tile_y);
+        put_be16(descriptor + 4, run->tile_count_x);
+        put_be16(descriptor + 6, CR_TILE);
+        put_be32(descriptor + 8, (uint32_t)offset);
+        put_be32(descriptor + 12, (uint32_t)(raw_length - offset));
+        descriptor += TB_NV12_TILE_RUN_DESCRIPTOR_BYTES;
+    }
+    size_t compressed_length = 0;
+    if (raw_length > 0) {
+        compressed_length = compression_encode_buffer(
+            descriptor, CR_PAYLOAD_CAPACITY - (size_t)(descriptor - payload),
+            raw, raw_length, NULL, COMPRESSION_LZ4
+        );
+    }
+    free(raw);
+
+    payload[0] = TB_NV12_COPY_RECT_FORMAT;
+    payload[1] = TB_NV12_TILE_RUN_COMPRESSION_LZ4;
+    put_be16(payload + 2, CR_TILE);
+    put_be32(payload + 4, CR_W);
+    put_be32(payload + 8, CR_H);
+    put_be32(payload + 12, fresh_count);
+    put_be32(payload + 16, (uint32_t)raw_length);
+    put_be32(payload + 20, (uint32_t)compressed_length);
+    put_be64(payload + 24, 0);
+    put_be16(payload + 32, (uint16_t)(int16_t)dx);
+    put_be16(payload + 34, (uint16_t)(int16_t)dy);
+    put_be32(payload + 36, copy_count);
+    for (uint32_t index = 0; index < copy_count; index++) {
+        uint8_t *copy =
+            payload + TB_NV12_COPY_RECT_HEADER_BYTES +
+            (size_t)index * TB_NV12_COPY_RECT_COPY_DESCRIPTOR_BYTES;
+        put_be16(copy, copies[index].tile_x);
+        put_be16(copy + 2, copies[index].tile_y);
+        put_be16(copy + 4, copies[index].tile_count_x);
+        put_be16(copy + 6, 0);
+    }
+    return (size_t)(descriptor - payload) + compressed_length;
+}
+
+/* Pixel-by-pixel model of format 5: copies read the previous frame as a
+ * snapshot, then fresh tiles take `next`'s pixels. */
+static void cr_reference(uint8_t *expected,
+                         const uint8_t *previous,
+                         const uint8_t *next,
+                         int dx,
+                         int dy,
+                         const struct cr_run *copies,
+                         uint32_t copy_count,
+                         const struct cr_run *fresh,
+                         uint32_t fresh_count) {
+    memcpy(expected, previous, CR_FRAME_BYTES);
+    for (uint32_t index = 0; index < copy_count; index++) {
+        const struct cr_run *run = &copies[index];
+        const int x0 = run->tile_x * (int)CR_TILE;
+        const int y0 = run->tile_y * (int)CR_TILE;
+        const int width = run->tile_count_x * (int)CR_TILE;
+        for (int y = y0; y < y0 + (int)CR_TILE; y++) {
+            for (int x = x0; x < x0 + width; x++) {
+                expected[(size_t)y * CR_W + (size_t)x] =
+                    previous[(size_t)(y - dy) * CR_W + (size_t)(x - dx)];
+            }
+        }
+        for (int y = y0 / 2; y < (y0 + (int)CR_TILE) / 2; y++) {
+            for (int x = x0; x < x0 + width; x++) {
+                expected[CR_Y_BYTES + (size_t)y * CR_W + (size_t)x] =
+                    previous[CR_Y_BYTES + (size_t)(y - dy / 2) * CR_W +
+                             (size_t)(x - dx)];
+            }
+        }
+    }
+    for (uint32_t index = 0; index < fresh_count; index++) {
+        const struct cr_run *run = &fresh[index];
+        const size_t x = (size_t)run->tile_x * CR_TILE;
+        const size_t y = (size_t)run->tile_y * CR_TILE;
+        const size_t width = (size_t)run->tile_count_x * CR_TILE;
+        for (size_t row = 0; row < CR_TILE; row++) {
+            memcpy(expected + (y + row) * CR_W + x,
+                   next + (y + row) * CR_W + x, width);
+        }
+        for (size_t row = 0; row < CR_TILE / 2u; row++) {
+            const size_t offset = CR_Y_BYTES + (y / 2u + row) * CR_W + x;
+            memcpy(expected + offset, next + offset, width);
+        }
+    }
+}
+
+static int cr_rects_cover(const struct tb_nv12_rect *rects,
+                          size_t rect_count,
+                          const struct cr_run *runs,
+                          uint32_t run_count) {
+    for (uint32_t index = 0; index < run_count; index++) {
+        const uint32_t x = runs[index].tile_x * CR_TILE;
+        const uint32_t y = runs[index].tile_y * CR_TILE;
+        const uint32_t width = runs[index].tile_count_x * CR_TILE;
+        int covered = 0;
+        for (size_t r = 0; r < rect_count; r++) {
+            if (x >= rects[r].x && x + width <= rects[r].x + rects[r].width &&
+                y >= rects[r].y && y + CR_TILE <= rects[r].y + rects[r].height) {
+                covered = 1;
+            }
+        }
+        if (!covered) return 0;
+    }
+    return 1;
+}
+
+struct cr_scenario {
+    const char *name;
+    int dx;
+    int dy;
+    struct cr_run copies[8];
+    uint32_t copy_count;
+    struct cr_run fresh[8];
+    uint32_t fresh_count;
+    size_t expected_rects;
+};
+
+static void test_nv12_copy_rect_apply(void) {
+    const struct cr_scenario scenarios[] = {
+        /* Content scrolls up: rows 0-2 come from 66 pixels lower, the
+         * revealed bottom rows are fresh. */
+        { "scroll up", 0, -66,
+          { {0, 0, 6}, {0, 1, 6}, {0, 2, 2} }, 3,
+          { {2, 2, 4}, {0, 3, 6}, {0, 4, 6} }, 3, 1 },
+        /* Content scrolls down: rows read from rows they also overwrite. */
+        { "scroll down", 0, 70,
+          { {1, 2, 4}, {1, 3, 4}, {1, 4, 4} }, 3,
+          { {1, 1, 4} }, 1, 1 },
+        /* A shift smaller than a tile reads rows of its own tile row. */
+        { "small scroll down", 0, 20,
+          { {0, 1, 6}, {0, 2, 6}, {0, 3, 6}, {0, 4, 6} }, 4,
+          { {0, 0, 6} }, 1, 1 },
+        { "drag down", 26, 14,
+          { {1, 1, 3}, {1, 2, 3}, {1, 3, 3} }, 3,
+          { {1, 0, 3}, {0, 1, 1} }, 2, 3 },
+        /* A window dragged right and up, over its own old position. */
+        { "drag", 38, -24,
+          { {1, 1, 3}, {1, 2, 3}, {1, 3, 3} }, 3,
+          { {4, 1, 1}, {1, 4, 1} }, 2, 3 },
+        /* Same-row shift right: the right run reads the left run's
+         * destination, so it must be copied first. */
+        { "shift right", 130, 0,
+          { {3, 1, 1}, {4, 1, 2}, {3, 2, 3} }, 3,
+          { {2, 1, 1} }, 1, 2 },
+        /* Same-row shift left across a gap. */
+        { "shift left", -70, 0,
+          { {0, 0, 2}, {3, 0, 1}, {0, 2, 4} }, 3,
+          { {0, 3, 1} }, 1, 3 },
+    };
+
+    uint8_t *previous = malloc(CR_FRAME_BYTES);
+    uint8_t *next = malloc(CR_FRAME_BYTES);
+    uint8_t *shadow = malloc(CR_FRAME_BYTES);
+    uint8_t *expected = malloc(CR_FRAME_BYTES);
+    uint8_t *raw = malloc(CR_FRAME_BYTES);
+    uint8_t *payload = malloc(CR_PAYLOAD_CAPACITY);
+    static struct tb_nv12_copy_run copies[TB_NV12_TILE_RUN_MAX_RUNS];
+    static struct tb_nv12_tile_run fresh[TB_NV12_TILE_RUN_MAX_RUNS];
+
+    for (size_t s = 0; s < sizeof(scenarios) / sizeof(scenarios[0]); s++) {
+        const struct cr_scenario *scenario = &scenarios[s];
+        cr_fill_noise(previous, CR_FRAME_BYTES, (uint32_t)s + 1u);
+        cr_fill_noise(next, CR_FRAME_BYTES, (uint32_t)s + 101u);
+        memcpy(shadow, previous, CR_FRAME_BYTES);
+        cr_reference(expected, previous, next, scenario->dx, scenario->dy,
+                     scenario->copies, scenario->copy_count,
+                     scenario->fresh, scenario->fresh_count);
+
+        const size_t length = cr_build_payload(
+            payload, scenario->dx, scenario->dy,
+            scenario->copies, scenario->copy_count,
+            scenario->fresh, scenario->fresh_count, next
+        );
+        struct tb_nv12_copy_rect_frame frame;
+        const int parsed = tb_nv12_copy_rect_parse(
+            payload, length, &frame,
+            copies, TB_NV12_TILE_RUN_MAX_RUNS,
+            fresh, TB_NV12_TILE_RUN_MAX_RUNS
+        );
+        CHECK(parsed == 0, scenario->name);
+        if (parsed != 0) continue;
+        CHECK(frame.dx == scenario->dx && frame.dy == scenario->dy,
+              "copy-rect vector parsed with sign");
+        CHECK(frame.copy_count == scenario->copy_count &&
+                  frame.fresh_count == scenario->fresh_count,
+              "copy-rect run counts parsed");
+        CHECK(compression_decode_buffer(
+                  raw, frame.raw_length, frame.compressed,
+                  frame.compressed_length, NULL, COMPRESSION_LZ4) ==
+                  frame.raw_length,
+              "copy-rect fresh data decodes");
+
+        tb_nv12_copy_rect_apply_copies(
+            &frame, copies, shadow, CR_W, shadow + CR_Y_BYTES, CR_W
+        );
+        tb_nv12_tile_runs_write(
+            fresh, frame.fresh_count, raw,
+            shadow, CR_W, shadow + CR_Y_BYTES, CR_W
+        );
+        CHECK(memcmp(shadow, expected, CR_Y_BYTES) == 0, scenario->name);
+        CHECK(memcmp(shadow + CR_Y_BYTES, expected + CR_Y_BYTES,
+                     CR_FRAME_BYTES - CR_Y_BYTES) == 0,
+              scenario->name);
+
+        struct tb_nv12_rect rects[TB_NV12_COPY_RECT_MAX_TILES_PER_SIDE];
+        const size_t rect_count = tb_nv12_copy_rect_dirty_rects(
+            &frame, copies, fresh, rects,
+            sizeof(rects) / sizeof(rects[0])
+        );
+        CHECK(rect_count == scenario->expected_rects,
+              "copy-rect upload spans merge per tile row");
+        CHECK(cr_rects_cover(rects, rect_count,
+                             scenario->copies, scenario->copy_count) &&
+                  cr_rects_cover(rects, rect_count,
+                                 scenario->fresh, scenario->fresh_count),
+              "copy-rect upload spans cover every touched tile");
+    }
+
+    /* A copy-only frame carries no LZ4 stream. */
+    const struct cr_run only[] = { {0, 0, 6} };
+    const size_t length = cr_build_payload(payload, 0, -64, only, 1, NULL, 0, next);
+    struct tb_nv12_copy_rect_frame frame;
+    CHECK(length == TB_NV12_COPY_RECT_HEADER_BYTES +
+                        TB_NV12_COPY_RECT_COPY_DESCRIPTOR_BYTES,
+          "copy-only payload is header plus descriptors");
+    CHECK(tb_nv12_copy_rect_parse(
+              payload, length, &frame,
+              copies, TB_NV12_TILE_RUN_MAX_RUNS,
+              fresh, TB_NV12_TILE_RUN_MAX_RUNS) == 0 &&
+              frame.compressed == NULL && frame.raw_length == 0,
+          "copy-only payload accepted without fresh data");
+
+    free(previous);
+    free(next);
+    free(shadow);
+    free(expected);
+    free(raw);
+    free(payload);
+}
+
+static int cr_parse(const uint8_t *payload, size_t length) {
+    static struct tb_nv12_copy_run copies[TB_NV12_TILE_RUN_MAX_RUNS];
+    static struct tb_nv12_tile_run fresh[TB_NV12_TILE_RUN_MAX_RUNS];
+    struct tb_nv12_copy_rect_frame frame;
+    return tb_nv12_copy_rect_parse(
+        payload, length, &frame,
+        copies, TB_NV12_TILE_RUN_MAX_RUNS,
+        fresh, TB_NV12_TILE_RUN_MAX_RUNS
+    );
+}
+
+static void test_nv12_copy_rect_validation(void) {
+    uint8_t *next = malloc(CR_FRAME_BYTES);
+    uint8_t *payload = malloc(CR_PAYLOAD_CAPACITY);
+    cr_fill_noise(next, CR_FRAME_BYTES, 7u);
+    const struct cr_run copies[] = { {0, 0, 6}, {0, 1, 6} };
+    const struct cr_run fresh[] = { {0, 2, 6} };
+    const size_t length = cr_build_payload(payload, 0, -64, copies, 2, fresh, 1, next);
+    CHECK(cr_parse(payload, length) == 0, "valid copy-rect payload accepted");
+
+    const size_t dx_offset = 32;
+    const size_t dy_offset = 34;
+    const size_t copy0 = TB_NV12_COPY_RECT_HEADER_BYTES;
+    const size_t copy1 = copy0 + TB_NV12_COPY_RECT_COPY_DESCRIPTOR_BYTES;
+    const size_t fresh0 = copy1 + TB_NV12_COPY_RECT_COPY_DESCRIPTOR_BYTES;
+
+    put_be16(payload + dy_offset, (uint16_t)(int16_t)-63);
+    CHECK(cr_parse(payload, length) == -1, "odd copy vector rejected");
+    put_be16(payload + dy_offset, 0);
+    CHECK(cr_parse(payload, length) == -1, "zero copy vector rejected");
+    put_be16(payload + dy_offset, (uint16_t)(int16_t)64);
+    CHECK(cr_parse(payload, length) == -1,
+          "copy source above the frame rejected");
+    put_be16(payload + dy_offset, (uint16_t)(int16_t)-64);
+    put_be16(payload + dx_offset, 2);
+    CHECK(cr_parse(payload, length) == -1,
+          "copy source left of the frame rejected");
+    put_be16(payload + dx_offset, 0);
+
+    put_be16(payload + copy0 + 6, 1);
+    CHECK(cr_parse(payload, length) == -1,
+          "nonzero copy descriptor reserved field rejected");
+    put_be16(payload + copy0 + 6, 0);
+
+    put_be16(payload + copy1 + 2, 0);
+    CHECK(cr_parse(payload, length) == -1, "overlapping copy runs rejected");
+    put_be16(payload + copy1 + 2, 1);
+
+    put_be16(payload + copy0 + 2, 2);
+    put_be16(payload + copy1 + 2, 1);
+    CHECK(cr_parse(payload, length) == -1, "out-of-order copy runs rejected");
+    put_be16(payload + copy0 + 2, 0);
+
+    put_be16(payload + fresh0 + 2, 1);
+    CHECK(cr_parse(payload, length) == -1,
+          "fresh run overlapping a copy run rejected");
+    put_be16(payload + fresh0 + 2, 2);
+
+    put_be16(payload + copy1 + 4, 7);
+    CHECK(cr_parse(payload, length) == -1, "copy run past the frame rejected");
+    put_be16(payload + copy1 + 4, 6);
+
+    put_be32(payload + 36, 0);
+    CHECK(cr_parse(payload, length) == -1, "frame without copies rejected");
+    put_be32(payload + 36, 2);
+
+    put_be32(payload + 12, 0);
+    CHECK(cr_parse(payload, length) == -1,
+          "fresh count disagreeing with raw length rejected");
+    put_be32(payload + 12, 1);
+
+    payload[length - 2] = 0;
+    CHECK(cr_parse(payload, length) == -1,
+          "copy-rect stream without LZ4 EOS rejected");
+    payload[length - 2] = 0x34;
+
+    CHECK(cr_parse(payload, length - 1) == -1, "truncated copy-rect rejected");
+    CHECK(cr_parse(payload, TB_NV12_COPY_RECT_HEADER_BYTES - 1) == -1,
+          "short copy-rect header rejected");
+    CHECK(cr_parse(payload, length) == 0, "restored payload accepted again");
+
+    free(next);
+    free(payload);
+}
+
 static void test_window_close_quit_policy(void) {
     CHECK(tb_window_should_honor_quit(1000, 0) == 1,
           "ordinary SDL quit remains available");
@@ -1374,6 +1757,8 @@ int main(void) {
     test_bc7_delta_validation();
     test_bc7_cursor_policy();
     test_nv12_tile_run_validation();
+    test_nv12_copy_rect_apply();
+    test_nv12_copy_rect_validation();
     test_window_close_quit_policy();
     test_receiver_idle_policy();
     test_receiver_diagnostics_policy();

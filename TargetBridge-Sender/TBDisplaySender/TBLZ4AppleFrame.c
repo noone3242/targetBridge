@@ -22,17 +22,32 @@ size_t TBLZ4AppleFrameStateSize(void) {
     return (size_t)LZ4_sizeofState();
 }
 
-size_t TBLZ4AppleFrameBound(size_t srcLength, size_t blockSize) {
+size_t TBLZ4AppleBlocksBound(size_t srcLength, size_t blockSize) {
     if (blockSize == 0) {
         return 0;
     }
     size_t blocks = (srcLength + blockSize - 1) / blockSize;
-    return srcLength + blocks * TBLZ4CompressedHeaderBytes + TBLZ4EndMarkerBytes;
+    return srcLength + blocks * TBLZ4CompressedHeaderBytes;
 }
 
-size_t TBLZ4EncodeAppleFrame(uint8_t *dst, size_t dstCapacity,
-                             const uint8_t *src, size_t srcLength,
-                             void *state, int acceleration, size_t blockSize) {
+size_t TBLZ4AppleFrameBound(size_t srcLength, size_t blockSize) {
+    if (blockSize == 0) {
+        return 0;
+    }
+    return TBLZ4AppleBlocksBound(srcLength, blockSize) + TBLZ4EndMarkerBytes;
+}
+
+size_t TBLZ4WriteAppleFrameEnd(uint8_t *dst, size_t dstCapacity) {
+    if (!dst || dstCapacity < TBLZ4EndMarkerBytes) {
+        return 0;
+    }
+    memcpy(dst, "bv4$", 4);
+    return TBLZ4EndMarkerBytes;
+}
+
+size_t TBLZ4EncodeAppleBlocks(uint8_t *dst, size_t dstCapacity,
+                              const uint8_t *src, size_t srcLength,
+                              void *state, int acceleration, size_t blockSize) {
     if (!dst || !src || !state || srcLength == 0 || blockSize == 0 ||
         blockSize > (size_t)LZ4_MAX_INPUT_SIZE) {
         return 0;
@@ -74,9 +89,17 @@ size_t TBLZ4EncodeAppleFrame(uint8_t *dst, size_t dstCapacity,
             out += TBLZ4RawHeaderBytes + length;
         }
     }
-    if (dstCapacity - out < TBLZ4EndMarkerBytes) {
+    return out;
+}
+
+size_t TBLZ4EncodeAppleFrame(uint8_t *dst, size_t dstCapacity,
+                             const uint8_t *src, size_t srcLength,
+                             void *state, int acceleration, size_t blockSize) {
+    size_t out = TBLZ4EncodeAppleBlocks(dst, dstCapacity, src, srcLength,
+                                        state, acceleration, blockSize);
+    if (out == 0) {
         return 0;
     }
-    memcpy(dst + out, "bv4$", 4);
-    return out + TBLZ4EndMarkerBytes;
+    size_t end = TBLZ4WriteAppleFrameEnd(dst + out, dstCapacity - out);
+    return end == 0 ? 0 : out + end;
 }

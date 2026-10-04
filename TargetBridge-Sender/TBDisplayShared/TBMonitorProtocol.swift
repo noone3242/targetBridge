@@ -116,6 +116,8 @@ struct TBMonitorReceiverMetrics: Codable, Equatable {
     var rawRegionFrames: UInt64?
     var rawTileRunFrames: UInt64?
     var rawTileRuns: UInt64?
+    var rawCopyRectFrames: UInt64? = nil
+    var rawCopiedTiles: UInt64? = nil
     var rawShadowCommitP50Ms: Double?
     var rawShadowCommitP95Ms: Double?
     var rawShadowCommitP99Ms: Double?

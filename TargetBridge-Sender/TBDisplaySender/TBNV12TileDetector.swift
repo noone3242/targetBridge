@@ -4,9 +4,63 @@ import Metal
 final class TBNV12TileDetector {
     static let tileSize = 64
 
+    /// A shift that reproduces `tiles` of the current frame from the committed
+    /// baseline: current(x, y) == baseline(x - dx, y - dy) for every Y and UV
+    /// sample of each tile, with the whole source rectangle inside the frame.
+    struct CopyRect: Equatable {
+        let dx: Int
+        let dy: Int
+        let tiles: Set<Int>
+    }
+
+    /// Copy-rect search tuning. Offsets are even so UV shifts exactly.
+    enum CopyRectSearch {
+        static let maxAnchors = 64
+        static let matchesPerAnchor = 8
+        static let minimumVotes = 2
+        /// Drags: any offset within this box.
+        static let dragRadius = 192
+        /// Scrolls: purely vertical / horizontal offsets up to these.
+        static let verticalScrollRange = 1440
+        static let horizontalScrollRange = 1024
+        /// Sample-to-sample luma changes an anchor needs among its 64 samples
+        /// so flat tiles, which match almost any offset, are skipped.
+        static let minimumAnchorTransitions: UInt32 = 8
+
+        static func offsets() -> [SIMD2<Int32>] {
+            var offsets: [SIMD2<Int32>] = []
+            for dy in stride(from: -dragRadius, through: dragRadius, by: 2) {
+                for dx in stride(from: -dragRadius, through: dragRadius, by: 2)
+                where dx != 0 || dy != 0 {
+                    offsets.append(SIMD2(Int32(dx), Int32(dy)))
+                }
+            }
+            for dy in stride(from: dragRadius + 2, through: verticalScrollRange, by: 2) {
+                offsets.append(SIMD2(0, Int32(dy)))
+                offsets.append(SIMD2(0, Int32(-dy)))
+            }
+            for dx in stride(from: dragRadius + 2, through: horizontalScrollRange, by: 2) {
+                offsets.append(SIMD2(Int32(dx), 0))
+                offsets.append(SIMD2(Int32(-dx), 0))
+            }
+            return offsets
+        }
+    }
+
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
+    private let anchorPipeline: MTLComputePipelineState
+    private let searchPipeline: MTLComputePipelineState
+    private let verifyPipeline: MTLComputePipelineState
+    private let offsetCount: Int
+    private let offsetBuffer: MTLBuffer
+    private let anchorBuffer: MTLBuffer
+    private let anchorValidBuffer: MTLBuffer
+    private let matchCountBuffer: MTLBuffer
+    private let matchBuffer: MTLBuffer
+    private var verifyTileBuffer: MTLBuffer?
+    private var verifyFlagBuffer: MTLBuffer?
     private var textureCache: CVMetalTextureCache?
     private var committedY: MTLTexture?
     private var committedUV: MTLTexture?
@@ -79,6 +133,142 @@ final class TBNV12TileDetector {
                 atomic_load_explicit(&changed, memory_order_relaxed);
         }
     }
+
+    // 64 luma samples spread over a 64x64 tile on a staggered 8x8 grid, so
+    // both horizontal and vertical structure is caught.
+    static inline uint2 anchor_sample(uint index) {
+        uint i = index & 7u;
+        uint j = index >> 3u;
+        return uint2(i * 8u + ((j * 3u) & 7u), j * 8u + ((i * 5u) & 7u));
+    }
+
+    kernel void nv12_anchor_texture(
+        texture2d<float, access::read> current_y [[texture(0)]],
+        device const uint2 *anchors [[buffer(0)]],
+        device uint *anchor_valid [[buffer(1)]],
+        constant uint4 &params [[buffer(2)]],
+        uint anchor [[thread_position_in_grid]]
+    ) {
+        // params: offset count, anchor count, min transitions, unused.
+        if (anchor >= params.y) {
+            return;
+        }
+        uint2 origin = anchors[anchor];
+        float previous = current_y.read(origin + anchor_sample(0u)).r;
+        uint transitions = 0u;
+        for (uint index = 1u; index < 64u; index++) {
+            float value = current_y.read(origin + anchor_sample(index)).r;
+            transitions += value != previous ? 1u : 0u;
+            previous = value;
+        }
+        anchor_valid[anchor] = transitions >= params.z ? 1u : 0u;
+    }
+
+    kernel void nv12_shift_search(
+        texture2d<float, access::read> current_y [[texture(0)]],
+        texture2d<float, access::read> baseline_y [[texture(1)]],
+        device const uint2 *anchors [[buffer(0)]],
+        device const uint *anchor_valid [[buffer(1)]],
+        device const int2 *offsets [[buffer(2)]],
+        device atomic_uint *match_counts [[buffer(3)]],
+        device uint *matches [[buffer(4)]],
+        constant uint4 &params [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        constexpr uint matches_per_anchor = 8u;
+        if (gid.x >= params.x || gid.y >= params.y ||
+            anchor_valid[gid.y] == 0u) {
+            return;
+        }
+        int2 origin = int2(anchors[gid.y]);
+        int2 source = origin - offsets[gid.x];
+        int2 size = int2(current_y.get_width(), current_y.get_height());
+        if (source.x < 0 || source.y < 0 ||
+            source.x + 64 > size.x || source.y + 64 > size.y) {
+            return;
+        }
+        for (uint index = 0u; index < 64u; index++) {
+            int2 sample = int2(anchor_sample(index));
+            if (current_y.read(uint2(origin + sample)).r !=
+                baseline_y.read(uint2(source + sample)).r) {
+                return;
+            }
+        }
+        uint slot = atomic_fetch_add_explicit(
+            &match_counts[gid.y], 1u, memory_order_relaxed
+        );
+        if (slot < matches_per_anchor) {
+            matches[gid.y * matches_per_anchor + slot] = gid.x;
+        }
+    }
+
+    // One threadgroup per listed tile: does the whole tile equal the
+    // baseline shifted by `shift` (luma pixels, even)?
+    kernel void nv12_tile_shift_compare(
+        texture2d<float, access::read> current_y [[texture(0)]],
+        texture2d<float, access::read> current_uv [[texture(1)]],
+        texture2d<float, access::read> baseline_y [[texture(2)]],
+        texture2d<float, access::read> baseline_uv [[texture(3)]],
+        device const uint *tiles [[buffer(0)]],
+        device uint *match_flags [[buffer(1)]],
+        constant int4 &params [[buffer(2)]],
+        uint thread_index [[thread_index_in_threadgroup]],
+        uint group [[threadgroup_position_in_grid]]
+    ) {
+        constexpr int tile_size = 64;
+        // params: dx, dy, tiles wide, tile count.
+        threadgroup atomic_uint mismatch;
+        if (thread_index == 0u) {
+            atomic_store_explicit(&mismatch, 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (int(group) >= params.w) {
+            return;
+        }
+        uint tile = tiles[group];
+        int2 origin = int2(int(tile % uint(params.z)), int(tile / uint(params.z))) *
+            tile_size;
+        int2 shift = params.xy;
+        int2 source = origin - shift;
+        int2 size = int2(current_y.get_width(), current_y.get_height());
+        bool inside = source.x >= 0 && source.y >= 0 &&
+            source.x + tile_size <= size.x && source.y + tile_size <= size.y;
+        if (inside) {
+            int x = int(thread_index);
+            for (int row = 0; row < tile_size; row++) {
+                if ((row & 7) == 0 &&
+                    atomic_load_explicit(&mismatch, memory_order_relaxed) != 0u) {
+                    break;
+                }
+                if (current_y.read(uint2(origin.x + x, origin.y + row)).r !=
+                    baseline_y.read(uint2(source.x + x, source.y + row)).r) {
+                    atomic_store_explicit(&mismatch, 1u, memory_order_relaxed);
+                    break;
+                }
+            }
+            // 32x32 UV samples: each thread covers half a row.
+            int2 uv_origin = origin / 2;
+            int2 uv_source = source / 2;
+            int uv_x = x & 31;
+            for (int row = x >> 5; row < tile_size / 2; row += 2) {
+                if ((row & 7) < 2 &&
+                    atomic_load_explicit(&mismatch, memory_order_relaxed) != 0u) {
+                    break;
+                }
+                if (any(current_uv.read(uint2(uv_origin.x + uv_x, uv_origin.y + row)).rg !=
+                        baseline_uv.read(uint2(uv_source.x + uv_x, uv_source.y + row)).rg)) {
+                    atomic_store_explicit(&mismatch, 1u, memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index == 0u) {
+            match_flags[group] = inside &&
+                atomic_load_explicit(&mismatch, memory_order_relaxed) == 0u
+                ? 1u : 0u;
+        }
+    }
     """
 
     init?() {
@@ -89,11 +279,29 @@ final class TBNV12TileDetector {
         }
         do {
             let library = try device.makeLibrary(source: Self.source, options: nil)
-            guard let function = library.makeFunction(name: "nv12_tile_compare")
+            guard let function = library.makeFunction(name: "nv12_tile_compare"),
+                  let anchorFunction = library.makeFunction(
+                      name: "nv12_anchor_texture"
+                  ),
+                  let searchFunction = library.makeFunction(
+                      name: "nv12_shift_search"
+                  ),
+                  let verifyFunction = library.makeFunction(
+                      name: "nv12_tile_shift_compare"
+                  )
             else {
                 return nil
             }
             pipeline = try device.makeComputePipelineState(function: function)
+            anchorPipeline = try device.makeComputePipelineState(
+                function: anchorFunction
+            )
+            searchPipeline = try device.makeComputePipelineState(
+                function: searchFunction
+            )
+            verifyPipeline = try device.makeComputePipelineState(
+                function: verifyFunction
+            )
         } catch {
             NSLog(
                 "TargetBridge: unable to compile NV12 tile detector: %@",
@@ -101,6 +309,39 @@ final class TBNV12TileDetector {
             )
             return nil
         }
+        let offsets = CopyRectSearch.offsets()
+        let maxAnchors = CopyRectSearch.maxAnchors
+        guard let offsetBuffer = device.makeBuffer(
+                  bytes: offsets,
+                  length: offsets.count * MemoryLayout<SIMD2<Int32>>.stride,
+                  options: .storageModeShared
+              ),
+              let anchorBuffer = device.makeBuffer(
+                  length: maxAnchors * MemoryLayout<SIMD2<UInt32>>.stride,
+                  options: .storageModeShared
+              ),
+              let anchorValidBuffer = device.makeBuffer(
+                  length: maxAnchors * MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared
+              ),
+              let matchCountBuffer = device.makeBuffer(
+                  length: maxAnchors * MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared
+              ),
+              let matchBuffer = device.makeBuffer(
+                  length: maxAnchors * CopyRectSearch.matchesPerAnchor *
+                      MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared
+              )
+        else {
+            return nil
+        }
+        offsetCount = offsets.count
+        self.offsetBuffer = offsetBuffer
+        self.anchorBuffer = anchorBuffer
+        self.anchorValidBuffer = anchorValidBuffer
+        self.matchCountBuffer = matchCountBuffer
+        self.matchBuffer = matchBuffer
         self.device = device
         self.commandQueue = commandQueue
         var cache: CVMetalTextureCache?
@@ -247,6 +488,187 @@ final class TBNV12TileDetector {
         return Set((0..<tileCount).filter { flags[$0] != 0 })
     }
 
+    /// Looks for one shift that reproduces many of `dirtyTiles` from the
+    /// committed baseline. Call right after `analyze` returned `dirtyTiles`
+    /// against a baseline, before committing or discarding the candidate.
+    /// `preferred` breaks ties, so a steady drag keeps its vector.
+    func findCopyRect(
+        dirtyTiles: Set<Int>,
+        preferred: SIMD2<Int>? = nil,
+        minimumTiles: Int = 16
+    ) -> CopyRect? {
+        guard let shift = searchShift(
+            dirtyTiles: dirtyTiles, preferred: preferred
+        ),
+        let tiles = verifyShift(
+            dx: shift.x, dy: shift.y, tiles: dirtyTiles
+        ),
+        tiles.count >= minimumTiles
+        else {
+            return nil
+        }
+        return CopyRect(dx: shift.x, dy: shift.y, tiles: tiles)
+    }
+
+    /// Votes over sparse matches of up to `maxAnchors` textured dirty tiles
+    /// against every candidate offset. Only a hint: `verifyShift` decides.
+    func searchShift(
+        dirtyTiles: Set<Int>,
+        preferred: SIMD2<Int>? = nil
+    ) -> SIMD2<Int>? {
+        guard hasStagedCandidate, hasBaseline,
+              let candidateY, let committedY,
+              !dirtyTiles.isEmpty,
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            return nil
+        }
+        let tilesWide = width / Self.tileSize
+        let sorted = dirtyTiles.sorted()
+        let anchorCount = min(CopyRectSearch.maxAnchors, sorted.count)
+        let anchors = anchorBuffer.contents()
+            .assumingMemoryBound(to: SIMD2<UInt32>.self)
+        for index in 0..<anchorCount {
+            // Evenly spaced over the dirty set, centred in each stride.
+            let tile = sorted[
+                (2 * index + 1) * sorted.count / (2 * anchorCount)
+            ]
+            anchors[index] = SIMD2(
+                UInt32(tile % tilesWide * Self.tileSize),
+                UInt32(tile / tilesWide * Self.tileSize)
+            )
+        }
+        memset(matchCountBuffer.contents(), 0, matchCountBuffer.length)
+        var params = SIMD4<UInt32>(
+            UInt32(offsetCount),
+            UInt32(anchorCount),
+            CopyRectSearch.minimumAnchorTransitions,
+            0
+        )
+        encoder.setComputePipelineState(anchorPipeline)
+        encoder.setTexture(candidateY, index: 0)
+        encoder.setBuffer(anchorBuffer, offset: 0, index: 0)
+        encoder.setBuffer(anchorValidBuffer, offset: 0, index: 1)
+        encoder.setBytes(
+            &params, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 2
+        )
+        encoder.dispatchThreads(
+            MTLSize(width: anchorCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(anchorCount, 64), height: 1, depth: 1
+            )
+        )
+        encoder.setComputePipelineState(searchPipeline)
+        encoder.setTexture(candidateY, index: 0)
+        encoder.setTexture(committedY, index: 1)
+        encoder.setBuffer(anchorBuffer, offset: 0, index: 0)
+        encoder.setBuffer(anchorValidBuffer, offset: 0, index: 1)
+        encoder.setBuffer(offsetBuffer, offset: 0, index: 2)
+        encoder.setBuffer(matchCountBuffer, offset: 0, index: 3)
+        encoder.setBuffer(matchBuffer, offset: 0, index: 4)
+        encoder.setBytes(
+            &params, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 5
+        )
+        encoder.dispatchThreads(
+            MTLSize(width: offsetCount, height: anchorCount, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else { return nil }
+
+        let counts = matchCountBuffer.contents()
+            .assumingMemoryBound(to: UInt32.self)
+        let matches = matchBuffer.contents()
+            .assumingMemoryBound(to: UInt32.self)
+        let offsets = offsetBuffer.contents()
+            .assumingMemoryBound(to: SIMD2<Int32>.self)
+        let perAnchor = CopyRectSearch.matchesPerAnchor
+        var votes: [Int: Int] = [:]
+        for anchor in 0..<anchorCount {
+            let count = Int(counts[anchor])
+            // Repetitive content matches too many offsets to be evidence.
+            guard count > 0, count <= perAnchor else { continue }
+            for slot in 0..<count {
+                votes[Int(matches[anchor * perAnchor + slot]), default: 0] += 1
+            }
+        }
+        func vector(_ index: Int) -> SIMD2<Int> {
+            SIMD2(Int(offsets[index].x), Int(offsets[index].y))
+        }
+        let best = votes.max { lhs, rhs in
+            if lhs.value != rhs.value { return lhs.value < rhs.value }
+            let lhsVector = vector(lhs.key)
+            let rhsVector = vector(rhs.key)
+            if let preferred, (lhsVector == preferred) != (rhsVector == preferred) {
+                return rhsVector == preferred
+            }
+            let lhsLength = abs(lhsVector.x) + abs(lhsVector.y)
+            let rhsLength = abs(rhsVector.x) + abs(rhsVector.y)
+            if lhsLength != rhsLength { return lhsLength > rhsLength }
+            return lhs.key > rhs.key
+        }
+        guard let best, best.value >= CopyRectSearch.minimumVotes else {
+            return nil
+        }
+        return vector(best.key)
+    }
+
+    /// Exactly compares each of `tiles` with the committed baseline shifted
+    /// by (`dx`, `dy`). Returns the tiles that match, or nil on GPU failure.
+    func verifyShift(dx: Int, dy: Int, tiles: Set<Int>) -> Set<Int>? {
+        guard hasStagedCandidate, hasBaseline,
+              dx % 2 == 0, dy % 2 == 0,
+              let candidateY, let candidateUV,
+              let committedY, let committedUV,
+              let verifyTileBuffer, let verifyFlagBuffer,
+              !tiles.isEmpty, tiles.count <= tileCount,
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder()
+        else {
+            return nil
+        }
+        let list = verifyTileBuffer.contents()
+            .assumingMemoryBound(to: UInt32.self)
+        var count = 0
+        for tile in tiles {
+            guard tile >= 0, tile < tileCount else { return nil }
+            list[count] = UInt32(tile)
+            count += 1
+        }
+        var params = SIMD4<Int32>(
+            Int32(dx), Int32(dy),
+            Int32(width / Self.tileSize), Int32(count)
+        )
+        encoder.setComputePipelineState(verifyPipeline)
+        encoder.setTexture(candidateY, index: 0)
+        encoder.setTexture(candidateUV, index: 1)
+        encoder.setTexture(committedY, index: 2)
+        encoder.setTexture(committedUV, index: 3)
+        encoder.setBuffer(verifyTileBuffer, offset: 0, index: 0)
+        encoder.setBuffer(verifyFlagBuffer, offset: 0, index: 1)
+        encoder.setBytes(
+            &params, length: MemoryLayout<SIMD4<Int32>>.stride, index: 2
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else { return nil }
+        let flags = verifyFlagBuffer.contents()
+            .assumingMemoryBound(to: UInt32.self)
+        var matched = Set<Int>()
+        for index in 0..<count where flags[index] != 0 {
+            matched.insert(Int(list[index]))
+        }
+        return matched
+    }
+
     func commitCandidate() {
         guard hasStagedCandidate else { return }
         swap(&committedY, &candidateY)
@@ -304,10 +726,20 @@ final class TBNV12TileDetector {
               let dirtyBuffer = device.makeBuffer(
                   length: count * MemoryLayout<UInt32>.stride,
                   options: .storageModeShared
+              ),
+              let verifyTileBuffer = device.makeBuffer(
+                  length: count * MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared
+              ),
+              let verifyFlagBuffer = device.makeBuffer(
+                  length: count * MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared
               )
         else {
             return false
         }
+        self.verifyTileBuffer = verifyTileBuffer
+        self.verifyFlagBuffer = verifyFlagBuffer
         self.committedY = committedY
         self.committedUV = committedUV
         self.candidateY = candidateY
@@ -320,5 +752,56 @@ final class TBNV12TileDetector {
         hasStagedCandidate = false
         memset(dirtyBuffer.contents(), 0, dirtyBuffer.length)
         return true
+    }
+}
+
+/// Skips copy-rect searches while busy content keeps missing (video,
+/// animation, full redraws), so mostly scrolls and drags pay for the GPU
+/// search. Skips count only frames large enough to search; a quiet frame,
+/// or a pause in such frames (capture sends nothing while the screen is
+/// idle), ends the busy stretch, so a scroll that follows searches at once.
+struct TBNV12CopyRectBackoff {
+    static let missesBeforeSkipping = 2
+    static let initialSkip = 4
+    static let maxSkip = 8
+    static let idleResetNanoseconds: UInt64 = 100_000_000
+
+    private(set) var consecutiveMisses = 0
+    private var skipLength = 0
+    private var remainingSkips = 0
+    private var lastFrameAt: UInt64?
+
+    /// Whether a frame large enough to search should run the search; a
+    /// skipped frame counts down the current backoff.
+    mutating func shouldSearch(at nanoseconds: UInt64) -> Bool {
+        if let lastFrameAt,
+           nanoseconds &- lastFrameAt > Self.idleResetNanoseconds {
+            reset()
+        }
+        lastFrameAt = nanoseconds
+        guard remainingSkips == 0 else {
+            remainingSkips -= 1
+            return false
+        }
+        return true
+    }
+
+    /// After `missesBeforeSkipping` misses in a row, skips the next
+    /// `initialSkip` frames, doubling up to `maxSkip` while probes keep
+    /// missing.
+    mutating func recordMiss() {
+        consecutiveMisses += 1
+        guard consecutiveMisses >= Self.missesBeforeSkipping else { return }
+        skipLength = skipLength == 0
+            ? Self.initialSkip
+            : min(skipLength * 2, Self.maxSkip)
+        remainingSkips = skipLength
+    }
+
+    /// A hit or a quiet frame.
+    mutating func reset() {
+        consecutiveMisses = 0
+        skipLength = 0
+        remainingSkips = 0
     }
 }

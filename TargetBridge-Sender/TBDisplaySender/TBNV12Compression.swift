@@ -37,6 +37,13 @@ enum TBNV12Compression {
         }
     }
 
+    /// A horizontal run of tiles in a format 5 copy-rect packet.
+    struct CopyRun: Equatable {
+        let tileX: Int
+        let tileY: Int
+        let tileCountX: Int
+    }
+
     struct Decoded {
         let y: Data
         let uv: Data
@@ -63,6 +70,73 @@ enum TBNV12Compression {
         let width: Int
         let height: Int
         let runs: [TileRun]
+    }
+
+    /// Uses `parallelEncoder` when it wraps the same encoder, so full and
+    /// region packets share the pipeline's preallocated parallel state.
+    private static func encode(
+        encoder: TBNV12LZ4Encoder,
+        parallelEncoder: TBNV12ParallelLZ4Encoder?,
+        destination: UnsafeMutablePointer<UInt8>,
+        capacity: Int,
+        source: UnsafePointer<UInt8>,
+        length: Int
+    ) -> Int {
+        if let parallelEncoder, parallelEncoder.encoder == encoder {
+            return parallelEncoder.encode(
+                destination: destination,
+                capacity: capacity,
+                source: source,
+                length: length
+            )
+        }
+        return encoder.encode(
+            destination: destination,
+            capacity: capacity,
+            source: source,
+            length: length,
+            scratch: nil
+        )
+    }
+
+    struct DecodedCopyRect {
+        let width: Int
+        let height: Int
+        let dx: Int
+        let dy: Int
+        let copyRuns: [CopyRun]
+        let freshRuns: [TileRun]
+        /// Fresh tile data, laid out as in a format 4 packet.
+        let raw: Data
+    }
+
+    /// Horizontal runs of `tiles`, in row-major order.
+    static func tileRuns(
+        tiles: Set<Int>,
+        tilesWide: Int,
+        tilesHigh: Int
+    ) -> [CopyRun] {
+        var runs: [CopyRun] = []
+        for tileY in 0..<tilesHigh {
+            var tileX = 0
+            while tileX < tilesWide {
+                guard tiles.contains(tileY * tilesWide + tileX) else {
+                    tileX += 1
+                    continue
+                }
+                let startX = tileX
+                while tileX < tilesWide,
+                      tiles.contains(tileY * tilesWide + tileX) {
+                    tileX += 1
+                }
+                runs.append(
+                    CopyRun(
+                        tileX: startX, tileY: tileY, tileCountX: tileX - startX
+                    )
+                )
+            }
+        }
+        return runs
     }
 
     static func tileRunCount(
@@ -108,7 +182,8 @@ enum TBNV12Compression {
         yStride: Int,
         uvStride: Int,
         checksumPolicy: TBNV12ChecksumPolicy = .disabled,
-        encoder: TBNV12LZ4Encoder = .apple
+        encoder: TBNV12LZ4Encoder = .apple,
+        parallelEncoder: TBNV12ParallelLZ4Encoder? = nil
     ) -> PacketResult? {
         guard width > 0, height > 0, width % 2 == 0, height % 2 == 0,
               y.count == yStride * height,
@@ -131,12 +206,13 @@ enum TBNV12Compression {
                 else {
                     return 0
                 }
-                return encoder.encode(
+                return encode(
+                    encoder: encoder,
+                    parallelEncoder: parallelEncoder,
                     destination: dst,
                     capacity: capacity,
                     source: src,
-                    length: raw.count,
-                    scratch: nil
+                    length: raw.count
                 )
             }
         }
@@ -189,7 +265,8 @@ enum TBNV12Compression {
         regionWidth: Int,
         regionHeight: Int,
         checksumPolicy: TBNV12ChecksumPolicy = .disabled,
-        encoder: TBNV12LZ4Encoder = .apple
+        encoder: TBNV12LZ4Encoder = .apple,
+        parallelEncoder: TBNV12ParallelLZ4Encoder? = nil
     ) -> PacketResult? {
         guard x >= 0, y >= 0, regionWidth > 0, regionHeight > 0,
               x % 2 == 0, y % 2 == 0, regionWidth % 2 == 0,
@@ -227,12 +304,13 @@ enum TBNV12Compression {
                 else {
                     return 0
                 }
-                return encoder.encode(
+                return encode(
+                    encoder: encoder,
+                    parallelEncoder: parallelEncoder,
                     destination: dst,
                     capacity: capacity,
                     source: src,
-                    length: raw.count,
-                    scratch: nil
+                    length: raw.count
                 )
             }
         }
@@ -283,7 +361,8 @@ enum TBNV12Compression {
         uvStride: Int,
         dirtyTiles: Set<Int>,
         checksumPolicy: TBNV12ChecksumPolicy = .disabled,
-        encoder: TBNV12LZ4Encoder = .apple
+        encoder: TBNV12LZ4Encoder = .apple,
+        parallelEncoder: TBNV12ParallelLZ4Encoder? = nil
     ) -> PacketResult? {
         guard width > 0, height > 0,
               width % tileSize == 0, height % tileSize == 0,
@@ -366,12 +445,13 @@ enum TBNV12Compression {
                 else {
                     return 0
                 }
-                return encoder.encode(
+                return encode(
+                    encoder: encoder,
+                    parallelEncoder: parallelEncoder,
                     destination: dst,
                     capacity: capacity,
                     source: src,
-                    length: raw.count,
-                    scratch: nil
+                    length: raw.count
                 )
             }
         }
@@ -594,6 +674,164 @@ enum TBNV12Compression {
             width: width,
             height: height,
             runs: runs
+        )
+    }
+
+    /// Parses and decompresses a format 5 packet. Mirrors the Receiver's
+    /// validation; used by tests.
+    static func decodeCopyRectPacket(_ packet: Data) -> DecodedCopyRect? {
+        let headerEnd = 5 + 40
+        guard packet.count >= headerEnd,
+              packet[4] == TBMonitorPacketType.rawFrame.rawValue,
+              packet[5] == 5,
+              packet[6] == 1,
+              TBMonitorProtocol.readBE16(packet, offset: 7) == tileSize
+        else {
+            return nil
+        }
+        let width = Int(TBMonitorProtocol.readBE32(packet, offset: 9))
+        let height = Int(TBMonitorProtocol.readBE32(packet, offset: 13))
+        let freshCount = Int(TBMonitorProtocol.readBE32(packet, offset: 17))
+        let rawLength = Int(TBMonitorProtocol.readBE32(packet, offset: 21))
+        let compressedLength = Int(
+            TBMonitorProtocol.readBE32(packet, offset: 25)
+        )
+        let expectedChecksum = TBMonitorProtocol.readBE64(packet, offset: 29)
+        let dx = Int(Int16(bitPattern: TBMonitorProtocol.readBE16(packet, offset: 37)))
+        let dy = Int(Int16(bitPattern: TBMonitorProtocol.readBE16(packet, offset: 39)))
+        let copyCount = Int(TBMonitorProtocol.readBE32(packet, offset: 41))
+        guard width > 0, height > 0,
+              width % tileSize == 0, height % tileSize == 0,
+              dx % 2 == 0, dy % 2 == 0, dx != 0 || dy != 0,
+              copyCount > 0, copyCount <= maxTileRuns,
+              freshCount <= maxTileRuns,
+              (freshCount == 0) == (rawLength == 0),
+              (rawLength == 0) == (compressedLength == 0)
+        else {
+            return nil
+        }
+        let freshStart = headerEnd + copyCount * 8
+        let compressedStart = freshStart + freshCount * 16
+        guard compressedStart <= packet.count,
+              compressedLength == packet.count - compressedStart
+        else {
+            return nil
+        }
+        let tilesWide = width / tileSize
+        let tilesHigh = height / tileSize
+        var covered = Set<Int>()
+        // Each list must be in row-major order, as the Receiver requires.
+        var previousEnd = 0
+        var copyRuns: [CopyRun] = []
+        for index in 0..<copyCount {
+            let offset = headerEnd + index * 8
+            let run = CopyRun(
+                tileX: Int(TBMonitorProtocol.readBE16(packet, offset: offset)),
+                tileY: Int(TBMonitorProtocol.readBE16(packet, offset: offset + 2)),
+                tileCountX: Int(
+                    TBMonitorProtocol.readBE16(packet, offset: offset + 4)
+                )
+            )
+            let x = run.tileX * tileSize
+            let y = run.tileY * tileSize
+            guard run.tileCountX > 0,
+                  run.tileY < tilesHigh,
+                  run.tileX + run.tileCountX <= tilesWide,
+                  run.tileY * tilesWide + run.tileX >= previousEnd,
+                  TBMonitorProtocol.readBE16(packet, offset: offset + 6) == 0,
+                  x - dx >= 0, y - dy >= 0,
+                  x + run.tileCountX * tileSize - dx <= width,
+                  y + tileSize - dy <= height
+            else {
+                return nil
+            }
+            for tileX in run.tileX..<(run.tileX + run.tileCountX) {
+                guard covered.insert(run.tileY * tilesWide + tileX).inserted
+                else {
+                    return nil
+                }
+            }
+            copyRuns.append(run)
+            previousEnd = run.tileY * tilesWide + run.tileX + run.tileCountX
+        }
+        previousEnd = 0
+        var freshRuns: [TileRun] = []
+        var expectedOffset = 0
+        for index in 0..<freshCount {
+            let offset = freshStart + index * 16
+            let run = TileRun(
+                tileX: Int(TBMonitorProtocol.readBE16(packet, offset: offset)),
+                tileY: Int(TBMonitorProtocol.readBE16(packet, offset: offset + 2)),
+                tileCountX: Int(
+                    TBMonitorProtocol.readBE16(packet, offset: offset + 4)
+                ),
+                pixelHeight: Int(
+                    TBMonitorProtocol.readBE16(packet, offset: offset + 6)
+                ),
+                dataOffset: Int(
+                    TBMonitorProtocol.readBE32(packet, offset: offset + 8)
+                ),
+                dataLength: Int(
+                    TBMonitorProtocol.readBE32(packet, offset: offset + 12)
+                )
+            )
+            guard run.tileCountX > 0,
+                  run.tileY < tilesHigh,
+                  run.tileX + run.tileCountX <= tilesWide,
+                  run.tileY * tilesWide + run.tileX >= previousEnd,
+                  run.pixelHeight == tileSize,
+                  run.dataOffset == expectedOffset,
+                  run.dataLength == run.tileCountX * tileSize * tileSize * 3 / 2
+            else {
+                return nil
+            }
+            for tileX in run.tileX..<(run.tileX + run.tileCountX) {
+                guard covered.insert(run.tileY * tilesWide + tileX).inserted
+                else {
+                    return nil
+                }
+            }
+            freshRuns.append(run)
+            previousEnd = run.tileY * tilesWide + run.tileX + run.tileCountX
+            expectedOffset += run.dataLength
+        }
+        guard expectedOffset == rawLength else { return nil }
+        var raw = Data(count: rawLength)
+        if rawLength > 0 {
+            let decoded = packet.withUnsafeBytes { sourceBytes in
+                raw.withUnsafeMutableBytes { destinationBytes in
+                    guard let source = sourceBytes.baseAddress?
+                        .advanced(by: compressedStart)
+                        .assumingMemoryBound(to: UInt8.self),
+                        let destination = destinationBytes.baseAddress?
+                        .assumingMemoryBound(to: UInt8.self)
+                    else {
+                        return 0
+                    }
+                    return compression_decode_buffer(
+                        destination,
+                        rawLength,
+                        source,
+                        compressedLength,
+                        nil,
+                        COMPRESSION_LZ4
+                    )
+                }
+            }
+            guard decoded == rawLength,
+                  expectedChecksum == 0 || checksum(raw) == expectedChecksum
+            else {
+                return nil
+            }
+        }
+        return DecodedCopyRect(
+            width: width,
+            height: height,
+            dx: dx,
+            dy: dy,
+            copyRuns: copyRuns,
+            freshRuns: freshRuns,
+            raw: raw
         )
     }
 
