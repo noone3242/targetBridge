@@ -32,13 +32,9 @@ final class TBNV12ParallelLZ4Encoder: @unchecked Sendable {
     private var sideCapacity = 0
     private let results: UnsafeMutablePointer<Int>
 
-    /// `maxSourceLength` preallocates and prefaults the side buffers; larger
-    /// inputs grow them on demand.
-    init(
-        encoder: TBNV12LZ4Encoder,
-        threadCount: Int,
-        maxSourceLength: Int = 0
-    ) {
+    /// Side buffers are allocated and prefaulted on the first large encode
+    /// and grow when a larger input arrives.
+    init(encoder: TBNV12LZ4Encoder, threadCount: Int) {
         self.encoder = encoder
         if case .liblz4 = encoder {
             self.threadCount = max(1, threadCount)
@@ -55,9 +51,6 @@ final class TBNV12ParallelLZ4Encoder: @unchecked Sendable {
         }
         results = .allocate(capacity: self.threadCount)
         results.initialize(repeating: 0, count: self.threadCount)
-        if maxSourceLength > 0 {
-            reserveSideBuffers(forSourceLength: maxSourceLength)
-        }
     }
 
     deinit {
@@ -171,13 +164,6 @@ final class TBNV12ParallelLZ4Encoder: @unchecked Sendable {
             destination.advanced(by: size), capacity - size
         )
         return end == 0 ? 0 : size + end
-    }
-
-    private func reserveSideBuffers(forSourceLength length: Int) {
-        guard threadCount > 1 else { return }
-        reserveSideBuffers(
-            forChunkLength: (length + threadCount - 1) / threadCount
-        )
     }
 
     private func reserveSideBuffers(forChunkLength chunkLength: Int) {

@@ -1855,6 +1855,7 @@ struct TBPipelineDiagnosticsSnapshot {
     let nv12CopyRectFrames: Int
     let nv12CopyRectTiles: Int
     let nv12CopyRectRejects: Int
+    let nv12CopyRectWriterFailures: Int
     let nv12CopyRectSkippedSearches: Int
     let nv12CopyRectSearchTime: TBMetricSummary
     let nv12CopyRectLastVector: String
@@ -1887,7 +1888,7 @@ struct TBPipelineDiagnosticsSnapshot {
         nv12ZeroCopyPackets: 0, nv12ZeroCopyFallbacks: 0,
         nv12LZ4Encoder: "off",
         nv12CopyRectFrames: 0, nv12CopyRectTiles: 0, nv12CopyRectRejects: 0,
-        nv12CopyRectSkippedSearches: 0,
+        nv12CopyRectWriterFailures: 0, nv12CopyRectSkippedSearches: 0,
         nv12CopyRectSearchTime: .empty, nv12CopyRectLastVector: "none"
     )
 }
@@ -2001,6 +2002,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _nv12CopyRectFrames = 0
     private var _nv12CopyRectTiles = 0
     private var _nv12CopyRectRejects = 0
+    private var _nv12CopyRectWriterFailures = 0
     private var _nv12CopyRectSkippedSearches = 0
     private var _nv12CopyRectSearchTimeWindow = TBRollingMetricWindow()
     private var _nv12CopyRectLastVector: SIMD2<Int>?
@@ -2209,6 +2211,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 nv12CopyRectFrames: _nv12CopyRectFrames,
                 nv12CopyRectTiles: _nv12CopyRectTiles,
                 nv12CopyRectRejects: _nv12CopyRectRejects,
+                nv12CopyRectWriterFailures: _nv12CopyRectWriterFailures,
                 nv12CopyRectSkippedSearches: _nv12CopyRectSkippedSearches,
                 nv12CopyRectSearchTime:
                     _nv12CopyRectSearchTimeWindow.summary(),
@@ -3034,8 +3037,15 @@ private final class TBVideoPipeline: @unchecked Sendable {
         guard let freshRunCount = TBNV12Compression.tileRunCount(
                   dirtyTiles: freshTiles, width: width, height: height
               ),
-              freshRunCount <= 256,
-              let result = rawNV12PacketWriter(
+              freshRunCount <= 256
+        else {
+            rawNV12CopyRectBackoff.recordMiss()
+            lock.lock(); _nv12CopyRectRejects += 1; lock.unlock()
+            return nil
+        }
+        // A busy writer slot says nothing about the content, so it does not
+        // feed the backoff.
+        guard let result = rawNV12PacketWriter(
                   width: width, height: height
               )?.makeCopyRectPacket(
                   yBase: yBase,
@@ -3049,8 +3059,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                   checksumPolicy: rawNV12ChecksumPolicy
               )
         else {
-            rawNV12CopyRectBackoff.recordMiss()
-            lock.lock(); _nv12CopyRectRejects += 1; lock.unlock()
+            lock.lock(); _nv12CopyRectWriterFailures += 1; lock.unlock()
             return nil
         }
         let vector = SIMD2(copyRect.dx, copyRect.dy)
@@ -6495,6 +6504,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     "nv12CopyRectFrames": diagnostics.nv12CopyRectFrames,
                     "nv12CopyRectTiles": diagnostics.nv12CopyRectTiles,
                     "nv12CopyRectRejects": diagnostics.nv12CopyRectRejects,
+                    "nv12CopyRectWriterFailures":
+                        diagnostics.nv12CopyRectWriterFailures,
                     "nv12CopyRectSkippedSearches":
                         diagnostics.nv12CopyRectSkippedSearches,
                     "nv12CopyRectSearchP50Ms":

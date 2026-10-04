@@ -572,7 +572,10 @@ final class TBNV12TileDetector {
         )
         encoder.dispatchThreads(
             MTLSize(width: offsetCount, height: anchorCount, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(
+                width: min(256, searchPipeline.maxTotalThreadsPerThreadgroup),
+                height: 1, depth: 1
+            )
         )
         encoder.endEncoding()
         commandBuffer.commit()

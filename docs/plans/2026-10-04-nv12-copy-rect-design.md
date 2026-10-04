@@ -102,7 +102,8 @@ would be wasted.
   a keyframe request or a resolution change.
 
 That way a scroll that starts after the screen was quiet is searched at once.
-A reject (too many fresh runs, or no writer slot) counts as a miss.
+A reject (too many fresh runs) counts as a miss; a busy writer slot does
+not, since it says nothing about the content.
 
 ## 7. Wire format 5
 
@@ -195,7 +196,8 @@ Sender:
 |---|---|
 | `nv12CopyRectFrames` | Format 5 packets sent |
 | `nv12CopyRectTiles` | Tiles sent as copies |
-| `nv12CopyRectRejects` | Vector covered enough tiles but the packet was not built (too many fresh runs, or no writer slot); too little coverage counts as a miss, not a reject |
+| `nv12CopyRectRejects` | Vector covered enough tiles but the fresh tiles needed more than 256 runs; too little coverage counts as a miss, not a reject |
+| `nv12CopyRectWriterFailures` | Packet not built because the zero-copy writer had no free slot; does not feed the backoff |
 | `nv12CopyRectSkippedSearches` | Searches skipped by the backoff |
 | `nv12CopyRectSearchP50Ms`, `nv12CopyRectSearchP95Ms` | Search plus verify time |
 | `nv12CopyRectLastVector` | Last vector used |
