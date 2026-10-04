@@ -1849,6 +1849,9 @@ struct TBPipelineDiagnosticsSnapshot {
     let nv12OverfetchPermille: TBMetricSummary
     let nv12TileDetectionTime: TBMetricSummary
     let nv12RunCount: TBMetricSummary
+    let nv12ZeroCopyPackets: Int
+    let nv12ZeroCopyFallbacks: Int
+    let nv12LZ4Encoder: String
 
     static let empty = TBPipelineDiagnosticsSnapshot(
         pending: 0, inFlight: 0, dropped: 0, ptsSeq: 0,
@@ -1874,7 +1877,9 @@ struct TBPipelineDiagnosticsSnapshot {
         nv12ChecksumTime: .empty, nv12PacketTime: .empty,
         nv12RegionPixels: .empty, nv12DirtyPixels: .empty,
         nv12DirtyRectCount: .empty, nv12OverfetchPermille: .empty,
-        nv12TileDetectionTime: .empty, nv12RunCount: .empty
+        nv12TileDetectionTime: .empty, nv12RunCount: .empty,
+        nv12ZeroCopyPackets: 0, nv12ZeroCopyFallbacks: 0,
+        nv12LZ4Encoder: "off"
     )
 }
 
@@ -1890,6 +1895,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let usesRawNV12LZ4: Bool
     private let usesRawNV12TileRuns: Bool
     private let rawNV12ChecksumPolicy: TBNV12ChecksumPolicy
+    private let usesRawNV12ZeroCopy: Bool
+    private let rawNV12LZ4Encoder: TBNV12LZ4Encoder
     private let usesBC7Mode6: Bool
     private let usesBC7TileDelta: Bool
     private let bc7CompressionMode: TBBC7CompressionMode
@@ -1922,6 +1929,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var rawNV12ObservedDropped = 0
     private var lastRawNV12Frame: TBCapturedFrame?
     private var rawNV12TileDetector: TBNV12TileDetector?
+    private var rawNV12PacketWriter: TBNV12TileRunPacketWriter?
     private let latestBC7Frame = TBLatestFrameSlot<TBCapturedFrame>()
     private let latestRawNV12Frame = TBLatestFrameSlot<TBCapturedFrame>()
 
@@ -1974,6 +1982,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var _nv12OverfetchPermilleWindow = TBRollingMetricWindow()
     private var _nv12TileDetectionTimeWindow = TBRollingMetricWindow()
     private var _nv12RunCountWindow = TBRollingMetricWindow()
+    private var _nv12ZeroCopyPackets = 0
+    private var _nv12ZeroCopyFallbacks = 0
     private var _lastCaptureFrameAt = Date()
 
     init(preset: TBDisplayCapturePreset,
@@ -2001,6 +2011,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
             ProcessInfo.processInfo.environment["TB_NV12_CHECKSUM"] == "1"
                 ? .fnv64
                 : .disabled
+        // On by default; TB_NV12_ZERO_COPY=0 falls back to the copying path.
+        self.usesRawNV12ZeroCopy =
+            ProcessInfo.processInfo.environment["TB_NV12_ZERO_COPY"] != "0"
+        self.rawNV12LZ4Encoder = TBNV12LZ4Encoder.fromEnvironment(
+            ProcessInfo.processInfo.environment
+        )
         self.usesBC7Mode6 = usesBC7Mode6
         self.usesBC7TileDelta = usesBC7TileDelta
         self.bc7CompressionMode = bc7CompressionMode
@@ -2144,7 +2160,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 nv12OverfetchPermille: _nv12OverfetchPermilleWindow.summary(),
                 nv12TileDetectionTime:
                     _nv12TileDetectionTimeWindow.summary(),
-                nv12RunCount: _nv12RunCountWindow.summary()
+                nv12RunCount: _nv12RunCountWindow.summary(),
+                nv12ZeroCopyPackets: _nv12ZeroCopyPackets,
+                nv12ZeroCopyFallbacks: _nv12ZeroCopyFallbacks,
+                nv12LZ4Encoder: usesRawNV12LZ4
+                    ? rawNV12LZ4Encoder.diagnosticName
+                    : "off"
             )
         }
     }
@@ -2561,6 +2582,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         if width != rawNV12Width || height != rawNV12Height {
             rawNV12HasBaseline = false
             rawNV12TileDetector?.reset()
+            rawNV12PacketWriter = nil
             rawNV12Width = width
             rawNV12Height = height
         }
@@ -2628,7 +2650,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                    height: height,
                    yStride: yStride,
                    uvStride: uvStride,
-                   checksumPolicy: self.rawNV12ChecksumPolicy
+                   checksumPolicy: self.rawNV12ChecksumPolicy,
+                   encoder: self.rawNV12LZ4Encoder
                ) {
                 self.recordNV12Packet(
                     result,
@@ -2670,15 +2693,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
             )
             if detectedTiles.count * 4 < totalTiles * 3,
                let tileRunCount, tileRunCount <= 256,
-               let result = TBNV12Compression.makeTileRunPacket(
+               let result = makeRawNV12TileRunPacket(
                    yBase: yBase,
                    uvBase: uvBase,
                    width: width,
                    height: height,
                    yStride: yStride,
                    uvStride: uvStride,
-                   dirtyTiles: detectedTiles,
-                   checksumPolicy: rawNV12ChecksumPolicy
+                   dirtyTiles: detectedTiles
                ) {
                 packet = result.packet
                 recordNV12Packet(
@@ -2711,7 +2733,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     y: regionY,
                     regionWidth: regionWidth,
                     regionHeight: regionHeight,
-                    checksumPolicy: rawNV12ChecksumPolicy
+                    checksumPolicy: rawNV12ChecksumPolicy,
+                    encoder: rawNV12LZ4Encoder
                 ) {
                     packet = result.packet
                     recordNV12Packet(
@@ -2748,7 +2771,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 width: width, height: height,
                 yStride: yStride, uvStride: uvStride,
                 x: x, y: y, regionWidth: maxX - x, regionHeight: maxY - y,
-                checksumPolicy: rawNV12ChecksumPolicy
+                checksumPolicy: rawNV12ChecksumPolicy,
+                encoder: rawNV12LZ4Encoder
             ) {
                 packet = result.packet
                 let dirtyPixels = rects.reduce(0) {
@@ -2830,6 +2854,50 @@ private final class TBVideoPipeline: @unchecked Sendable {
             }
         }))
         lock.lock(); _sentFrames += 1; _sentBytes += packet.count; lock.unlock()
+    }
+
+    /// Builds a tile-run packet, preferring the zero-copy writer unless
+    /// `TB_NV12_ZERO_COPY=0`. Both paths use `rawNV12LZ4Encoder` and produce
+    /// byte-identical packets.
+    private func makeRawNV12TileRunPacket(
+        yBase: UnsafeRawPointer,
+        uvBase: UnsafeRawPointer,
+        width: Int,
+        height: Int,
+        yStride: Int,
+        uvStride: Int,
+        dirtyTiles: Set<Int>
+    ) -> TBNV12Compression.PacketResult? {
+        if usesRawNV12ZeroCopy {
+            if rawNV12PacketWriter == nil {
+                rawNV12PacketWriter = TBNV12TileRunPacketWriter(
+                    width: width, height: height, encoder: rawNV12LZ4Encoder
+                )
+            }
+            if let result = rawNV12PacketWriter?.makeTileRunPacket(
+                yBase: yBase,
+                uvBase: uvBase,
+                yStride: yStride,
+                uvStride: uvStride,
+                dirtyTiles: dirtyTiles,
+                checksumPolicy: rawNV12ChecksumPolicy
+            ) {
+                lock.lock(); _nv12ZeroCopyPackets += 1; lock.unlock()
+                return result
+            }
+            lock.lock(); _nv12ZeroCopyFallbacks += 1; lock.unlock()
+        }
+        return TBNV12Compression.makeTileRunPacket(
+            yBase: yBase,
+            uvBase: uvBase,
+            width: width,
+            height: height,
+            yStride: yStride,
+            uvStride: uvStride,
+            dirtyTiles: dirtyTiles,
+            checksumPolicy: rawNV12ChecksumPolicy,
+            encoder: rawNV12LZ4Encoder
+        )
     }
 
     func requestRawNV12Keyframe() {
@@ -6252,7 +6320,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                         Double(diagnostics.nv12TileDetectionTime.p95) /
                             1_000_000.0,
                     "nv12RunCountP50": diagnostics.nv12RunCount.p50,
-                    "nv12RunCountP95": diagnostics.nv12RunCount.p95
+                    "nv12RunCountP95": diagnostics.nv12RunCount.p95,
+                    "nv12ZeroCopyPackets": diagnostics.nv12ZeroCopyPackets,
+                    "nv12ZeroCopyFallbacks": diagnostics.nv12ZeroCopyFallbacks,
+                    "nv12LZ4Encoder": diagnostics.nv12LZ4Encoder
                 ]
                 let livenessNow = DispatchTime.now().uptimeNanoseconds
                 let liveness = tbHeartbeatLivenessEvaluation(

@@ -19,8 +19,16 @@ targets:
       - path: ../TargetBridge-Shared
         excludes:
           - "**/*.md"
+      - path: ThirdParty/lz4
+        excludes:
+          - "**/*.md"
+        # Release defaults to -Os; -O3 makes the encoder about 4% faster.
+        compilerFlags:
+          - "-O3"
       - path: TargetBridgeSupport/Assets.xcassets
       - path: ../ThirdPartyNotices/MonitorControl-MIT.txt
+        buildPhase: resources
+      - path: ../ThirdPartyNotices/LZ4-BSD-2.txt
         buildPhase: resources
     dependencies:
       - sdk: IOKit.framework

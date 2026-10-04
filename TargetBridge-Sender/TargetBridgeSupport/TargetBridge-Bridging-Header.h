@@ -14,6 +14,8 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/i2c/IOI2CInterface.h>
 
+#import "../TBDisplaySender/TBLZ4AppleFrame.h"
+
 static inline uint64_t TBChecksum64(const void *data, size_t length) {
     const uint8_t *bytes = (const uint8_t *)data;
     uint64_t hash = UINT64_C(14695981039346656037);

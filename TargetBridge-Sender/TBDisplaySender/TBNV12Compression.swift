@@ -107,7 +107,8 @@ enum TBNV12Compression {
         height: Int,
         yStride: Int,
         uvStride: Int,
-        checksumPolicy: TBNV12ChecksumPolicy = .disabled
+        checksumPolicy: TBNV12ChecksumPolicy = .disabled,
+        encoder: TBNV12LZ4Encoder = .apple
     ) -> PacketResult? {
         guard width > 0, height > 0, width % 2 == 0, height % 2 == 0,
               y.count == yStride * height,
@@ -130,8 +131,12 @@ enum TBNV12Compression {
                 else {
                     return 0
                 }
-                return compression_encode_buffer(
-                    dst, capacity, src, raw.count, nil, COMPRESSION_LZ4
+                return encoder.encode(
+                    destination: dst,
+                    capacity: capacity,
+                    source: src,
+                    length: raw.count,
+                    scratch: nil
                 )
             }
         }
@@ -183,7 +188,8 @@ enum TBNV12Compression {
         y: Int,
         regionWidth: Int,
         regionHeight: Int,
-        checksumPolicy: TBNV12ChecksumPolicy = .disabled
+        checksumPolicy: TBNV12ChecksumPolicy = .disabled,
+        encoder: TBNV12LZ4Encoder = .apple
     ) -> PacketResult? {
         guard x >= 0, y >= 0, regionWidth > 0, regionHeight > 0,
               x % 2 == 0, y % 2 == 0, regionWidth % 2 == 0,
@@ -221,8 +227,12 @@ enum TBNV12Compression {
                 else {
                     return 0
                 }
-                return compression_encode_buffer(
-                    dst, capacity, src, raw.count, nil, COMPRESSION_LZ4
+                return encoder.encode(
+                    destination: dst,
+                    capacity: capacity,
+                    source: src,
+                    length: raw.count,
+                    scratch: nil
                 )
             }
         }
@@ -272,7 +282,8 @@ enum TBNV12Compression {
         yStride: Int,
         uvStride: Int,
         dirtyTiles: Set<Int>,
-        checksumPolicy: TBNV12ChecksumPolicy = .disabled
+        checksumPolicy: TBNV12ChecksumPolicy = .disabled,
+        encoder: TBNV12LZ4Encoder = .apple
     ) -> PacketResult? {
         guard width > 0, height > 0,
               width % tileSize == 0, height % tileSize == 0,
@@ -355,8 +366,12 @@ enum TBNV12Compression {
                 else {
                     return 0
                 }
-                return compression_encode_buffer(
-                    dst, capacity, src, raw.count, nil, COMPRESSION_LZ4
+                return encoder.encode(
+                    destination: dst,
+                    capacity: capacity,
+                    source: src,
+                    length: raw.count,
+                    scratch: nil
                 )
             }
         }
