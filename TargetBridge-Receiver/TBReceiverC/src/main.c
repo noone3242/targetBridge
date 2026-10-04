@@ -44,6 +44,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
