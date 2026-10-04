@@ -13,12 +13,17 @@
 #include "../src/bc7_cursor.h"
 #include "../src/nv12_tile_runs.h"
 #include "../src/idle_policy.h"
+#include "../src/receiver_diagnostics.h"
 #include "../src/window_policy.h"
 
 #include <compression.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -988,6 +993,202 @@ static void test_receiver_idle_policy(void) {
           "connected audio remains active");
 }
 
+static void test_receiver_diagnostics_policy(void) {
+    uint64_t idle_ms = UINT64_MAX;
+    CHECK(tb_receiver_idle_decision(1050, 1000, 10000, &idle_ms) ==
+              TB_RECEIVER_IDLE_ACTIVE,
+          "short receive gap remains active");
+    CHECK(idle_ms == 50,
+          "active receive gap is measured without truncation");
+
+    CHECK(tb_receiver_idle_decision(11000, 1000, 10000, &idle_ms) ==
+              TB_RECEIVER_IDLE_TIMEOUT,
+          "exact watchdog threshold times out");
+    CHECK(idle_ms == 10000,
+          "timeout records exact idle duration");
+
+    idle_ms = UINT64_MAX;
+    CHECK(tb_receiver_idle_decision(999, 1000, 10000, &idle_ms) ==
+              TB_RECEIVER_IDLE_CLOCK_REGRESSION,
+          "monotonic regression is not treated as an enormous timeout");
+    CHECK(idle_ms == 0,
+          "clock regression clamps idle duration to zero");
+
+    CHECK(strcmp(
+              tb_receiver_close_reason_name(TB_RECEIVER_CLOSE_PEER_FIN),
+              "peer_fin") == 0,
+          "peer FIN close reason is stable");
+    CHECK(strcmp(
+              tb_receiver_close_reason_name(TB_RECEIVER_CLOSE_READ_ERROR),
+              "read_error") == 0,
+          "read error close reason is stable");
+    CHECK(strcmp(
+              tb_receiver_close_reason_name(TB_RECEIVER_CLOSE_PARSER_ERROR),
+              "parser_error") == 0,
+          "parser error close reason is stable");
+    CHECK(strcmp(
+              tb_receiver_close_reason_name(
+                  TB_RECEIVER_CLOSE_SENDER_TEARDOWN),
+              "sender_teardown") == 0,
+          "sender teardown close reason is stable");
+    CHECK(strcmp(
+              tb_receiver_close_reason_name(
+                  TB_RECEIVER_CLOSE_IDLE_TIMEOUT),
+              "idle_timeout") == 0,
+          "idle timeout close reason is stable");
+    CHECK(strcmp(
+              tb_receiver_close_reason_name(
+                  TB_RECEIVER_CLOSE_METRICS_SEND_ERROR),
+              "metrics_send_error") == 0,
+          "metrics send error close reason is stable");
+    CHECK(strcmp(
+              tb_receiver_close_reason_name(TB_RECEIVER_CLOSE_LOCAL_QUIT),
+              "local_quit") == 0,
+          "local quit close reason is stable");
+    CHECK(strcmp(
+              tb_receiver_close_reason_name(
+                  TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN),
+              "signal_shutdown") == 0,
+          "signal shutdown close reason is stable");
+}
+
+static int read_text_file(
+    const char *path,
+    char *buffer,
+    size_t buffer_size) {
+    if (!path || !buffer || buffer_size == 0) return -1;
+    FILE *file = fopen(path, "r");
+    if (!file) return -1;
+    const size_t count = fread(buffer, 1, buffer_size - 1u, file);
+    const int read_error = ferror(file);
+    fclose(file);
+    buffer[count] = '\0';
+    return read_error ? -1 : 0;
+}
+
+static void test_receiver_persistent_diagnostics(void) {
+    char temporary_home[] = "/tmp/targetbridge-diagnostics-test-XXXXXX";
+    CHECK(mkdtemp(temporary_home) != NULL,
+          "temporary diagnostics home created");
+    if (!temporary_home[0]) return;
+
+    char library[PATH_MAX];
+    char application_support[PATH_MAX];
+    char app_dir[PATH_MAX];
+    char log_dir[PATH_MAX];
+    char log_path[PATH_MAX];
+    char previous_path[PATH_MAX];
+    char run_state_path[PATH_MAX];
+    snprintf(library, sizeof(library), "%s/Library", temporary_home);
+    snprintf(
+        application_support,
+        sizeof(application_support),
+        "%s/Application Support",
+        library);
+    snprintf(
+        app_dir,
+        sizeof(app_dir),
+        "%s/TargetBridge Receiver",
+        application_support);
+    snprintf(log_dir, sizeof(log_dir), "%s/Logs", app_dir);
+    snprintf(log_path, sizeof(log_path), "%s/receiver.jsonl", log_dir);
+    snprintf(
+        previous_path,
+        sizeof(previous_path),
+        "%s/receiver.previous.jsonl",
+        log_dir);
+    snprintf(run_state_path, sizeof(run_state_path), "%s/run-state.json", log_dir);
+    CHECK(mkdir(library, 0755) == 0,
+          "temporary Library directory created");
+    CHECK(mkdir(application_support, 0755) == 0,
+          "temporary Application Support directory created");
+
+    const char *original_home = getenv("HOME");
+    char saved_home[PATH_MAX];
+    snprintf(
+        saved_home,
+        sizeof(saved_home),
+        "%s",
+        original_home ? original_home : "");
+    CHECK(setenv("HOME", temporary_home, 1) == 0,
+          "temporary HOME installed");
+
+    struct tb_receiver_diagnostics diagnostics;
+    CHECK(tb_receiver_diagnostics_init(
+              &diagnostics,
+              "4.0.1",
+              "test-build",
+              "test-commit",
+              1000) == 0,
+          "persistent diagnostics initialize");
+    tb_receiver_diagnostics_log(
+        &diagnostics,
+        1010,
+        "session_start",
+        "\"tcpState\":4");
+    tb_receiver_diagnostics_close(&diagnostics, 1100, "local_quit");
+
+    char contents[8192];
+    CHECK(read_text_file(log_path, contents, sizeof(contents)) == 0,
+          "receiver.jsonl is readable");
+    CHECK(strstr(contents, "\"event\":\"process_start\"") != NULL,
+          "receiver log records process start");
+    CHECK(strstr(contents, "\"event\":\"session_start\"") != NULL,
+          "receiver log records session start");
+    CHECK(strstr(contents, "\"event\":\"process_exit\"") != NULL,
+          "receiver log records process exit");
+    CHECK(read_text_file(run_state_path, contents, sizeof(contents)) == 0,
+          "run-state.json is readable");
+    CHECK(strstr(contents, "\"cleanExit\":true") != NULL,
+          "normal shutdown leaves a clean run-state marker");
+
+    CHECK(tb_receiver_diagnostics_init(
+              &diagnostics,
+              "4.0.1",
+              "test-build-2",
+              "test-commit",
+              2000) == 0,
+          "second diagnostics run initializes");
+    CHECK(access(previous_path, F_OK) == 0,
+          "prior receiver log rotates on restart");
+    tb_receiver_diagnostics_flush(&diagnostics, 1);
+    fclose(diagnostics.file);
+    diagnostics.file = NULL;
+    diagnostics.initialized = 0;
+
+    CHECK(tb_receiver_diagnostics_init(
+              &diagnostics,
+              "4.0.1",
+              "test-build-3",
+              "test-commit",
+              3000) == 0,
+          "diagnostics restart after simulated crash initializes");
+    tb_receiver_diagnostics_close(&diagnostics, 3100, "local_quit");
+    CHECK(read_text_file(log_path, contents, sizeof(contents)) == 0,
+          "post-crash receiver log is readable");
+    CHECK(strstr(contents, "\"previousRunUnclean\":true") != NULL,
+          "process start marks previous unclean run");
+    CHECK(strstr(contents, "\"event\":\"unclean_previous_run\"") != NULL,
+          "unclean previous run receives an explicit event");
+
+    if (saved_home[0]) {
+        CHECK(setenv("HOME", saved_home, 1) == 0,
+              "original HOME restored");
+    } else {
+        CHECK(unsetenv("HOME") == 0,
+              "empty original HOME restored");
+    }
+
+    unlink(log_path);
+    unlink(previous_path);
+    unlink(run_state_path);
+    rmdir(log_dir);
+    rmdir(app_dir);
+    rmdir(application_support);
+    rmdir(library);
+    rmdir(temporary_home);
+}
+
 int main(void) {
     test_single_packet_whole_feed();
     test_byte_by_byte_feed();
@@ -1004,6 +1205,8 @@ int main(void) {
     test_nv12_tile_run_validation();
     test_window_close_quit_policy();
     test_receiver_idle_policy();
+    test_receiver_diagnostics_policy();
+    test_receiver_persistent_diagnostics();
 
     if (g_failures == 0) {
         printf("net parser tests: %d checks passed\n", g_checks);

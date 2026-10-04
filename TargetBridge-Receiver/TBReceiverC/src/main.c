@@ -20,6 +20,7 @@
 #include "bc7_renderer.h"
 #include "nv12_tile_runs.h"
 #include "idle_policy.h"
+#include "receiver_diagnostics.h"
 #include "decoder.h"
 #include "display.h"
 #include "proto.h"
@@ -43,10 +44,12 @@
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
+#include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
@@ -143,6 +146,12 @@ struct app {
     struct tb_metric_window raw_checksum_ns;
     uint64_t last_ip_check_ms;
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
+    uint64_t last_packet_ms;
+    uint64_t last_heartbeat_sequence;
+    uint64_t last_persistent_metrics_ms;
+    uint8_t  last_packet_type;
+    int      last_heartbeat_sequence_valid;
+    int      clock_error_logged;
     int      debug_enabled;
     int      close_requested;
     int      have_video_frame;
@@ -198,6 +207,7 @@ struct app {
     int      sent_caps_down;
     uint64_t last_clipboard_poll_ms;
     char     last_clipboard_text[4096];
+    struct tb_receiver_diagnostics diagnostics;
 };
 
 static int send_all(int fd, const uint8_t *buf, size_t len);
@@ -239,10 +249,19 @@ static void tb_receiver_input_log(const char *fmt, ...) {
 static volatile sig_atomic_t g_term = 0;
 static void on_sigint(int s) { (void)s; g_term = 1; }
 
+static int g_monotonic_clock_errno = 0;
+static uint64_t g_last_monotonic_ms = 0;
+
 static uint64_t now_ms(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        g_monotonic_clock_errno = errno;
+        return g_last_monotonic_ms;
+    }
+    g_monotonic_clock_errno = 0;
+    g_last_monotonic_ms =
+        (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+    return g_last_monotonic_ms;
 }
 
 static uint64_t now_ns(void) {
@@ -1947,6 +1966,8 @@ static void tb_set_system_volume(double level) {
 static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud) {
     struct app *a = (struct app *)ud;
     a->packets_received++;
+    a->last_packet_type = type;
+    a->last_packet_ms = now_ms();
     switch (type) {
     case TB_PKT_UI_LANGUAGE:
         {
@@ -2135,6 +2156,18 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         tb_receiver_apply_input_control_mode(a, payload, len);
         break;
     case TB_PKT_HEARTBEAT:
+        {
+            int sequence = 0;
+            if (extract_json_int_field(
+                    payload,
+                    len,
+                    "\"sequence\"",
+                    &sequence) == 1 &&
+                sequence >= 0) {
+                a->last_heartbeat_sequence = (uint64_t)sequence;
+                a->last_heartbeat_sequence_valid = 1;
+            }
+        }
         break;
     case TB_PKT_TEST_DATA:
         /* Performance test data; discard */
@@ -2152,24 +2185,40 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
 /* ---- Networking helpers ---------------------------------------------- */
 
-static int drain_socket(struct app *a) {
+enum tb_drain_result {
+    TB_DRAIN_PEER_FIN = -3,
+    TB_DRAIN_READ_ERROR = -2,
+    TB_DRAIN_PARSER_ERROR = -1,
+    TB_DRAIN_NO_DATA = 0,
+    TB_DRAIN_DATA = 1
+};
+
+static int drain_socket(struct app *a, int *error_code) {
     uint8_t buf[1024 * 1024];
     int saw_data = 0;
     size_t drained_bytes = 0;
+    if (error_code) *error_code = 0;
     for (;;) {
         ssize_t n = read(a->client_fd, buf, sizeof(buf));
         if (n > 0) {
             saw_data = 1;
             drained_bytes += (size_t)n;
             a->received_bytes += (uint64_t)n;
-            if (tb_parser_feed(&a->parser, buf, (size_t)n) < 0) return -1;
-            if (drained_bytes >= 32u * 1024u * 1024u) return saw_data;
+            if (tb_parser_feed(&a->parser, buf, (size_t)n) < 0) {
+                return TB_DRAIN_PARSER_ERROR;
+            }
+            if (drained_bytes >= 32u * 1024u * 1024u) {
+                return TB_DRAIN_DATA;
+            }
         } else if (n == 0) {
-            return -1;  /* peer closed */
+            return TB_DRAIN_PEER_FIN;
         } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return saw_data;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return saw_data ? TB_DRAIN_DATA : TB_DRAIN_NO_DATA;
+            }
+            if (error_code) *error_code = errno;
             perror("[main] read");
-            return -1;
+            return TB_DRAIN_READ_ERROR;
         }
     }
 }
@@ -2680,9 +2729,9 @@ static void send_receiver_info(struct app *a) {
     free(pkt);
 }
 
-static void send_receiver_metrics(
+static int send_receiver_metrics(
     struct app *a, double fps, double present_fps, double gbps) {
-    if (!a || a->client_fd < 0) return;
+    if (!a || a->client_fd < 0) return 0;
     const struct tb_metric_summary packet_interval =
         metric_summary(&a->bc7_packet_interval_ns);
     const struct tb_metric_summary apply = metric_summary(&a->bc7_apply_ns);
@@ -2778,23 +2827,119 @@ static void send_receiver_metrics(
         ns_to_ms(raw_checksum.p95),
         ns_to_ms(raw_checksum.p99)
     );
-    if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
+    if (json_len <= 0 || (size_t)json_len >= sizeof(json)) {
+        errno = EMSGSIZE;
+        return -1;
+    }
 
     const size_t packet_len = 5u + (size_t)json_len;
     uint8_t packet[5 + 3072];
     write_be32(packet, (uint32_t)(1 + json_len));
     packet[4] = TB_PKT_RECEIVER_METRICS;
     memcpy(packet + 5, json, (size_t)json_len);
-    (void)send_all(a->client_fd, packet, packet_len);
+    return send_all(a->client_fd, packet, packet_len);
 }
 
-static void close_client(struct app *a) {
+static int tcp_state_for_fd(int fd) {
+    if (fd < 0) return -1;
+    struct tcp_connection_info info;
+    socklen_t info_length = sizeof(info);
+    memset(&info, 0, sizeof(info));
+    if (getsockopt(
+            fd,
+            IPPROTO_TCP,
+            TCP_CONNECTION_INFO,
+            &info,
+            &info_length) != 0) {
+        return -1;
+    }
+    return info.tcpi_state;
+}
+
+static void close_client(
+    struct app *a,
+    enum tb_receiver_close_reason reason,
+    int error_code,
+    uint64_t close_time_ms,
+    uint64_t idle_ms) {
+    int socket_error = 0;
+    socklen_t socket_error_length = sizeof(socket_error);
+    const int tcp_state = tcp_state_for_fd(a->client_fd);
+    if (a->client_fd >= 0 &&
+        getsockopt(
+            a->client_fd,
+            SOL_SOCKET,
+            SO_ERROR,
+            &socket_error,
+            &socket_error_length) != 0) {
+        socket_error = -1;
+    }
+    const uint64_t last_packet_age_ms =
+        close_time_ms >= a->last_packet_ms
+            ? close_time_ms - a->last_packet_ms
+            : 0;
+    char heartbeat_sequence[32];
+    snprintf(
+        heartbeat_sequence,
+        sizeof(heartbeat_sequence),
+        "%s",
+        a->last_heartbeat_sequence_valid ? "" : "null");
+    if (a->last_heartbeat_sequence_valid) {
+        snprintf(
+            heartbeat_sequence,
+            sizeof(heartbeat_sequence),
+            "%llu",
+            (unsigned long long)a->last_heartbeat_sequence);
+    }
+    char fields[2048];
+    snprintf(
+        fields,
+        sizeof(fields),
+        "\"reason\":\"%s\",\"errno\":%d,\"socketError\":%d,"
+        "\"tcpState\":%d,\"nowMs\":%llu,\"lastReceiveMs\":%llu,"
+        "\"idleMs\":%llu,\"lastPacketType\":%u,\"lastPacketMs\":%llu,"
+        "\"lastPacketAgeMs\":%llu,\"lastHeartbeatSequence\":%s,"
+        "\"transport\":\"%s\",\"sessionActive\":%s,"
+        "\"frames\":%llu,\"packets\":%llu,\"bytes\":%llu,"
+        "\"invalidFrames\":%llu,\"renderFailures\":%llu,"
+        "\"appliedSequence\":%llu,\"keyframeRequests\":%llu",
+        tb_receiver_close_reason_name(reason),
+        error_code,
+        socket_error,
+        tcp_state,
+        (unsigned long long)close_time_ms,
+        (unsigned long long)a->last_recv_ms,
+        (unsigned long long)idle_ms,
+        (unsigned int)a->last_packet_type,
+        (unsigned long long)a->last_packet_ms,
+        (unsigned long long)last_packet_age_ms,
+        heartbeat_sequence,
+        a->active_transport,
+        a->session_active ? "true" : "false",
+        (unsigned long long)a->frames,
+        (unsigned long long)a->packets_received,
+        (unsigned long long)a->received_bytes,
+        (unsigned long long)a->bc7_invalid_frames,
+        (unsigned long long)a->bc7_render_failures,
+        (unsigned long long)a->bc7_applied_sequence,
+        (unsigned long long)a->bc7_keyframe_requests);
+    tb_receiver_diagnostics_log(
+        &a->diagnostics,
+        close_time_ms,
+        "session_close",
+        fields);
+    tb_receiver_diagnostics_flush(&a->diagnostics, 1);
     if (a->debug_enabled && a->client_fd >= 0) {
         fprintf(stderr,
-                "[diag] event=disconnect transport=%s frames=%llu packets=%llu "
+                "[diag] event=disconnect reason=%s errno=%d tcpState=%d "
+                "idleMs=%llu transport=%s frames=%llu packets=%llu "
                 "bytes=%llu bc7Frames=%llu bc7Invalid=%llu renderFailures=%llu "
                 "bc7Deltas=%llu appliedSequence=%llu keyframeRequests=%llu "
                 "ackRequests=%llu acksSent=%llu\n",
+                tb_receiver_close_reason_name(reason),
+                error_code,
+                tcp_state,
+                (unsigned long long)idle_ms,
                 a->active_transport,
                 (unsigned long long)a->frames,
                 (unsigned long long)a->packets_received,
@@ -2840,7 +2985,12 @@ static void close_client(struct app *a) {
         a->audio_buf_size = 0;
         SDL_UnlockAudioDevice(a->audio_device);
     }
-    fprintf(stderr, "[main] client disconnected\n");
+    fprintf(
+        stderr,
+        "[main] client disconnected reason=%s errno=%d idle_ms=%llu\n",
+        tb_receiver_close_reason_name(reason),
+        error_code,
+        (unsigned long long)idle_ms);
 }
 
 /* Build the display string for the host/IP line of the status screen.
@@ -2876,6 +3026,7 @@ int main(int argc, char **argv) {
     int fullscreen = 1;
     int print_capabilities = 0;
     int debug_enabled = 0;
+    const uint64_t startup_monotonic_ms = now_ms();
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--windowed") == 0) {
             fullscreen = 0;
@@ -2956,6 +3107,12 @@ int main(int argc, char **argv) {
     a.server_fd = -1;
     a.client_fd = -1;
     a.debug_enabled = debug_enabled;
+    (void)tb_receiver_diagnostics_init(
+        &a.diagnostics,
+        TB_RECEIVER_VERSION,
+        TB_RECEIVER_BUILD,
+        TB_RECEIVER_COMMIT,
+        startup_monotonic_ms);
     snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
     {
         char host[96] = {0};
@@ -2978,7 +3135,19 @@ int main(int argc, char **argv) {
     tb_gesture_bridge_set_active(0);
 
     a.disp = tb_disp_create(fullscreen);
-    if (!a.disp) { fprintf(stderr, "tb_disp_create failed\n"); return 1; }
+    if (!a.disp) {
+        fprintf(stderr, "tb_disp_create failed\n");
+        tb_receiver_diagnostics_log(
+            &a.diagnostics,
+            now_ms(),
+            "startup_failure",
+            "\"component\":\"display\"");
+        tb_receiver_diagnostics_close(
+            &a.diagnostics,
+            now_ms(),
+            "startup_failure");
+        return 1;
+    }
 
     /* Open SDL Audio Device */
     SDL_AudioSpec spec;
@@ -3007,14 +3176,43 @@ int main(int argc, char **argv) {
     bonjour_update(&a, TB_PORT);
 
     a.dec = tb_dec_create(on_frame, &a);
-    if (!a.dec) { fprintf(stderr, "tb_dec_create failed\n"); tb_disp_destroy(a.disp); return 1; }
+    if (!a.dec) {
+        fprintf(stderr, "tb_dec_create failed\n");
+        tb_receiver_diagnostics_log(
+            &a.diagnostics,
+            now_ms(),
+            "startup_failure",
+            "\"component\":\"decoder\"");
+        tb_disp_destroy(a.disp);
+        tb_receiver_diagnostics_close(
+            &a.diagnostics,
+            now_ms(),
+            "startup_failure");
+        return 1;
+    }
 
     tb_parser_init(&a.parser, on_packet, &a);
 
     a.server_fd = tb_net_listen(TB_PORT);
-    if (a.server_fd < 0) { fprintf(stderr, "tb_net_listen failed\n"); return 1; }
+    if (a.server_fd < 0) {
+        fprintf(stderr, "tb_net_listen failed\n");
+        tb_receiver_diagnostics_log(
+            &a.diagnostics,
+            now_ms(),
+            "startup_failure",
+            "\"component\":\"listen_socket\"");
+        tb_parser_free(&a.parser);
+        tb_dec_destroy(a.dec);
+        tb_disp_destroy(a.disp);
+        tb_receiver_diagnostics_close(
+            &a.diagnostics,
+            now_ms(),
+            "startup_failure");
+        return 1;
+    }
 
     a.last_fps_tick_ms = now_ms();
+    a.last_persistent_metrics_ms = a.last_fps_tick_ms;
     a.last_ip_check_ms = 0;
     if (a.debug_enabled) {
         char metal_device[256] = {0};
@@ -3030,16 +3228,38 @@ int main(int argc, char **argv) {
                 TB_PORT);
     }
 
+    const char *shutdown_reason = "normal_exit";
     while (!g_term) {
         unsigned int disp_actions = tb_disp_poll_actions(a.disp);
         int socket_activity = 0;
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, true);
-        if (disp_actions & TB_DISP_ACTION_QUIT) break;
+        if (disp_actions & TB_DISP_ACTION_QUIT) {
+            shutdown_reason = "local_quit";
+            break;
+        }
         if ((disp_actions & TB_DISP_ACTION_CYCLE_LANGUAGE) && a.client_fd < 0) {
             tb_receiver_cycle_language_preference(&a);
         }
 
         uint64_t t = now_ms();
+        if (g_monotonic_clock_errno != 0) {
+            if (!a.clock_error_logged) {
+                char fields[128];
+                snprintf(
+                    fields,
+                    sizeof(fields),
+                    "\"errno\":%d",
+                    g_monotonic_clock_errno);
+                tb_receiver_diagnostics_log(
+                    &a.diagnostics,
+                    t,
+                    "clock_error",
+                    fields);
+                a.clock_error_logged = 1;
+            }
+        } else {
+            a.clock_error_logged = 0;
+        }
 
         if (t - a.last_ip_check_ms >= 1000) {
             char refreshed_tb_ip[64] = {0};
@@ -3120,32 +3340,109 @@ int main(int argc, char **argv) {
                 memset(&a.raw_checksum_ns, 0, sizeof(a.raw_checksum_ns));
                 snprintf(a.active_transport, sizeof(a.active_transport), "%s", "none");
                 a.last_recv_ms = t;
+                a.last_packet_ms = t;
+                a.last_packet_type = 0;
+                a.last_heartbeat_sequence = 0;
+                a.last_heartbeat_sequence_valid = 0;
+                a.last_persistent_metrics_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
+                char fields[256];
+                snprintf(
+                    fields,
+                    sizeof(fields),
+                    "\"tcpState\":%d,\"thunderboltIP\":\"%s\","
+                    "\"localNetworkIP\":\"%s\"",
+                    tcp_state_for_fd(a.client_fd),
+                    a.tb_ip_text,
+                    a.net_ip_text);
+                tb_receiver_diagnostics_log(
+                    &a.diagnostics,
+                    t,
+                    "session_start",
+                    fields);
                 tb_parser_free(&a.parser);
                 tb_parser_init(&a.parser, on_packet, &a);
                 tb_receiver_refresh_input_capture(&a);
                 send_receiver_info(&a);
             }
         } else {
-            int drain_result = drain_socket(&a);
-            if (drain_result < 0) {
-                close_client(&a);
+            int drain_error = 0;
+            int drain_result = drain_socket(&a, &drain_error);
+            if (drain_result == TB_DRAIN_PEER_FIN) {
+                close_client(
+                    &a,
+                    TB_RECEIVER_CLOSE_PEER_FIN,
+                    0,
+                    t,
+                    t >= a.last_recv_ms ? t - a.last_recv_ms : 0);
+            } else if (drain_result == TB_DRAIN_READ_ERROR) {
+                close_client(
+                    &a,
+                    TB_RECEIVER_CLOSE_READ_ERROR,
+                    drain_error,
+                    t,
+                    t >= a.last_recv_ms ? t - a.last_recv_ms : 0);
+            } else if (drain_result == TB_DRAIN_PARSER_ERROR) {
+                close_client(
+                    &a,
+                    TB_RECEIVER_CLOSE_PARSER_ERROR,
+                    0,
+                    t,
+                    t >= a.last_recv_ms ? t - a.last_recv_ms : 0);
             } else {
                 socket_activity = drain_result;
                 if (drain_result > 0) a.last_recv_ms = t;
                 if (a.close_requested) {
-                    close_client(&a);
-                } else if (t - a.last_recv_ms >= TB_SENDER_IDLE_TIMEOUT_MS) {
-                    /* The sender streams frames continuously and heartbeats
-                     * every 2s. Total silence means it died without a FIN
-                     * (crash, pulled cable, force sleep). Without this reap,
-                     * the dead fd is held forever and — because the receiver
-                     * is single-client — every future connect is locked out
-                     * until the app is restarted. */
-                    fprintf(stderr, "[main] no data from sender for %llu ms; closing stale session\n",
-                            (unsigned long long)(t - a.last_recv_ms));
-                    close_client(&a);
+                    close_client(
+                        &a,
+                        TB_RECEIVER_CLOSE_SENDER_TEARDOWN,
+                        0,
+                        t,
+                        0);
+                } else {
+                    uint64_t idle_ms = 0;
+                    const enum tb_receiver_idle_decision idle_decision =
+                        tb_receiver_idle_decision(
+                            t,
+                            a.last_recv_ms,
+                            TB_SENDER_IDLE_TIMEOUT_MS,
+                            &idle_ms);
+                    if (idle_decision ==
+                        TB_RECEIVER_IDLE_CLOCK_REGRESSION) {
+                        char fields[256];
+                        snprintf(
+                            fields,
+                            sizeof(fields),
+                            "\"nowMs\":%llu,\"lastReceiveMs\":%llu",
+                            (unsigned long long)t,
+                            (unsigned long long)a.last_recv_ms);
+                        tb_receiver_diagnostics_log(
+                            &a.diagnostics,
+                            t,
+                            "clock_regression",
+                            fields);
+                        a.last_recv_ms = t;
+                    } else if (idle_decision ==
+                               TB_RECEIVER_IDLE_TIMEOUT) {
+                        /* The sender streams frames continuously and heartbeats
+                         * every 2s. Total silence means it died without a FIN
+                         * (crash, pulled cable, force sleep). Without this
+                         * reap, the dead fd is held forever and — because the
+                         * receiver is single-client — every future connect is
+                         * locked out until the app is restarted. */
+                        fprintf(
+                            stderr,
+                            "[main] no data from sender for %llu ms; "
+                            "closing stale session\n",
+                            (unsigned long long)idle_ms);
+                        close_client(
+                            &a,
+                            TB_RECEIVER_CLOSE_IDLE_TIMEOUT,
+                            0,
+                            t,
+                            idle_ms);
+                    }
                 }
             }
         }
@@ -3254,7 +3551,70 @@ int main(int argc, char **argv) {
             double gbps = elapsed_ms > 0
                 ? ((double)db * 8.0 / ((double)elapsed_ms * 1000000.0))
                 : 0.0;
-            send_receiver_metrics(&a, fps, present_fps, gbps);
+            int metrics_send_error = 0;
+            if (send_receiver_metrics(&a, fps, present_fps, gbps) != 0) {
+                metrics_send_error = errno != 0 ? errno : EIO;
+            }
+            if (t >= a.last_persistent_metrics_ms &&
+                t - a.last_persistent_metrics_ms >=
+                TB_RECEIVER_DIAGNOSTIC_METRICS_INTERVAL_MS) {
+                const uint64_t last_receive_age_ms =
+                    t >= a.last_recv_ms ? t - a.last_recv_ms : 0;
+                char heartbeat_sequence[32];
+                if (a.last_heartbeat_sequence_valid) {
+                    snprintf(
+                        heartbeat_sequence,
+                        sizeof(heartbeat_sequence),
+                        "%llu",
+                        (unsigned long long)a.last_heartbeat_sequence);
+                } else {
+                    snprintf(
+                        heartbeat_sequence,
+                        sizeof(heartbeat_sequence),
+                        "%s",
+                        "null");
+                }
+                char fields[1536];
+                snprintf(
+                    fields,
+                    sizeof(fields),
+                    "\"connected\":%s,\"sessionActive\":%s,"
+                    "\"transport\":\"%s\",\"fps\":%.3f,"
+                    "\"presentFPS\":%.3f,\"networkGbps\":%.6f,"
+                    "\"frames\":%llu,\"packets\":%llu,\"bytes\":%llu,"
+                    "\"lastReceiveAgeMs\":%llu,\"lastPacketType\":%u,"
+                    "\"lastPacketAgeMs\":%llu,\"lastHeartbeatSequence\":%s,"
+                    "\"tcpState\":%d,\"invalidFrames\":%llu,"
+                    "\"renderFailures\":%llu,\"appliedSequence\":%llu,"
+                    "\"keyframeRequests\":%llu",
+                    a.client_fd >= 0 ? "true" : "false",
+                    a.session_active ? "true" : "false",
+                    a.active_transport,
+                    fps,
+                    present_fps,
+                    gbps,
+                    (unsigned long long)a.frames,
+                    (unsigned long long)a.packets_received,
+                    (unsigned long long)a.received_bytes,
+                    (unsigned long long)last_receive_age_ms,
+                    (unsigned int)a.last_packet_type,
+                    (unsigned long long)(
+                        t >= a.last_packet_ms
+                            ? t - a.last_packet_ms
+                            : 0),
+                    heartbeat_sequence,
+                    tcp_state_for_fd(a.client_fd),
+                    (unsigned long long)a.bc7_invalid_frames,
+                    (unsigned long long)a.bc7_render_failures,
+                    (unsigned long long)a.bc7_applied_sequence,
+                    (unsigned long long)a.bc7_keyframe_requests);
+                tb_receiver_diagnostics_log(
+                    &a.diagnostics,
+                    t,
+                    "metrics",
+                    fields);
+                a.last_persistent_metrics_ms = t;
+            }
             if (a.debug_enabled) {
                 const struct tb_metric_summary packet_interval =
                     metric_summary(&a.bc7_packet_interval_ns);
@@ -3333,6 +3693,14 @@ int main(int argc, char **argv) {
             } else if (df > 0) {
                 fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
             }
+            if (metrics_send_error != 0 && a.client_fd >= 0) {
+                close_client(
+                    &a,
+                    TB_RECEIVER_CLOSE_METRICS_SEND_ERROR,
+                    metrics_send_error,
+                    t,
+                    t >= a.last_recv_ms ? t - a.last_recv_ms : 0);
+            }
         }
 
         /* Keep connected streaming latency unchanged, but do not poll and
@@ -3345,7 +3713,17 @@ int main(int argc, char **argv) {
         if (loop_delay_ms > 0) SDL_Delay(loop_delay_ms);
     }
 
-    if (a.client_fd >= 0) close(a.client_fd);
+    if (g_term) shutdown_reason = "signal_shutdown";
+    if (a.client_fd >= 0) {
+        close_client(
+            &a,
+            g_term
+                ? TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN
+                : TB_RECEIVER_CLOSE_LOCAL_QUIT,
+            0,
+            now_ms(),
+            0);
+    }
     tb_receiver_stop_input_tap(&a);
     if (a.server_fd >= 0) close(a.server_fd);
     bonjour_deinit(&a);
@@ -3355,6 +3733,10 @@ int main(int argc, char **argv) {
         SDL_CloseAudioDevice(a.audio_device);
     }
     tb_disp_destroy(a.disp);
+    tb_receiver_diagnostics_close(
+        &a.diagnostics,
+        now_ms(),
+        shutdown_reason);
     fprintf(stderr, "[main] bye\n");
     return 0;
 }
