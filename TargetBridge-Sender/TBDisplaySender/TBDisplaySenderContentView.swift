@@ -267,6 +267,15 @@ private struct TBDisplaySenderSessionCard: View {
             )
             Divider()
             compactSummaryRow(
+                icon: "clock",
+                title: TBDisplaySenderL10n.connectionStartedLabel(
+                    service.language
+                ),
+                value: session.connectionStartedText,
+                detail: session.isConnected ? session.statusText : ""
+            )
+            Divider()
+            compactSummaryRow(
                 icon: "display",
                 title: receiverTitle,
                 value: session.receiverDisplayName.isEmpty

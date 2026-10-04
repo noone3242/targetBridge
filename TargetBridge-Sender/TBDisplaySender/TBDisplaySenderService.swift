@@ -31,6 +31,43 @@ func tbShouldReleaseSessionOnNetworkWait(
     isConnected && transportKind == .thunderboltBridge
 }
 
+func tbConnectionStartedTimestamp(
+    _ date: Date?,
+    calendar: Calendar = .current
+) -> String {
+    guard let date else { return "—" }
+    let components = calendar.dateComponents(
+        [.year, .month, .day, .hour, .minute, .second],
+        from: date
+    )
+    return String(
+        format: "%04d-%02d-%02d %02d:%02d:%02d",
+        components.year ?? 0,
+        components.month ?? 0,
+        components.day ?? 0,
+        components.hour ?? 0,
+        components.minute ?? 0,
+        components.second ?? 0
+    )
+}
+
+func tbConnectionStartedClockTime(
+    _ date: Date?,
+    calendar: Calendar = .current
+) -> String {
+    guard let date else { return "—" }
+    let components = calendar.dateComponents(
+        [.hour, .minute, .second],
+        from: date
+    )
+    return String(
+        format: "%02d:%02d:%02d",
+        components.hour ?? 0,
+        components.minute ?? 0,
+        components.second ?? 0
+    )
+}
+
 struct TBSessionCloseContext: Equatable, Sendable {
     let reason: String
     let category: String
@@ -3229,6 +3266,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     @Published var isConnected = false
     @Published var isStreaming = false
+    @Published private(set) var connectionStartedAt: Date?
     @Published var statusText: String
     @Published var transportKind: TBTransportKind = .thunderboltBridge
     @Published var localInterfaceIP = ""
@@ -3577,6 +3615,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return "\(localInterfaceIP) → \(receiverIP):\(TBMonitorProtocol.port) · \(interface)"
     }
 
+    var connectionStartedText: String {
+        tbConnectionStartedTimestamp(connectionStartedAt)
+    }
+
+    var connectionStartedClockText: String {
+        tbConnectionStartedClockTime(connectionStartedAt)
+    }
+
     var generationDiagnosticsText: String {
         "capture=\(captureGeneration) · renderAck=\(bc7RenderConfirmed ? "yes" : "no")"
     }
@@ -3789,6 +3835,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.connectTimeoutWorkItem?.cancel()
                     self.connectTimeoutWorkItem = nil
                     self.isConnected = true
+                    self.connectionStartedAt = Date()
                     TBSenderDiagnosticsLogger.shared.append(
                         event: "connection_state",
                         fields: [

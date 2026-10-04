@@ -527,6 +527,23 @@ enum TBDisplaySenderL10n {
         text("sender.status_chip.idle", language)
     }
 
+    static func connectionStartedLabel(
+        _ language: TBDisplaySenderLanguage
+    ) -> String {
+        text("sender.label.connection_started", language)
+    }
+
+    static func connectedSince(
+        _ time: String,
+        language: TBDisplaySenderLanguage
+    ) -> String {
+        text(
+            "sender.menu.connected_since",
+            language,
+            ["time": time]
+        )
+    }
+
     static func captureDisplayNotAvailable(_ language: TBDisplaySenderLanguage) -> String {
         text("sender.capture_display.na", language)
     }

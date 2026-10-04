@@ -206,7 +206,12 @@ final class TBDisplaySenderStatusItemController: NSObject {
             button.toolTip =
                 "TargetBridge\nFrame rate: \(fps) FPS\n" +
                 "Thunderbolt throughput: " +
-                tbMenuBarByteRateText(gigabitsPerSecond: bandwidth)
+                tbMenuBarByteRateText(gigabitsPerSecond: bandwidth) +
+                "\n" +
+                TBDisplaySenderL10n.connectedSince(
+                    session.connectionStartedClockText,
+                    language: service.language
+                )
             button.cell?.usesSingleLineMode = false
             button.cell?.lineBreakMode = .byClipping
             button.imagePosition = .imageLeading
@@ -235,7 +240,15 @@ final class TBDisplaySenderStatusItemController: NSObject {
         }
 
         for session in service.sessions {
-            let line = "\(service.sessionTitle(for: session)): \(session.statusText)"
+            let connectedSince = session.isConnected
+                ? " · " + TBDisplaySenderL10n.connectedSince(
+                    session.connectionStartedClockText,
+                    language: service.language
+                )
+                : ""
+            let line =
+                "\(service.sessionTitle(for: session)): " +
+                "\(session.statusText)\(connectedSince)"
             let sessionItem = NSMenuItem(title: line, action: nil, keyEquivalent: "")
             sessionItem.isEnabled = false
             menu.addItem(sessionItem)

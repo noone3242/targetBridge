@@ -131,6 +131,33 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
         )
     }
 
+    func testConnectionStartTimeFormattingIsStable() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let date = try XCTUnwrap(
+            calendar.date(
+                from: DateComponents(
+                    year: 2026,
+                    month: 10,
+                    day: 4,
+                    hour: 13,
+                    minute: 46,
+                    second: 52
+                )
+            )
+        )
+        XCTAssertEqual(
+            tbConnectionStartedTimestamp(date, calendar: calendar),
+            "2026-10-04 13:46:52"
+        )
+        XCTAssertEqual(
+            tbConnectionStartedClockTime(date, calendar: calendar),
+            "13:46:52"
+        )
+        XCTAssertEqual(tbConnectionStartedTimestamp(nil), "—")
+        XCTAssertEqual(tbConnectionStartedClockTime(nil), "—")
+    }
+
     func testMenuBarBandwidthUsesAdaptiveByteUnitsWithoutDecimals() {
         XCTAssertEqual(
             tbMenuBarByteRateText(gigabitsPerSecond: 0),

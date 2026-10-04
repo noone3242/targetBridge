@@ -32,6 +32,8 @@
   "sender.label.sender_fps": "发送端 FPS",
   "sender.label.capture": "捕获",
   "sender.label.state": "状态",
+  "sender.label.connection_started": "连接开始时间",
+  "sender.menu.connected_since": "连接于 {time}",
   "sender.option.manual_entry": "手动输入",
   "sender.option.not_detected": "未检测到",
   "sender.group.stream_profile": "码流配置",

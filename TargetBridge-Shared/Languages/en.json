@@ -32,6 +32,8 @@
   "sender.label.sender_fps": "Sender FPS",
   "sender.label.capture": "Capture",
   "sender.label.state": "State",
+  "sender.label.connection_started": "Connection started",
+  "sender.menu.connected_since": "Since {time}",
   "sender.option.manual_entry": "Manual entry",
   "sender.option.not_detected": "Not detected",
   "sender.group.stream_profile": "Stream profile",
