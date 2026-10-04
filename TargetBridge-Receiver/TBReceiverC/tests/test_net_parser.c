@@ -14,6 +14,7 @@
 #include "../src/nv12_tile_runs.h"
 #include "../src/idle_policy.h"
 #include "../src/receiver_diagnostics.h"
+#include "../src/receiver_heartbeat.h"
 #include "../src/window_policy.h"
 
 #include <compression.h>
@@ -1042,6 +1043,11 @@ static void test_receiver_diagnostics_policy(void) {
               "metrics_send_error") == 0,
           "metrics send error close reason is stable");
     CHECK(strcmp(
+              tb_receiver_close_reason_name(
+                  TB_RECEIVER_CLOSE_HEARTBEAT_ACK_ERROR),
+              "heartbeat_ack_error") == 0,
+          "heartbeat ACK error close reason is stable");
+    CHECK(strcmp(
               tb_receiver_close_reason_name(TB_RECEIVER_CLOSE_LOCAL_QUIT),
               "local_quit") == 0,
           "local quit close reason is stable");
@@ -1050,6 +1056,113 @@ static void test_receiver_diagnostics_policy(void) {
                   TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN),
               "signal_shutdown") == 0,
           "signal shutdown close reason is stable");
+}
+
+static void test_receiver_heartbeat_ack(void) {
+    const uint8_t current_request[] =
+        "{\"sequence\":42,\"senderTimestampMs\":123456789}";
+    struct tb_heartbeat_request request;
+    CHECK(tb_heartbeat_parse_request(
+              current_request,
+              sizeof(current_request) - 1u,
+              &request) == 0,
+          "current heartbeat request parses");
+    CHECK(request.sequence == 42,
+          "heartbeat sequence is preserved");
+    CHECK(request.has_sender_timestamp == 1,
+          "current heartbeat captures sender timestamp");
+    CHECK(request.sender_timestamp_ms == 123456789,
+          "sender timestamp is preserved");
+
+    char acknowledgment[512];
+    const int acknowledgment_length = tb_heartbeat_build_ack(
+        acknowledgment,
+        sizeof(acknowledgment),
+        &request,
+        123456790,
+        "commit-pid-startup",
+        7,
+        9912);
+    CHECK(acknowledgment_length > 0,
+          "heartbeat acknowledgment builds");
+    CHECK(strstr(acknowledgment, "\"sequence\":42") != NULL,
+          "heartbeat acknowledgment echoes sequence");
+    CHECK(strstr(acknowledgment, "\"ack\":true") != NULL,
+          "heartbeat acknowledgment is marked as an ACK");
+    CHECK(strstr(
+              acknowledgment,
+              "\"senderTimestampMs\":123456789") != NULL,
+          "heartbeat acknowledgment echoes sender timestamp");
+    CHECK(strstr(
+              acknowledgment,
+              "\"receiverTimestampMs\":123456790") != NULL,
+          "heartbeat acknowledgment includes receiver timestamp");
+    CHECK(strstr(
+              acknowledgment,
+              "\"processInstanceID\":\"commit-pid-startup\"") != NULL,
+          "heartbeat acknowledgment includes process identity");
+    CHECK(strstr(acknowledgment, "\"eventLoopLagMs\":7") != NULL,
+          "heartbeat acknowledgment includes event-loop lag");
+    CHECK(strstr(acknowledgment, "\"appliedSequence\":9912") != NULL,
+          "heartbeat acknowledgment includes applied sequence");
+    uint8_t packet[1024];
+    const int packet_length = tb_heartbeat_build_ack_packet(
+        packet,
+        sizeof(packet),
+        &request,
+        123456790,
+        "commit-pid-startup",
+        7,
+        9912);
+    CHECK(packet_length == acknowledgment_length + 5,
+          "framed heartbeat acknowledgment has expected length");
+    CHECK(packet[0] == 0 && packet[1] == 0,
+          "heartbeat acknowledgment uses big-endian frame length");
+    CHECK(
+        (((uint32_t)packet[0] << 24) |
+         ((uint32_t)packet[1] << 16) |
+         ((uint32_t)packet[2] << 8) |
+         (uint32_t)packet[3]) == (uint32_t)(1 + acknowledgment_length),
+        "heartbeat acknowledgment frame length includes packet type");
+    CHECK(packet[4] == TB_PKT_HEARTBEAT,
+          "heartbeat acknowledgment reuses packet type 0x30");
+    CHECK(memcmp(packet + 5, acknowledgment, (size_t)acknowledgment_length) == 0,
+          "framed heartbeat acknowledgment preserves JSON payload");
+
+    const uint8_t legacy_request[] = "{\"sequence\":9}";
+    CHECK(tb_heartbeat_parse_request(
+              legacy_request,
+              sizeof(legacy_request) - 1u,
+              &request) == 0,
+          "legacy heartbeat request parses");
+    CHECK(request.sequence == 9 && request.has_sender_timestamp == 0,
+          "legacy heartbeat remains compatible");
+    CHECK(tb_heartbeat_build_ack(
+              acknowledgment,
+              sizeof(acknowledgment),
+              &request,
+              500,
+              "instance",
+              0,
+              0) > 0,
+          "legacy heartbeat receives a compatible acknowledgment");
+    CHECK(strstr(acknowledgment, "senderTimestampMs") == NULL,
+          "legacy acknowledgment does not invent a sender timestamp");
+
+    const uint8_t malformed_request[] = "{\"senderTimestampMs\":123}";
+    CHECK(tb_heartbeat_parse_request(
+              malformed_request,
+              sizeof(malformed_request) - 1u,
+              &request) == -1,
+          "heartbeat without sequence is rejected");
+
+    const uint8_t overflow_request[] =
+        "{\"sequence\":18446744073709551616}";
+    CHECK(tb_heartbeat_parse_request(
+              overflow_request,
+              sizeof(overflow_request) - 1u,
+              &request) == -1,
+          "overflowing heartbeat sequence is rejected");
 }
 
 static int read_text_file(
@@ -1206,6 +1319,7 @@ int main(void) {
     test_window_close_quit_policy();
     test_receiver_idle_policy();
     test_receiver_diagnostics_policy();
+    test_receiver_heartbeat_ack();
     test_receiver_persistent_diagnostics();
 
     if (g_failures == 0) {

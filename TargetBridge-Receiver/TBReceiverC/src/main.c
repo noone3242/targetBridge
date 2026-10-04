@@ -21,6 +21,7 @@
 #include "nv12_tile_runs.h"
 #include "idle_policy.h"
 #include "receiver_diagnostics.h"
+#include "receiver_heartbeat.h"
 #include "decoder.h"
 #include "display.h"
 #include "proto.h"
@@ -149,8 +150,11 @@ struct app {
     uint64_t last_packet_ms;
     uint64_t last_heartbeat_sequence;
     uint64_t last_persistent_metrics_ms;
+    uint64_t last_loop_ms;
+    uint64_t max_loop_lag_ms;
     uint8_t  last_packet_type;
     int      last_heartbeat_sequence_valid;
+    int      heartbeat_ack_send_error;
     int      clock_error_logged;
     int      debug_enabled;
     int      close_requested;
@@ -2157,16 +2161,70 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_HEARTBEAT:
         {
-            int sequence = 0;
-            if (extract_json_int_field(
+            struct tb_heartbeat_request request;
+            if (tb_heartbeat_parse_request(
                     payload,
                     len,
-                    "\"sequence\"",
-                    &sequence) == 1 &&
-                sequence >= 0) {
-                a->last_heartbeat_sequence = (uint64_t)sequence;
-                a->last_heartbeat_sequence_valid = 1;
+                    &request) != 0) {
+                tb_receiver_diagnostics_log(
+                    &a->diagnostics,
+                    a->last_packet_ms,
+                    "heartbeat_malformed",
+                    NULL);
+                break;
             }
+            a->last_heartbeat_sequence = request.sequence;
+            a->last_heartbeat_sequence_valid = 1;
+
+            const uint64_t receiver_timestamp_ms = now_ms();
+            uint8_t packet[1024];
+            const int packet_length = tb_heartbeat_build_ack_packet(
+                packet,
+                sizeof(packet),
+                &request,
+                receiver_timestamp_ms,
+                a->diagnostics.process_instance_id,
+                a->max_loop_lag_ms,
+                a->bc7_applied_sequence);
+            if (packet_length <= 0) {
+                a->heartbeat_ack_send_error = EMSGSIZE;
+                break;
+            }
+            if (send_all(
+                    a->client_fd,
+                    packet,
+                    (size_t)packet_length) != 0) {
+                a->heartbeat_ack_send_error =
+                    errno != 0 ? errno : EIO;
+                char fields[192];
+                snprintf(
+                    fields,
+                    sizeof(fields),
+                    "\"sequence\":%llu,\"errno\":%d",
+                    (unsigned long long)request.sequence,
+                    a->heartbeat_ack_send_error);
+                tb_receiver_diagnostics_log(
+                    &a->diagnostics,
+                    receiver_timestamp_ms,
+                    "heartbeat_ack_error",
+                    fields);
+                break;
+            }
+            char fields[320];
+            snprintf(
+                fields,
+                sizeof(fields),
+                "\"sequence\":%llu,\"eventLoopLagMs\":%llu,"
+                "\"appliedSequence\":%llu",
+                (unsigned long long)request.sequence,
+                (unsigned long long)a->max_loop_lag_ms,
+                (unsigned long long)a->bc7_applied_sequence);
+            tb_receiver_diagnostics_log(
+                &a->diagnostics,
+                receiver_timestamp_ms,
+                "heartbeat_ack_sent",
+                fields);
+            a->max_loop_lag_ms = 0;
         }
         break;
     case TB_PKT_TEST_DATA:
@@ -2687,6 +2745,7 @@ static void send_receiver_info(struct app *a) {
         "\"receiverVersion\":\"%s\",\"receiverBuild\":\"%s\",\"receiverCommit\":\"%s\","
         "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,"
         "\"supportsRawNV12LZ4\":true,\"supportsRawNV12TileRuns\":true,"
+        "\"supportsHeartbeatAck\":true,"
         "\"supportsBC7Mode6\":%s,"
         "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
         "\"supportsBC7LZ4\":%s,"
@@ -2957,6 +3016,7 @@ static void close_client(
     a->client_fd = -1;
     a->session_active = 0;
     a->close_requested = 0;
+    a->heartbeat_ack_send_error = 0;
     a->have_video_frame = 0;
     a->bc7_render_ack_sent = 0;
     a->bc7_render_generation = 0;
@@ -3058,7 +3118,8 @@ int main(int argc, char **argv) {
             "\"metalDevice\":\"%s\",\"supportsBC7Mode6\":%s,"
             "\"supportsBC7TileDelta\":%s,\"supportsBC7LZFSE\":%s,"
             "\"supportsBC7LZ4\":%s,\"supportsRawNV12\":true,"
-            "\"supportsRawNV12LZ4\":true,\"supportsRawNV12TileRuns\":true}\n",
+            "\"supportsRawNV12LZ4\":true,\"supportsRawNV12TileRuns\":true,"
+            "\"supportsHeartbeatAck\":true}\n",
             TB_RECEIVER_VERSION,
             TB_RECEIVER_BUILD,
             TB_RECEIVER_COMMIT,
@@ -3242,6 +3303,13 @@ int main(int argc, char **argv) {
         }
 
         uint64_t t = now_ms();
+        if (a.last_loop_ms != 0 && t >= a.last_loop_ms) {
+            const uint64_t loop_lag_ms = t - a.last_loop_ms;
+            if (loop_lag_ms > a.max_loop_lag_ms) {
+                a.max_loop_lag_ms = loop_lag_ms;
+            }
+        }
+        a.last_loop_ms = t;
         if (g_monotonic_clock_errno != 0) {
             if (!a.clock_error_logged) {
                 char fields[128];
@@ -3344,6 +3412,9 @@ int main(int argc, char **argv) {
                 a.last_packet_type = 0;
                 a.last_heartbeat_sequence = 0;
                 a.last_heartbeat_sequence_valid = 0;
+                a.heartbeat_ack_send_error = 0;
+                a.last_loop_ms = t;
+                a.max_loop_lag_ms = 0;
                 a.last_persistent_metrics_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
@@ -3369,7 +3440,19 @@ int main(int argc, char **argv) {
         } else {
             int drain_error = 0;
             int drain_result = drain_socket(&a, &drain_error);
-            if (drain_result == TB_DRAIN_PEER_FIN) {
+            if (a.heartbeat_ack_send_error != 0) {
+                const int ack_error = a.heartbeat_ack_send_error;
+                a.heartbeat_ack_send_error = 0;
+                const uint64_t close_time_ms = now_ms();
+                close_client(
+                    &a,
+                    TB_RECEIVER_CLOSE_HEARTBEAT_ACK_ERROR,
+                    ack_error,
+                    close_time_ms,
+                    close_time_ms >= a.last_recv_ms
+                        ? close_time_ms - a.last_recv_ms
+                        : 0);
+            } else if (drain_result == TB_DRAIN_PEER_FIN) {
                 close_client(
                     &a,
                     TB_RECEIVER_CLOSE_PEER_FIN,

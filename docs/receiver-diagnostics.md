@@ -25,6 +25,7 @@ The Receiver records:
 
 - `process_start`, `process_exit`, and `unclean_previous_run`
 - `session_start` and `session_close`
+- `heartbeat_ack_sent`, `heartbeat_ack_error`, and `heartbeat_malformed`
 - a bounded `metrics` sample every 10 seconds
 - `clock_error`, `clock_regression`, and `run_state_write_error`
 
@@ -37,6 +38,7 @@ parser_error
 sender_teardown
 idle_timeout
 metrics_send_error
+heartbeat_ack_error
 local_quit
 signal_shutdown
 ```
@@ -44,6 +46,11 @@ signal_shutdown
 Each close event includes the numeric error, socket error, TCP state,
 monotonic receive timestamps, idle duration, last packet type and age, last
 heartbeat sequence, transport, and frame/protocol counters.
+
+Current Receivers advertise `supportsHeartbeatAck`. They reply to each
+`0x30` heartbeat with the original sequence, sender timestamp, process
+instance ID, event-loop lag, and latest applied frame sequence. A compatible
+Sender only enables its liveness timeout when that capability is present.
 
 ## Reading the latest evidence
 

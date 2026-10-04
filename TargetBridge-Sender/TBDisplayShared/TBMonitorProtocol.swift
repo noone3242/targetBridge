@@ -53,6 +53,7 @@ struct TBMonitorDisplayProfile: Codable {
     var supportsRawNV12: Bool?
     var supportsRawNV12LZ4: Bool?
     var supportsRawNV12TileRuns: Bool?
+    var supportsHeartbeatAck: Bool?
     var supportsBC7Mode6: Bool?
     var supportsBC7TileDelta: Bool?
     var supportsBC7LZFSE: Bool?
@@ -128,8 +129,71 @@ struct TBMonitorUILanguageUpdate: Codable {
     var uiLanguage: String
 }
 
-struct TBMonitorHeartbeat: Codable {
+struct TBMonitorHeartbeat: Codable, Equatable {
     var sequence: UInt64
+    var senderTimestampMs: UInt64? = nil
+    var ack: Bool? = nil
+    var receiverTimestampMs: UInt64? = nil
+    var processInstanceID: String? = nil
+    var eventLoopLagMs: UInt64? = nil
+    var appliedSequence: UInt64? = nil
+}
+
+struct TBHeartbeatLivenessEvaluation: Equatable {
+    var shouldTimeout: Bool
+    var missedAcknowledgments: UInt64
+    var receiverSilenceNanoseconds: UInt64
+}
+
+func tbHeartbeatLivenessEvaluation(
+    supportsHeartbeatAck: Bool,
+    isConnected: Bool,
+    nowNanoseconds: UInt64,
+    lastReceiverActivityNanoseconds: UInt64?,
+    lastHeartbeatSentSequence: UInt64,
+    lastHeartbeatAcknowledgedSequence: UInt64,
+    requiredMisses: UInt64 = 3,
+    silenceTimeoutNanoseconds: UInt64 = 6_000_000_000
+) -> TBHeartbeatLivenessEvaluation {
+    let missedAcknowledgments =
+        lastHeartbeatSentSequence >= lastHeartbeatAcknowledgedSequence
+            ? lastHeartbeatSentSequence - lastHeartbeatAcknowledgedSequence
+            : 0
+    guard supportsHeartbeatAck,
+          isConnected,
+          let lastReceiverActivityNanoseconds,
+          nowNanoseconds >= lastReceiverActivityNanoseconds
+    else {
+        return TBHeartbeatLivenessEvaluation(
+            shouldTimeout: false,
+            missedAcknowledgments: missedAcknowledgments,
+            receiverSilenceNanoseconds: 0
+        )
+    }
+    let silence = nowNanoseconds - lastReceiverActivityNanoseconds
+    return TBHeartbeatLivenessEvaluation(
+        shouldTimeout:
+            missedAcknowledgments >= requiredMisses &&
+            silence >= silenceTimeoutNanoseconds,
+        missedAcknowledgments: missedAcknowledgments,
+        receiverSilenceNanoseconds: silence
+    )
+}
+
+func tbShouldAcceptHeartbeatAck(
+    sequence: UInt64,
+    lastAcceptedSequence: UInt64,
+    lastSentSequence: UInt64
+) -> Bool {
+    sequence > lastAcceptedSequence && sequence <= lastSentSequence
+}
+
+func tbShouldStopAfterHeartbeatSend(
+    hasError: Bool,
+    isCurrentConnection: Bool,
+    isConnected: Bool
+) -> Bool {
+    hasError && isCurrentConnection && isConnected
 }
 
 struct TBMonitorTeardown: Codable {

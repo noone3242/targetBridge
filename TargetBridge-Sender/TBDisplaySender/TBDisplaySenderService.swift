@@ -3366,6 +3366,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var lastReceiverMetrics: TBMonitorReceiverMetrics?
     private var fpsTimer: Timer?
     private var heartbeatTimer: Timer?
+    private var heartbeatLivenessTimer: Timer?
     private var firstFrameTimer: Timer?
     private var cursorTimer: Timer?
     private var connectTimeoutWorkItem: DispatchWorkItem?
@@ -3377,6 +3378,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// out so the real reason is not lost.
     private var lastConnectionStateDetail: String?
     private var heartbeatSequence: UInt64 = 0
+    private var lastReceiverActivityNanoseconds: UInt64?
+    private var lastHeartbeatSentNanoseconds: UInt64?
+    private var lastHeartbeatAckNanoseconds: UInt64?
+    private var lastHeartbeatAckSequence: UInt64 = 0
+    private var receiverProcessInstanceID: String?
+    private var receiverEventLoopLagMs: UInt64?
+    private var receiverAppliedSequence: UInt64?
+    private var receiverHeartbeatRTTMs: UInt64?
     private var statusState: TBDisplaySenderStatusState = .ready
     private var streamingActivity: NSObjectProtocol?
     private var lastCheckedCursor: NSCursor?
@@ -3646,6 +3655,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         connectTimeoutWorkItem = nil
         recvBuffer.removeAll(keepingCapacity: false)
         activeProfile = nil
+        resetHeartbeatLiveness()
         activeCodecType = nil
         activeCodecName = nil
         captureGeneration &+= 1
@@ -3696,6 +3706,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.connectTimeoutWorkItem?.cancel()
                     self.connectTimeoutWorkItem = nil
                     self.isConnected = true
+                    self.lastReceiverActivityNanoseconds =
+                        DispatchTime.now().uptimeNanoseconds
                     TBLog.connection.info("connect: ready — \(self.receiverIP, privacy: .public) via \(self.connectInterfaceName ?? "?", privacy: .public)")
                     self.recordSessionEvent("Connected: \(self.connectionPathText)")
                     self.setStatus(.waitingDisplayProfile)
@@ -3903,6 +3915,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         connectTimeoutWorkItem = nil
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
+        heartbeatLivenessTimer?.invalidate()
+        heartbeatLivenessTimer = nil
+        resetHeartbeatLiveness()
         firstFrameTimer?.invalidate()
         firstFrameTimer = nil
         cursorTimer?.invalidate()
@@ -4125,12 +4140,53 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func sendHeartbeat() {
-        heartbeatSequence += 1
+        guard let connection, isConnected else { return }
+        let nowNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let evaluation = tbHeartbeatLivenessEvaluation(
+            supportsHeartbeatAck: activeProfile?.supportsHeartbeatAck == true,
+            isConnected: isConnected,
+            nowNanoseconds: nowNanoseconds,
+            lastReceiverActivityNanoseconds: lastReceiverActivityNanoseconds,
+            lastHeartbeatSentSequence: heartbeatSequence,
+            lastHeartbeatAcknowledgedSequence: lastHeartbeatAckSequence
+        )
+
+        heartbeatSequence &+= 1
+        lastHeartbeatSentNanoseconds = nowNanoseconds
+        let senderTimestampMs = nowNanoseconds / 1_000_000
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .heartbeat,
-            value: TBMonitorHeartbeat(sequence: heartbeatSequence)
+            value: TBMonitorHeartbeat(
+                sequence: heartbeatSequence,
+                senderTimestampMs: senderTimestampMs
+            )
         ) else { return }
-        send(packet)
+        let sentSequence = heartbeatSequence
+        TBLog.connection.debug(
+            "heartbeat sent sequence=\(sentSequence, privacy: .public) missed=\(evaluation.missedAcknowledgments, privacy: .public)"
+        )
+        connection.send(
+            content: packet,
+            completion: .contentProcessed({ [weak self, weak connection] error in
+                Task { @MainActor [weak self, weak connection] in
+                    guard let self, let connection else { return }
+                    let isCurrentConnection = self.connection === connection
+                    guard tbShouldStopAfterHeartbeatSend(
+                        hasError: error != nil,
+                        isCurrentConnection: isCurrentConnection,
+                        isConnected: self.isConnected
+                    ), let error
+                    else { return }
+                    let message =
+                        "Receiver heartbeat send failed: " +
+                        error.localizedDescription
+                    TBLog.connection.error("\(message, privacy: .public)")
+                    self.recordSessionEvent(message)
+                    self.setStatus(.connectionClosed(message))
+                    self.stop(resetStatusTo: nil)
+                }
+            })
+        )
     }
 
     private func sendTeardown(reason: String) {
@@ -4180,6 +4236,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private func drainPacketsOrThrow() throws {
         while let (type, payload) = try TBMonitorProtocol.drainPacket(from: &recvBuffer) {
+            noteReceiverActivity()
             switch type {
             case .displayProfile:
                 handleDisplayProfile(payload)
@@ -4228,7 +4285,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     }
                 }
             case .heartbeat:
-                break
+                handleHeartbeatAcknowledgment(payload)
             case .teardown:
                 setStatus(.receiverTerminatedSession)
                 stop(resetStatusTo: nil)
@@ -4585,6 +4642,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         else { return }
 
         activeProfile = profile
+        if profile.supportsHeartbeatAck == true {
+            recordSessionEvent("Receiver heartbeat ACK capability enabled")
+        }
         let receiverIdentity = [
             profile.receiverVersion.map { "v\($0)" },
             profile.receiverBuild.map { "build \($0)" },
@@ -5527,6 +5587,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func handleSystemWake() {
+        grantHeartbeatLivenessGrace()
         guard autoRestartOnWake else { return }
         scheduleCaptureRestart(reason: "system wake", delaySeconds: 1.0)
     }
@@ -5830,6 +5891,40 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     "nv12RunCountP50": diagnostics.nv12RunCount.p50,
                     "nv12RunCountP95": diagnostics.nv12RunCount.p95
                 ]
+                let livenessNow = DispatchTime.now().uptimeNanoseconds
+                let liveness = tbHeartbeatLivenessEvaluation(
+                    supportsHeartbeatAck:
+                        activeProfile?.supportsHeartbeatAck == true,
+                    isConnected: isConnected,
+                    nowNanoseconds: livenessNow,
+                    lastReceiverActivityNanoseconds:
+                        lastReceiverActivityNanoseconds,
+                    lastHeartbeatSentSequence: heartbeatSequence,
+                    lastHeartbeatAcknowledgedSequence:
+                        lastHeartbeatAckSequence
+                )
+                let lastSentAgeMs = lastHeartbeatSentNanoseconds.map {
+                    livenessNow >= $0 ? (livenessNow - $0) / 1_000_000 : 0
+                } ?? 0
+                let lastAckAgeMs = lastHeartbeatAckNanoseconds.map {
+                    livenessNow >= $0 ? (livenessNow - $0) / 1_000_000 : 0
+                } ?? 0
+                metricsJSON["receiverLiveness"] = [
+                    "supportsHeartbeatAck":
+                        activeProfile?.supportsHeartbeatAck == true,
+                    "lastSentSequence": heartbeatSequence,
+                    "lastAckSequence": lastHeartbeatAckSequence,
+                    "missedAcks": liveness.missedAcknowledgments,
+                    "receiverSilenceMs":
+                        liveness.receiverSilenceNanoseconds / 1_000_000,
+                    "lastHeartbeatSentAgeMs": lastSentAgeMs,
+                    "lastHeartbeatAckAgeMs": lastAckAgeMs,
+                    "rttMs": receiverHeartbeatRTTMs ?? 0,
+                    "eventLoopLagMs": receiverEventLoopLagMs ?? 0,
+                    "appliedSequence": receiverAppliedSequence ?? 0,
+                    "processInstanceID":
+                        receiverProcessInstanceID ?? "unknown"
+                ]
                 if let receiver = lastReceiverMetrics {
                     metricsJSON["receiver"] = [
                         "applyFPS": receiver.fps,
@@ -5879,13 +5974,143 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
 
+    private func resetHeartbeatLiveness() {
+        heartbeatSequence = 0
+        lastReceiverActivityNanoseconds = nil
+        lastHeartbeatSentNanoseconds = nil
+        lastHeartbeatAckNanoseconds = nil
+        lastHeartbeatAckSequence = 0
+        receiverProcessInstanceID = nil
+        receiverEventLoopLagMs = nil
+        receiverAppliedSequence = nil
+        receiverHeartbeatRTTMs = nil
+    }
+
+    private func grantHeartbeatLivenessGrace() {
+        guard isConnected else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        lastReceiverActivityNanoseconds = now
+        lastHeartbeatAckSequence = heartbeatSequence
+        lastHeartbeatAckNanoseconds = now
+        TBLog.connection.info("heartbeat liveness reset after wake")
+    }
+
+    private func noteReceiverActivity() {
+        lastReceiverActivityNanoseconds =
+            DispatchTime.now().uptimeNanoseconds
+    }
+
+    private func handleHeartbeatAcknowledgment(_ payload: Data) {
+        guard let acknowledgment = TBMonitorProtocol.decodeJSON(
+            TBMonitorHeartbeat.self,
+            from: payload
+        ), acknowledgment.ack == true
+        else {
+            TBLog.connection.error(
+                "Receiver heartbeat ACK payload could not be decoded"
+            )
+            return
+        }
+        guard tbShouldAcceptHeartbeatAck(
+            sequence: acknowledgment.sequence,
+            lastAcceptedSequence: lastHeartbeatAckSequence,
+            lastSentSequence: heartbeatSequence
+        ) else {
+            let ackSequence = acknowledgment.sequence
+            let acceptedSequence = lastHeartbeatAckSequence
+            let sentSequence = heartbeatSequence
+            TBLog.connection.debug(
+                "ignored stale heartbeat ACK sequence=\(ackSequence, privacy: .public) accepted=\(acceptedSequence, privacy: .public) sent=\(sentSequence, privacy: .public)"
+            )
+            return
+        }
+
+        let nowNanoseconds = DispatchTime.now().uptimeNanoseconds
+        lastHeartbeatAckSequence = acknowledgment.sequence
+        lastHeartbeatAckNanoseconds = nowNanoseconds
+        receiverEventLoopLagMs = acknowledgment.eventLoopLagMs
+        receiverAppliedSequence = acknowledgment.appliedSequence
+        if let senderTimestampMs = acknowledgment.senderTimestampMs {
+            let nowMilliseconds = nowNanoseconds / 1_000_000
+            receiverHeartbeatRTTMs =
+                nowMilliseconds >= senderTimestampMs
+                    ? nowMilliseconds - senderTimestampMs
+                    : 0
+        }
+
+        if let processInstanceID = acknowledgment.processInstanceID {
+            if let previous = receiverProcessInstanceID,
+               previous != processInstanceID {
+                recordSessionEvent(
+                    "Receiver process restarted: \(previous) → " +
+                    processInstanceID
+                )
+            } else if receiverProcessInstanceID == nil {
+                recordSessionEvent(
+                    "Receiver process: \(processInstanceID)"
+                )
+            }
+            receiverProcessInstanceID = processInstanceID
+        }
+
+        let evaluation = tbHeartbeatLivenessEvaluation(
+            supportsHeartbeatAck: activeProfile?.supportsHeartbeatAck == true,
+            isConnected: isConnected,
+            nowNanoseconds: nowNanoseconds,
+            lastReceiverActivityNanoseconds: lastReceiverActivityNanoseconds,
+            lastHeartbeatSentSequence: heartbeatSequence,
+            lastHeartbeatAcknowledgedSequence: lastHeartbeatAckSequence
+        )
+        let ackSequence = acknowledgment.sequence
+        let rttMs = receiverHeartbeatRTTMs ?? 0
+        let loopLagMs = receiverEventLoopLagMs ?? 0
+        let appliedSequence = receiverAppliedSequence ?? 0
+        let missedAcknowledgments = evaluation.missedAcknowledgments
+        TBLog.connection.debug(
+            "heartbeat ACK sequence=\(ackSequence, privacy: .public) rttMs=\(rttMs, privacy: .public) loopLagMs=\(loopLagMs, privacy: .public) appliedSequence=\(appliedSequence, privacy: .public) missed=\(missedAcknowledgments, privacy: .public)"
+        )
+    }
+
     private func startHeartbeat() {
         heartbeatTimer?.invalidate()
+        heartbeatLivenessTimer?.invalidate()
+        sendHeartbeat()
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.sendHeartbeat()
             }
         }
+        heartbeatLivenessTimer = Timer.scheduledTimer(
+            withTimeInterval: 1,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkHeartbeatLiveness()
+            }
+        }
+    }
+
+    private func checkHeartbeatLiveness() {
+        guard connection != nil, isConnected else { return }
+        let evaluation = tbHeartbeatLivenessEvaluation(
+            supportsHeartbeatAck: activeProfile?.supportsHeartbeatAck == true,
+            isConnected: isConnected,
+            nowNanoseconds: DispatchTime.now().uptimeNanoseconds,
+            lastReceiverActivityNanoseconds: lastReceiverActivityNanoseconds,
+            lastHeartbeatSentSequence: heartbeatSequence,
+            lastHeartbeatAcknowledgedSequence: lastHeartbeatAckSequence
+        )
+        guard evaluation.shouldTimeout else { return }
+        let silenceMilliseconds =
+            evaluation.receiverSilenceNanoseconds / 1_000_000
+        let message =
+            "Receiver heartbeat timeout: " +
+            "\(evaluation.missedAcknowledgments) ACKs missed, " +
+            "\(silenceMilliseconds) ms silent"
+        TBLog.connection.error("\(message, privacy: .public)")
+        recordSessionEvent(message)
+        setStatus(.connectionClosed(message))
+        stop(resetStatusTo: nil)
     }
 
     private func startFirstFrameWatchdog() {

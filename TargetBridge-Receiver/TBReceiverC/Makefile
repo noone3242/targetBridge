@@ -35,7 +35,7 @@ ifeq ($(UNAME_S),Darwin)
 LDFLAGS  += -lcompression -framework ApplicationServices -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework CoreServices -framework CoreAudio -framework Metal -framework QuartzCore
 endif
 
-C_SRC = src/main.c src/net.c src/receiver_diagnostics.c src/bc7_frame.c src/bc7_delta.c src/bc7_supercompression.c src/bc7_cursor.c src/nv12_tile_runs.c src/decoder.c src/display.c src/tb_i18n.c
+C_SRC = src/main.c src/net.c src/receiver_diagnostics.c src/receiver_heartbeat.c src/bc7_frame.c src/bc7_delta.c src/bc7_supercompression.c src/bc7_cursor.c src/nv12_tile_runs.c src/decoder.c src/display.c src/tb_i18n.c
 OBJC_SRC = src/tb_gesture_bridge.m
 OBJCXX_SRC = src/bc7_renderer.mm
 OBJ = $(C_SRC:.c=.o) $(OBJC_SRC:.m=.o) $(OBJCXX_SRC:.mm=.o)
@@ -64,8 +64,8 @@ clean:
 TEST_CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
 TEST_BIN = test_net_parser
 
-$(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h src/receiver_diagnostics.h src/bc7_frame.c src/bc7_frame.h src/bc7_delta.c src/bc7_delta.h src/bc7_supercompression.c src/bc7_supercompression.h src/bc7_cursor.c src/bc7_cursor.h src/nv12_tile_runs.c src/nv12_tile_runs.h src/idle_policy.h src/window_policy.h
-	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c src/receiver_diagnostics.c src/bc7_frame.c src/bc7_delta.c src/bc7_supercompression.c src/bc7_cursor.c src/nv12_tile_runs.c -lcompression -o $@
+$(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h src/receiver_diagnostics.h src/receiver_heartbeat.c src/receiver_heartbeat.h src/bc7_frame.c src/bc7_frame.h src/bc7_delta.c src/bc7_delta.h src/bc7_supercompression.c src/bc7_supercompression.h src/bc7_cursor.c src/bc7_cursor.h src/nv12_tile_runs.c src/nv12_tile_runs.h src/idle_policy.h src/window_policy.h
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c src/receiver_diagnostics.c src/receiver_heartbeat.c src/bc7_frame.c src/bc7_delta.c src/bc7_supercompression.c src/bc7_cursor.c src/nv12_tile_runs.c -lcompression -o $@
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)

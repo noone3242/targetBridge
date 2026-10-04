@@ -14,6 +14,7 @@ enum tb_receiver_close_reason {
     TB_RECEIVER_CLOSE_SENDER_TEARDOWN,
     TB_RECEIVER_CLOSE_IDLE_TIMEOUT,
     TB_RECEIVER_CLOSE_METRICS_SEND_ERROR,
+    TB_RECEIVER_CLOSE_HEARTBEAT_ACK_ERROR,
     TB_RECEIVER_CLOSE_LOCAL_QUIT,
     TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN
 };
@@ -39,6 +40,8 @@ static inline const char *tb_receiver_close_reason_name(
         return "idle_timeout";
     case TB_RECEIVER_CLOSE_METRICS_SEND_ERROR:
         return "metrics_send_error";
+    case TB_RECEIVER_CLOSE_HEARTBEAT_ACK_ERROR:
+        return "heartbeat_ack_error";
     case TB_RECEIVER_CLOSE_LOCAL_QUIT:
         return "local_quit";
     case TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN:

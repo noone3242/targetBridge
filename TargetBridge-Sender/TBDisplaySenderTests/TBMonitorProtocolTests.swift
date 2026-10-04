@@ -144,6 +144,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertNil(profile.supportsRawNV12)
         XCTAssertNil(profile.supportsRawNV12LZ4)
         XCTAssertNil(profile.supportsRawNV12TileRuns)
+        XCTAssertNil(profile.supportsHeartbeatAck)
         XCTAssertNil(profile.supportsBC7Mode6)
         XCTAssertNil(profile.supportsBC7TileDelta)
         XCTAssertNil(profile.supportsBC7LZFSE)
@@ -167,6 +168,7 @@ final class TBMonitorProtocolTests: XCTestCase {
           "supportsBC7LZ4": true,
           "supportsRawNV12LZ4": true,
           "supportsRawNV12TileRuns": true,
+          "supportsHeartbeatAck": true,
           "receiverVersion": "4.0.1",
           "receiverBuild": "dev-20260926163000",
           "receiverCommit": "9b6b092abcde"
@@ -178,6 +180,7 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(current.supportsBC7LZ4, true)
         XCTAssertEqual(current.supportsRawNV12LZ4, true)
         XCTAssertEqual(current.supportsRawNV12TileRuns, true)
+        XCTAssertEqual(current.supportsHeartbeatAck, true)
         XCTAssertEqual(current.receiverBuild, "dev-20260926163000")
         XCTAssertEqual(current.receiverCommit, "9b6b092abcde")
 
@@ -1725,7 +1728,10 @@ final class TBMonitorProtocolTests: XCTestCase {
     // MARK: - JSON payloads
 
     func testJSONPacketRoundTrip() throws {
-        let heartbeat = TBMonitorHeartbeat(sequence: 42)
+        let heartbeat = TBMonitorHeartbeat(
+            sequence: 42,
+            senderTimestampMs: 123456789
+        )
         guard var buffer = TBMonitorProtocol.makeJSONPacket(type: .heartbeat, value: heartbeat) else {
             XCTFail("encode failed"); return
         }
@@ -1733,7 +1739,142 @@ final class TBMonitorProtocolTests: XCTestCase {
             XCTFail("drain failed"); return
         }
         XCTAssertEqual(type, .heartbeat)
-        XCTAssertEqual(TBMonitorProtocol.decodeJSON(TBMonitorHeartbeat.self, from: payload)?.sequence, 42)
+        let decoded = TBMonitorProtocol.decodeJSON(
+            TBMonitorHeartbeat.self,
+            from: payload
+        )
+        XCTAssertEqual(decoded?.sequence, 42)
+        XCTAssertEqual(decoded?.senderTimestampMs, 123456789)
+        XCTAssertNil(decoded?.ack)
+    }
+
+    func testHeartbeatAckPayloadRoundTrip() throws {
+        let acknowledgment = TBMonitorHeartbeat(
+            sequence: 42,
+            senderTimestampMs: 123456789,
+            ack: true,
+            receiverTimestampMs: 123456790,
+            processInstanceID: "commit-pid-startup",
+            eventLoopLagMs: 7,
+            appliedSequence: 9912
+        )
+        let payload = try JSONEncoder().encode(acknowledgment)
+        let decoded = try JSONDecoder().decode(
+            TBMonitorHeartbeat.self,
+            from: payload
+        )
+        XCTAssertEqual(decoded, acknowledgment)
+    }
+
+    func testHeartbeatLivenessRequiresCapabilityMissesAndSilence() {
+        XCTAssertFalse(
+            tbHeartbeatLivenessEvaluation(
+                supportsHeartbeatAck: false,
+                isConnected: true,
+                nowNanoseconds: 8_000_000_000,
+                lastReceiverActivityNanoseconds: 0,
+                lastHeartbeatSentSequence: 4,
+                lastHeartbeatAcknowledgedSequence: 0
+            ).shouldTimeout,
+            "older Receiver profiles must never enable ACK timeout"
+        )
+        XCTAssertFalse(
+            tbHeartbeatLivenessEvaluation(
+                supportsHeartbeatAck: true,
+                isConnected: true,
+                nowNanoseconds: 8_000_000_000,
+                lastReceiverActivityNanoseconds: 1_000_000_000,
+                lastHeartbeatSentSequence: 2,
+                lastHeartbeatAcknowledgedSequence: 0
+            ).shouldTimeout,
+            "two missed heartbeats are below the threshold"
+        )
+        XCTAssertFalse(
+            tbHeartbeatLivenessEvaluation(
+                supportsHeartbeatAck: true,
+                isConnected: true,
+                nowNanoseconds: 8_000_000_000,
+                lastReceiverActivityNanoseconds: 7_500_000_000,
+                lastHeartbeatSentSequence: 10,
+                lastHeartbeatAcknowledgedSequence: 1
+            ).shouldTimeout,
+            "fresh Receiver metrics suppress timeout despite missed ACKs"
+        )
+        let timedOut = tbHeartbeatLivenessEvaluation(
+            supportsHeartbeatAck: true,
+            isConnected: true,
+            nowNanoseconds: 8_000_000_000,
+            lastReceiverActivityNanoseconds: 2_000_000_000,
+            lastHeartbeatSentSequence: 6,
+            lastHeartbeatAcknowledgedSequence: 3
+        )
+        XCTAssertTrue(timedOut.shouldTimeout)
+        XCTAssertEqual(timedOut.missedAcknowledgments, 3)
+        XCTAssertEqual(
+            timedOut.receiverSilenceNanoseconds,
+            6_000_000_000
+        )
+        XCTAssertFalse(
+            tbHeartbeatLivenessEvaluation(
+                supportsHeartbeatAck: true,
+                isConnected: true,
+                nowNanoseconds: 999,
+                lastReceiverActivityNanoseconds: 1000,
+                lastHeartbeatSentSequence: 10,
+                lastHeartbeatAcknowledgedSequence: 0
+            ).shouldTimeout,
+            "monotonic regression cannot become a false timeout"
+        )
+    }
+
+    func testHeartbeatAckSequenceValidation() {
+        XCTAssertTrue(
+            tbShouldAcceptHeartbeatAck(
+                sequence: 3,
+                lastAcceptedSequence: 2,
+                lastSentSequence: 3
+            )
+        )
+        XCTAssertFalse(
+            tbShouldAcceptHeartbeatAck(
+                sequence: 2,
+                lastAcceptedSequence: 2,
+                lastSentSequence: 3
+            ),
+            "duplicate or stale ACKs cannot move state backward"
+        )
+        XCTAssertFalse(
+            tbShouldAcceptHeartbeatAck(
+                sequence: 4,
+                lastAcceptedSequence: 2,
+                lastSentSequence: 3
+            ),
+            "ACKs for unsent heartbeats are rejected"
+        )
+    }
+
+    func testHeartbeatSendFailureOnlyStopsCurrentConnectedSession() {
+        XCTAssertTrue(
+            tbShouldStopAfterHeartbeatSend(
+                hasError: true,
+                isCurrentConnection: true,
+                isConnected: true
+            )
+        )
+        XCTAssertFalse(
+            tbShouldStopAfterHeartbeatSend(
+                hasError: true,
+                isCurrentConnection: false,
+                isConnected: true
+            )
+        )
+        XCTAssertFalse(
+            tbShouldStopAfterHeartbeatSend(
+                hasError: false,
+                isCurrentConnection: true,
+                isConnected: true
+            )
+        )
     }
 
     // MARK: - Hand-rolled input-event encoder parity
