@@ -21,7 +21,9 @@ send 1.15 ms, about 13.4 ms in total. That leaves almost no headroom inside a
 - Always compress. Sending raw NV12 needs 4–10 Gbit/s at 60 Hz, which may
   trip traffic anomaly detection on managed machines.
 - At most two performance cores for the encode.
-- No Receiver change: it keeps decoding with Apple `COMPRESSION_LZ4`.
+- No Receiver change for the LZ4 work: it keeps decoding with Apple
+  `COMPRESSION_LZ4`. (Copy-rect, on the same branch, does change the
+  Receiver; see `2026-10-04-nv12-copy-rect-design.md`.)
 
 ## 3. Options considered
 
@@ -37,10 +39,9 @@ send 1.15 ms, about 13.4 ms in total. That leaves almost no headroom inside a
 ## 4. Stage 1: zero-copy packet writer (landed in `6faa0b1`)
 
 `TBNV12TileRunPacketWriter` allocates and prefaults its buffers once per
-resolution:
-- a raw staging area;
-- two packet slots (about 66 MB resident at 5K);
-- a reusable LZ4 scratch buffer.
+resolution: a raw staging area and two packet slots (about 22 MB each, so
+about 66 MB together at 5K). Since stage 3 the LZ4 state lives in the
+parallel encoder rather than in the writer.
 
 Dirty tiles are copied with `memcpy` into the staging area. The packet header,
 run table and LZ4 output are written in place into a free slot, which is
@@ -98,8 +99,9 @@ encoded in pieces:
 3. Concatenate the runs and append a single `bv4$`.
 
 The result is still one valid frame, so neither the wire format nor the
-Receiver changes. The chunk boundary adds at most one extra block boundary;
-its effect on the ratio is negligible.
+Receiver changes. Chunks are not aligned to the 1 MiB block size, so each of
+the N−1 chunk boundaries adds at most one short block; the effect on the
+ratio is negligible.
 
 ### Implementation
 
@@ -111,13 +113,15 @@ its effect on the ratio is negligible.
   `TBLZ4EncodeAppleFrame` is now built from them and still produces the same
   bytes as before.
 - `TBNV12ParallelLZ4Encoder` holds one liblz4 state per thread and N−1
-  prefaulted side buffers.
+  side buffers. The side buffers grow on demand to the largest chunk seen
+  (about 11 MB at 5K with two threads) and are prefaulted when they grow,
+  so only the first large frame pays for it.
   - Chunk 0 is written directly into the destination. The other chunks go to
     side buffers and are copied in after the join, so the extra copy only
     touches compressed bytes.
   - `DispatchQueue.concurrentPerform` runs one chunk on the calling thread.
-    The helper thread inherits the pipeline queue's QoS, so both stay on
-    P-cores.
+    The helper thread runs at the pipeline queue's QoS, which in practice
+    keeps both on P-cores (macOS cannot pin threads).
 - The serial path is used for:
   - inputs under 1 MiB;
   - a thread count of 1;
@@ -125,13 +129,16 @@ its effect on the ratio is negligible.
 
   It produces exactly the same bytes as the single-threaded encoder.
 - Thread count:
-  - 2 when `hw.perflevel0.physicalcpu` ≥ 4, otherwise 1;
-  - `TB_NV12_LZ4_THREADS=<n>` overrides it (1 disables the split);
+  - 2 when `hw.perflevel0.physicalcpu` ≥ 4, otherwise 1; if that sysctl
+    fails, the logical CPU count is used instead;
+  - `TB_NV12_LZ4_THREADS=<n>` overrides it (1 disables the split; 0 or an
+    invalid value is ignored);
   - never more than the number of P-cores.
 - Used by every raw NV12 packet that is compressed: full (format 2), region
   (format 3), tile runs (format 4) and copy rects (format 5).
-- The metrics field `nv12LZ4Encoder` reports the thread count, for example
-  `liblz4-a32-t2`.
+- The metrics field `nv12LZ4Encoder` reports the encoder:
+  `liblz4-a32-t2` when split across two threads, `liblz4-a32` on one
+  thread, `apple` for the Apple encoder and `off` without LZ4.
 
 ### Cost
 
@@ -144,6 +151,9 @@ using a second P-core only for the duration of the encode.
   - round trip through the Apple decoder;
   - N=1 output is byte-identical to the serial encoder;
   - small inputs take the serial path;
+  - incompressible input and a destination that is too small;
+  - full packets and the zero-copy writer round-trip with the parallel
+    encoder;
   - the thread-count policy;
   - the diagnostic name.
 - Earlier stages: the writer produces byte-identical packets to the old path

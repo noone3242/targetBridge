@@ -26,11 +26,14 @@ pixels. The Receiver moves the pixels it already has.
 - No capability negotiation. The Receiver is assumed to be the current
   version; `TB_NV12_COPY_RECT=0` on the Sender is the only switch.
 - Every Receiver error recovers through the existing keyframe request.
+- Copy-rect is only enabled when the Receiver advertises tile runs and LZ4,
+  which format 5 builds on.
 
 ## 3. Correctness invariant
 
-The Sender's tile detector keeps a committed baseline, which is the frame the
-Receiver is showing. Format 4 already relies on this.
+The Sender's tile detector keeps a committed baseline: the last frame whose
+packet was sent. Over a reliable, in-order connection this is the frame the
+Receiver ends up showing. Format 4 already relies on this.
 
 A copy is used only after the GPU has compared every pixel (Y and UV) of the
 tile with the baseline shifted by the vector. So for every copied tile:
@@ -69,15 +72,18 @@ The work runs on the GPU in two synchronous command buffers.
 
 ## 5. Packet selection
 
-`makeRawNV12CopyRectPacket` runs before the format 4 choice. It needs:
+`makeRawNV12CopyRectPacket` runs on the tile-run path, before the format 4
+choice. It needs:
 - copy-rect enabled;
+- a baseline on both the Sender and the detector;
 - the zero-copy writer;
 - at least 32 dirty tiles.
 
 It produces format 5 when:
 - copied tiles × 4 ≥ dirty tiles (at least a quarter of the dirty area is
   copied);
-- the remaining fresh tiles form at most 256 runs;
+- the remaining fresh tiles form at most 256 runs (copy runs are only
+  limited by the 4096-run packet maximum);
 - the zero-copy writer has a free slot.
 
 Otherwise the frame falls through to the existing choice: format 4 when under
@@ -128,29 +134,48 @@ Semantics: a copied tile at (x, y) takes the previous frame's pixels at
 fresh runs are written.
 
 The parser (`tb_nv12_copy_rect_parse`) rejects:
+- a width or height of 0, above 8192, or not a multiple of 64, and a tile
+  size other than 64;
 - odd or zero vectors;
+- zero copy runs, or more than 4096 copy or fresh runs;
+- a non-zero reserved field or an empty run;
 - runs that are out of row-major order or overlap;
 - copy sources outside the frame;
 - copy and fresh runs that overlap each other;
-- lengths that do not match.
+- lengths that do not match, lengths above 64 MiB, or an LZ4 stream without
+  the `bv4$` end marker.
 
 The Sender's test decoder (`TBNV12Compression.decodeCopyRectPacket`) enforces
-the same rules.
+the same ordering, overlap, source-bounds and length rules, but not the size
+caps or the end-marker check.
 
 ## 8. Receiver
 
 - **Shadow.** The Receiver keeps a CPU NV12 copy of the displayed frame, with
-  a tight stride equal to the width. Keyframes, region frames and format 4
-  frames write into it, so it always matches the screen.
+  a tight stride equal to the width. Full frames (formats 1 and 2) make it
+  valid; region (format 3) and tile-run (format 4) frames update it while it
+  is valid, so it always matches the screen. A format 5 frame without a
+  valid shadow requests a keyframe (`copy-rect-base`).
+- **Order.** The Receiver parses the packet, then decodes the fresh data and
+  checks its checksum. Only then does it touch the shadow: apply copies,
+  write fresh runs, upload, present. A parse, decode or checksum failure
+  leaves the shadow untouched; an upload or present failure invalidates it
+  through the keyframe request.
 - **Apply in place** (`tb_nv12_copy_rect_apply_copies`). The copies are
   applied with `memmove`, in an order chosen so that no source pixel is
   overwritten before it is read:
   - rows bottom-up when dy > 0, otherwise top-down;
   - within a row, right to left when dy == 0 and dx > 0.
 
-  When dy ≠ 0 a source row is never a destination row in the same pass. When
-  dy == 0, the row order inside each tile row makes `memmove` safe. Snapshot
-  semantics therefore hold without a second full-frame buffer.
+  Rows are visited starting from the edge the content moves towards. A row
+  may be both a source and a destination (with dy = 2, row 100 feeds row
+  102 and is itself overwritten from row 98), but the pass reaches it as a
+  source before it reaches it as a destination. The same holds for the UV
+  plane, whose rows shift by dy/2. When dy == 0, the runs of each pixel row
+  are visited right to left when dx > 0 (left to right otherwise), so no run
+  reads a run that was already written, and `memmove` handles the overlap
+  inside a run. Snapshot semantics therefore hold without a second full-frame
+  buffer.
 - **Fresh runs.** These are decoded with Apple LZ4, checked against the
   optional checksum, and written into the shadow.
 - **Upload.** `tb_nv12_copy_rect_dirty_rects` builds one span per tile row
@@ -170,13 +195,14 @@ Sender:
 |---|---|
 | `nv12CopyRectFrames` | Format 5 packets sent |
 | `nv12CopyRectTiles` | Tiles sent as copies |
-| `nv12CopyRectRejects` | Vector found but packet not built |
+| `nv12CopyRectRejects` | Vector covered enough tiles but the packet was not built (too many fresh runs, or no writer slot); too little coverage counts as a miss, not a reject |
 | `nv12CopyRectSkippedSearches` | Searches skipped by the backoff |
 | `nv12CopyRectSearchP50Ms`, `nv12CopyRectSearchP95Ms` | Search plus verify time |
 | `nv12CopyRectLastVector` | Last vector used |
 
 Receiver:
-- `rawCopyRectFrames` and `rawCopiedTiles`;
+- `rawCopyRectFrames` and `rawCopiedTiles`; format 5 frames also count in
+  `rawRegionFrames`, and their fresh runs in `rawTileRuns`;
 - the existing shadow commit timing;
 - keyframe reasons prefixed with `copy-rect-`.
 
@@ -202,8 +228,8 @@ Sender (`TBNV12CopyRectTests`):
 - the detector finds drag and scroll vectors and rejects unrelated or flat
   content;
 - verification is exact for any vector;
-- the search offsets are even, unique and cover the drag box and scroll
-  ranges;
+- the search offsets are even and unique, and include the corners of the
+  drag box and scroll ranges (spot checks, not the full count);
 - the writer round-trips through the test decoder, including copy-only
   frames, and rejects invalid copies;
 - the decoder rejects malformed packets;
