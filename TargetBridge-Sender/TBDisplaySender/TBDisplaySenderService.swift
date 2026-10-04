@@ -31,6 +31,78 @@ func tbShouldReleaseSessionOnNetworkWait(
     isConnected && transportKind == .thunderboltBridge
 }
 
+struct TBSessionCloseContext: Equatable, Sendable {
+    let reason: String
+    let category: String
+    let detail: String?
+    let notifyPeer: Bool
+
+    static let userStop = TBSessionCloseContext(
+        reason: "user_stop",
+        category: "user",
+        detail: "Stop requested by user",
+        notifyPeer: true
+    )
+
+    static let appQuit = TBSessionCloseContext(
+        reason: "app_quit",
+        category: "shutdown",
+        detail: "Sender application terminating",
+        notifyPeer: true
+    )
+
+    static let remoteSignal = TBSessionCloseContext(
+        reason: "remote_teardown",
+        category: "transport",
+        detail: "Receiver sent teardown",
+        notifyPeer: false
+    )
+
+    static func appError(_ reason: String, detail: String) -> Self {
+        TBSessionCloseContext(
+            reason: reason,
+            category: "app_error",
+            detail: detail,
+            notifyPeer: true
+        )
+    }
+
+    static func transport(
+        _ reason: String,
+        detail: String,
+        notifyPeer: Bool = false
+    ) -> Self {
+        TBSessionCloseContext(
+            reason: reason,
+            category: "transport",
+            detail: detail,
+            notifyPeer: notifyPeer
+        )
+    }
+
+    static func liveness(
+        _ reason: String,
+        detail: String,
+        notifyPeer: Bool = true
+    ) -> Self {
+        TBSessionCloseContext(
+            reason: reason,
+            category: "liveness",
+            detail: detail,
+            notifyPeer: notifyPeer
+        )
+    }
+
+    static func test(_ reason: String, detail: String) -> Self {
+        TBSessionCloseContext(
+            reason: reason,
+            category: "test",
+            detail: detail,
+            notifyPeer: true
+        )
+    }
+}
+
 struct TBSessionLogEntry: Identifiable, Equatable {
     let id: UUID
     let timestamp: String
@@ -3386,6 +3458,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var receiverEventLoopLagMs: UInt64?
     private var receiverAppliedSequence: UInt64?
     private var receiverHeartbeatRTTMs: UInt64?
+    private var connectionSessionID: String?
     private var statusState: TBDisplaySenderStatusState = .ready
     private var streamingActivity: NSObjectProtocol?
     private var lastCheckedCursor: NSCursor?
@@ -3655,7 +3728,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         connectTimeoutWorkItem = nil
         recvBuffer.removeAll(keepingCapacity: false)
         activeProfile = nil
+        connectionSessionID = UUID().uuidString
         resetHeartbeatLiveness()
+        TBSenderDiagnosticsLogger.shared.append(
+            event: "session_start",
+            fields: [
+                "sessionID": connectionSessionID ?? "",
+                "receiverIP": receiverIP,
+                "localInterfaceIP": localInterfaceIP,
+                "transport": transportKind.rawValue
+            ]
+        )
         activeCodecType = nil
         activeCodecName = nil
         captureGeneration &+= 1
@@ -3706,6 +3789,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.connectTimeoutWorkItem?.cancel()
                     self.connectTimeoutWorkItem = nil
                     self.isConnected = true
+                    TBSenderDiagnosticsLogger.shared.append(
+                        event: "connection_state",
+                        fields: [
+                            "sessionID": self.connectionSessionID ?? "",
+                            "state": "ready",
+                            "receiverIP": self.receiverIP,
+                            "localInterfaceIP": self.localInterfaceIP,
+                            "interface": self.connectInterfaceName ?? ""
+                        ]
+                    )
                     self.lastReceiverActivityNanoseconds =
                         DispatchTime.now().uptimeNanoseconds
                     TBLog.connection.info("connect: ready — \(self.receiverIP, privacy: .public) via \(self.connectInterfaceName ?? "?", privacy: .public)")
@@ -3720,6 +3813,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     // reason so a later timeout can report it instead of a
                     // bare "Connection timed out".
                     self.lastConnectionStateDetail = "waiting(\(error.localizedDescription))"
+                    TBSenderDiagnosticsLogger.shared.append(
+                        event: "connection_state",
+                        fields: [
+                            "sessionID": self.connectionSessionID ?? "",
+                            "state": "waiting",
+                            "error": error.localizedDescription
+                        ]
+                    )
                     TBLog.connection.warning("connect: waiting — \(error.localizedDescription, privacy: .public)")
                     if tbShouldReleaseSessionOnNetworkWait(
                         isConnected: self.isConnected,
@@ -3730,11 +3831,23 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                         self.recordSessionEvent(message)
                         self.stop(
                             resetStatusTo: .connectionFailed(message),
-                            persistArrangement: false
+                            persistArrangement: false,
+                            closeContext: .transport(
+                                "network_wait",
+                                detail: message
+                            )
                         )
                     }
                 case .failed(let error):
                     self.lastConnectionStateDetail = "failed(\(error.localizedDescription))"
+                    TBSenderDiagnosticsLogger.shared.append(
+                        event: "connection_state",
+                        fields: [
+                            "sessionID": self.connectionSessionID ?? "",
+                            "state": "failed",
+                            "error": error.localizedDescription
+                        ]
+                    )
                     let detail = TBConnectionDiagnostics.failureDetail(
                         receiverHost: self.receiverIP,
                         port: TBMonitorProtocol.port,
@@ -3745,7 +3858,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     )
                     TBLog.connection.error("connect: failed — \(error.localizedDescription, privacy: .public); \(detail, privacy: .public)")
                     self.setStatus(.connectionFailed("\(error.localizedDescription) — \(detail)"))
-                    self.stop(resetStatusTo: nil)
+                    self.stop(
+                        resetStatusTo: nil,
+                        closeContext: .transport(
+                            "connect_failed",
+                            detail: error.localizedDescription
+                        )
+                    )
                 case .cancelled:
                     self.isConnected = false
                 default:
@@ -3898,19 +4017,68 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
 
-    func stop(persistArrangement: Bool = true) {
-        stop(resetStatusTo: .stopped, persistArrangement: persistArrangement)
+    func stop(
+        persistArrangement: Bool = true,
+        closeContext: TBSessionCloseContext = .userStop
+    ) {
+        stop(
+            resetStatusTo: .stopped,
+            persistArrangement: persistArrangement,
+            closeContext: closeContext
+        )
     }
 
     func persistExtendedDisplayArrangementSnapshot() {
         persistExtendedDisplayArrangementIfNeeded()
     }
 
-    private func stop(resetStatusTo status: TBDisplaySenderStatusState?, persistArrangement: Bool = true) {
+    private func stop(
+        resetStatusTo status: TBDisplaySenderStatusState?,
+        persistArrangement: Bool = true,
+        closeContext: TBSessionCloseContext = .userStop
+    ) {
         if persistArrangement {
             persistExtendedDisplayArrangementIfNeeded()
         }
-        sendTeardown(reason: "sender_stop")
+        let closingSessionID = connectionSessionID
+        let closingConnection = connection
+        let sentFrames = UInt64(max(0, pipeline?.sentFramesSnapshot ?? 0))
+        let sentBytes = UInt64(max(0, pipeline?.sentBytesSnapshot ?? 0))
+        let hadActiveSession =
+            closingConnection != nil ||
+            isConnected ||
+            isStreaming ||
+            closingSessionID != nil
+        if hadActiveSession {
+            TBSenderDiagnosticsLogger.shared.append(
+                event: "session_close",
+                fields: [
+                    "sessionID": closingSessionID ?? "",
+                    "reason": closeContext.reason,
+                    "category": closeContext.category,
+                    "detail": closeContext.detail ?? "",
+                    "notifyPeer": closeContext.notifyPeer,
+                    "frames": sentFrames,
+                    "bytes": sentBytes,
+                    "receiverIP": receiverIP,
+                    "connected": isConnected
+                ]
+            )
+        }
+        if let closingConnection {
+            closingConnection.stateUpdateHandler = nil
+            if closeContext.notifyPeer {
+                sendTeardown(
+                    on: closingConnection,
+                    context: closeContext,
+                    sessionID: closingSessionID,
+                    frames: sentFrames,
+                    bytes: sentBytes
+                )
+            } else {
+                closingConnection.cancel()
+            }
+        }
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
         heartbeatTimer?.invalidate()
@@ -3948,8 +4116,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         remoteHeldModifierKeyCodes.removeAll()
         injectedLeftClickTracker.reset()
         suppressedTriggerKeyCode = nil
-        connection?.stateUpdateHandler = nil
-        connection?.cancel()
         connection = nil
         let currentSession = session
         Task { @MainActor in
@@ -3990,6 +4156,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         baselineDisplayIDs = []
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
+        connectionSessionID = nil
         captureDisplayText = TBDisplaySenderL10n.captureDisplayNotAvailable(language)
         displayStateText = TBDisplaySenderL10n.displayStateNotAvailable(language)
     }
@@ -4085,7 +4252,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 captureSource: captureSource.title(language),
                 captureWidth: preset.width,
                 captureHeight: preset.height,
-                codec: helloCodecName
+                codec: helloCodecName,
+                senderProcessInstanceID:
+                    TBSenderDiagnosticsLogger.shared.processInstanceID,
+                sessionID: connectionSessionID
             )
         ) else { return }
         send(packet)
@@ -4183,18 +4353,76 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     TBLog.connection.error("\(message, privacy: .public)")
                     self.recordSessionEvent(message)
                     self.setStatus(.connectionClosed(message))
-                    self.stop(resetStatusTo: nil)
+                    self.stop(
+                        resetStatusTo: nil,
+                        closeContext: .liveness(
+                            "heartbeat_send_error",
+                            detail: message,
+                            notifyPeer: false
+                        )
+                    )
                 }
             })
         )
     }
 
-    private func sendTeardown(reason: String) {
+    private func sendTeardown(
+        on connection: NWConnection,
+        context: TBSessionCloseContext,
+        sessionID: String?,
+        frames: UInt64,
+        bytes: UInt64
+    ) {
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .teardown,
-            value: TBMonitorTeardown(reason: reason)
-        ) else { return }
-        send(packet)
+            value: TBMonitorTeardown(
+                reason: context.reason,
+                origin: "sender",
+                category: context.category,
+                detail: context.detail,
+                errno: 0,
+                timestampMs:
+                    DispatchTime.now().uptimeNanoseconds / 1_000_000,
+                processInstanceID:
+                    TBSenderDiagnosticsLogger.shared.processInstanceID,
+                sessionID: sessionID,
+                frames: frames,
+                packets: heartbeatSequence,
+                bytes: bytes
+            )
+        ) else {
+            TBSenderDiagnosticsLogger.shared.append(
+                event: "peer_signal_send_error",
+                fields: [
+                    "sessionID": sessionID ?? "",
+                    "reason": context.reason,
+                    "category": context.category,
+                    "error": "unable to encode teardown payload"
+                ]
+            )
+            connection.cancel()
+            return
+        }
+        connection.send(
+            content: packet,
+            completion: .contentProcessed({ error in
+                TBSenderDiagnosticsLogger.shared.append(
+                    event: error == nil
+                        ? "peer_signal_sent"
+                        : "peer_signal_send_error",
+                    fields: [
+                        "sessionID": sessionID ?? "",
+                        "reason": context.reason,
+                        "category": context.category,
+                        "error": error?.localizedDescription ?? ""
+                    ]
+                )
+                connection.cancel()
+            })
+        )
+        connectionQueue.asyncAfter(deadline: .now() + 0.25) {
+            connection.cancel()
+        }
     }
 
     private func receiveLoop(on connection: NWConnection) {
@@ -4204,6 +4432,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 if let data, !data.isEmpty {
                     self.recvBuffer.append(data)
                     self.drainPackets()
+                    guard self.connection === connection else { return }
                 }
                 if error != nil || isDone {
                     if let error {
@@ -4213,7 +4442,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     } else if case .captureActive = self.statusState {
                         self.setStatus(.receiverClosedConnection)
                     }
-                    self.stop(resetStatusTo: nil)
+                    self.stop(
+                        resetStatusTo: nil,
+                        closeContext: .transport(
+                            error == nil ? "peer_closed" : "receive_error",
+                            detail: error?.localizedDescription ??
+                                "Receiver closed connection"
+                        )
+                    )
                     return
                 }
                 self.receiveLoop(on: connection)
@@ -4230,7 +4466,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             TBLog.connection.error("corrupt inbound stream (\(String(describing: error), privacy: .public)); closing connection")
             recvBuffer.removeAll(keepingCapacity: false)
             setStatus(.connectionClosed(String(describing: error)))
-            stop(resetStatusTo: nil)
+            stop(
+                resetStatusTo: nil,
+                closeContext: .appError(
+                    "protocol_error",
+                    detail: String(describing: error)
+                )
+            )
         }
     }
 
@@ -4287,8 +4529,37 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             case .heartbeat:
                 handleHeartbeatAcknowledgment(payload)
             case .teardown:
+                let teardown = TBMonitorProtocol.decodeJSON(
+                    TBMonitorTeardown.self,
+                    from: payload
+                )
+                TBSenderDiagnosticsLogger.shared.append(
+                    event: "peer_close_signal",
+                    fields: [
+                        "sessionID":
+                            teardown?.sessionID ?? connectionSessionID ?? "",
+                        "reason": teardown?.reason ?? "unknown",
+                        "origin": teardown?.origin ?? "receiver",
+                        "category": teardown?.category ?? "unknown",
+                        "detail": teardown?.detail ?? "",
+                        "errno": teardown?.errno ?? 0,
+                        "peerProcessInstanceID":
+                            teardown?.processInstanceID ?? "",
+                        "frames": teardown?.frames ?? 0,
+                        "packets": teardown?.packets ?? 0,
+                        "bytes": teardown?.bytes ?? 0
+                    ]
+                )
                 setStatus(.receiverTerminatedSession)
-                stop(resetStatusTo: nil)
+                stop(
+                    resetStatusTo: nil,
+                    closeContext: .transport(
+                        "receiver_\(teardown?.reason ?? "teardown")",
+                        detail: teardown?.detail ??
+                            "Receiver sent teardown",
+                        notifyPeer: false
+                    )
+                )
                 return
             case .clipboard:
                 if let clipboard = TBMonitorProtocol.decodeJSON(TBMonitorClipboard.self, from: payload) {
@@ -4683,12 +4954,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.cableTestResult = rate
                 } catch {
                     NSLog("TargetBridge: cable test failed: \(error)")
-                    self.stop(resetStatusTo: .connectionFailed(error.localizedDescription))
+                    self.stop(
+                        resetStatusTo:
+                            .connectionFailed(error.localizedDescription),
+                        closeContext: .test(
+                            "cable_test_failed",
+                            detail: error.localizedDescription
+                        )
+                    )
                     return
                 }
                 self.isCableTestConnection = false
                 self.isCableTesting = false
-                self.stop(resetStatusTo: .stopped)
+                self.stop(
+                    resetStatusTo: .stopped,
+                    closeContext: .test(
+                        "cable_test_complete",
+                        detail: "Cable test completed"
+                    )
+                )
                 return
             }
 
@@ -4714,7 +4998,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverKey: receiverKey
             ) else {
                 self.setStatus(.virtualDisplayCreationFailed)
-                self.stop(resetStatusTo: nil)
+                self.stop(
+                    resetStatusTo: nil,
+                    closeContext: .appError(
+                        "virtual_display_creation_failed",
+                        detail: "Unable to create virtual display"
+                    )
+                )
                 return
             }
             if self.captureSource == .desktopMirror {
@@ -4746,7 +5036,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             self.setStatus(.startingCapture(self.capturePreset.description, self.captureSource))
             let started = await self.startCapture(for: profile)
             guard started else {
-                self.stop(resetStatusTo: nil)
+                self.stop(
+                    resetStatusTo: nil,
+                    closeContext: .appError(
+                        "capture_start_failed",
+                        detail: "Unable to start capture"
+                    )
+                )
                 return
             }
 
@@ -4961,7 +5257,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.setStatus(.captureError(self.formattedCaptureErrorMessage(for: error)))
-                    self.stop(resetStatusTo: nil)
+                    self.stop(
+                        resetStatusTo: nil,
+                        closeContext: .appError(
+                            "capture_error",
+                            detail:
+                                self.formattedCaptureErrorMessage(for: error)
+                        )
+                    )
                 }
             }
             captureDelegate = delegate
@@ -5670,7 +5973,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let started = await startCapture(for: profile)
         if !started {
             NSLog("TargetBridge: soft restart after wake failed — falling back to full stop")
-            stop(resetStatusTo: .captureError("capture restart after wake failed"))
+            stop(
+                resetStatusTo:
+                    .captureError("capture restart after wake failed"),
+                closeContext: .appError(
+                    "capture_restart_failed",
+                    detail: "Capture restart after wake failed"
+                )
+            )
         } else {
             setStatus(.captureStartedWaitingFirstFrame)
             startFirstFrameWatchdog()
@@ -5691,7 +6001,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             let message =
                 "5K validation failed: captured frame is \(width)×\(height), expected \(capturePreset.width)×\(capturePreset.height)."
             bc7TestStatusText = message
-            stop(resetStatusTo: .captureError(message))
+            stop(
+                resetStatusTo: .captureError(message),
+                closeContext: .appError(
+                    "capture_validation_failed",
+                    detail: message
+                )
+            )
             return
         }
         setStatus(.captureActive(capturePreset.description, activeCodecName ?? capturePreset.codecName, captureSource))
@@ -6110,7 +6426,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         TBLog.connection.error("\(message, privacy: .public)")
         recordSessionEvent(message)
         setStatus(.connectionClosed(message))
-        stop(resetStatusTo: nil)
+        stop(
+            resetStatusTo: nil,
+            closeContext: .liveness(
+                "heartbeat_timeout",
+                detail: message
+            )
+        )
     }
 
     private func startFirstFrameWatchdog() {
@@ -6130,7 +6452,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 } else {
                     setStatus(.noFirstFrame)
                 }
-                stop(resetStatusTo: nil)
+                stop(
+                    resetStatusTo: nil,
+                    closeContext: .appError(
+                        "first_frame_timeout",
+                        detail: "Capture produced no first frame"
+                    )
+                )
             }
         }
     }
@@ -6165,7 +6493,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 )
                 TBLog.connection.error("connect: timed out — \(detail, privacy: .public)")
                 self.setStatus(.connectionFailed("\(timeoutMessage) — \(detail)"))
-                self.stop(resetStatusTo: nil)
+                self.stop(
+                    resetStatusTo: nil,
+                    closeContext: .transport(
+                        "connect_timeout",
+                        detail: detail
+                    )
+                )
             }
         }
         

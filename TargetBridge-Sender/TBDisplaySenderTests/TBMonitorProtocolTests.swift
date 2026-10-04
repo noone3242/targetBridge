@@ -1877,6 +1877,110 @@ final class TBMonitorProtocolTests: XCTestCase {
         )
     }
 
+    func testStructuredTeardownRemainsBackwardCompatible() throws {
+        let legacy = try JSONDecoder().decode(
+            TBMonitorTeardown.self,
+            from: Data(#"{"reason":"sender_stop"}"#.utf8)
+        )
+        XCTAssertEqual(legacy.reason, "sender_stop")
+        XCTAssertNil(legacy.origin)
+        XCTAssertNil(legacy.category)
+        XCTAssertNil(legacy.sessionID)
+
+        let current = TBMonitorTeardown(
+            reason: "parser_error",
+            origin: "receiver",
+            category: "app_error",
+            detail: "Malformed framing",
+            errno: 71,
+            timestampMs: 123456789,
+            processInstanceID: "commit-pid-startup",
+            sessionID: "session-123",
+            frames: 42,
+            packets: 99,
+            bytes: 1234
+        )
+        let data = try JSONEncoder().encode(current)
+        let decoded = try JSONDecoder().decode(
+            TBMonitorTeardown.self,
+            from: data
+        )
+        XCTAssertEqual(decoded.reason, "parser_error")
+        XCTAssertEqual(decoded.origin, "receiver")
+        XCTAssertEqual(decoded.category, "app_error")
+        XCTAssertEqual(decoded.sessionID, "session-123")
+        XCTAssertEqual(decoded.frames, 42)
+    }
+
+    func testCloseContextsRouteSignalsWithoutTeardownEcho() {
+        XCTAssertTrue(TBSessionCloseContext.userStop.notifyPeer)
+        XCTAssertEqual(TBSessionCloseContext.userStop.reason, "user_stop")
+        XCTAssertEqual(TBSessionCloseContext.userStop.category, "user")
+        XCTAssertTrue(TBSessionCloseContext.appQuit.notifyPeer)
+        XCTAssertEqual(TBSessionCloseContext.appQuit.reason, "app_quit")
+        XCTAssertFalse(TBSessionCloseContext.remoteSignal.notifyPeer)
+        XCTAssertEqual(
+            TBSessionCloseContext.remoteSignal.reason,
+            "remote_teardown"
+        )
+        XCTAssertFalse(
+            TBSessionCloseContext.transport(
+                "peer_closed",
+                detail: "FIN"
+            ).notifyPeer
+        )
+        XCTAssertTrue(
+            TBSessionCloseContext.appError(
+                "parser_error",
+                detail: "bad frame"
+            ).notifyPeer
+        )
+    }
+
+    func testSenderPersistentDiagnosticsTracksCleanAndUncleanRuns() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let first = TBSenderDiagnosticsLogger(
+            logsDirectoryOverride: directory,
+            processInstanceIDOverride: "process-1"
+        )
+        first.append(
+            event: "session_close",
+            fields: ["reason": "user_stop"]
+        )
+        first.finishProcess(reason: "app_quit")
+
+        var state = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: first.runStateFileURL)
+        ) as? [String: Any]
+        XCTAssertEqual(state?["cleanExit"] as? Bool, true)
+        var log = try String(
+            contentsOf: first.logFileURL,
+            encoding: .utf8
+        )
+        XCTAssertTrue(log.contains(#""event":"session_close""#))
+        XCTAssertTrue(log.contains(#""event":"process_exit""#))
+
+        _ = TBSenderDiagnosticsLogger(
+            logsDirectoryOverride: directory,
+            processInstanceIDOverride: "process-2"
+        )
+        let third = TBSenderDiagnosticsLogger(
+            logsDirectoryOverride: directory,
+            processInstanceIDOverride: "process-3"
+        )
+        third.finishProcess(reason: "test_complete")
+        log = try String(contentsOf: third.logFileURL, encoding: .utf8)
+        XCTAssertTrue(log.contains(#""previousRunUnclean":true"#))
+        XCTAssertTrue(log.contains(#""event":"unclean_previous_run""#))
+        state = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: third.runStateFileURL)
+        ) as? [String: Any]
+        XCTAssertEqual(state?["cleanExit"] as? Bool, true)
+    }
+
     // MARK: - Hand-rolled input-event encoder parity
     //
     // `makeInputEventPacket` documents this invariant: "emits the same JSON shape

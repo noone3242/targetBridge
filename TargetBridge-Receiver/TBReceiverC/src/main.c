@@ -22,6 +22,7 @@
 #include "idle_policy.h"
 #include "receiver_diagnostics.h"
 #include "receiver_heartbeat.h"
+#include "receiver_teardown.h"
 #include "decoder.h"
 #include "display.h"
 #include "proto.h"
@@ -181,6 +182,12 @@ struct app {
     char     sender_ui_language[8];
     char     input_control_mode[32];
     char     active_transport[16];
+    char     sender_process_instance_id[192];
+    char     session_id[128];
+    char     peer_close_reason[128];
+    char     peer_close_category[64];
+    char     peer_close_detail[384];
+    char     peer_close_process_instance_id[192];
     int      last_input_monitoring_trusted;
     int      last_accessibility_trusted;
     uint64_t last_permissions_poll_ms;
@@ -1992,6 +1999,33 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_HELLO_RECEIVER:
         extract_json_string_field(payload, len, "\"senderName\"", a->sender_text, sizeof(a->sender_text));
+        extract_json_string_field(
+            payload,
+            len,
+            "\"senderProcessInstanceID\"",
+            a->sender_process_instance_id,
+            sizeof(a->sender_process_instance_id));
+        extract_json_string_field(
+            payload,
+            len,
+            "\"sessionID\"",
+            a->session_id,
+            sizeof(a->session_id));
+        {
+            char fields[512];
+            snprintf(
+                fields,
+                sizeof(fields),
+                "\"sessionID\":\"%s\","
+                "\"senderProcessInstanceID\":\"%s\"",
+                a->session_id,
+                a->sender_process_instance_id);
+            tb_receiver_diagnostics_log(
+                &a->diagnostics,
+                now_ms(),
+                "peer_identity",
+                fields);
+        }
         {
             char ui_language[16];
             ui_language[0] = '\0';
@@ -2233,6 +2267,50 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_TEARDOWN:
         fprintf(stderr, "[main] teardown requested by sender\n");
+        extract_json_string_field(
+            payload,
+            len,
+            "\"reason\"",
+            a->peer_close_reason,
+            sizeof(a->peer_close_reason));
+        extract_json_string_field(
+            payload,
+            len,
+            "\"category\"",
+            a->peer_close_category,
+            sizeof(a->peer_close_category));
+        extract_json_string_field(
+            payload,
+            len,
+            "\"detail\"",
+            a->peer_close_detail,
+            sizeof(a->peer_close_detail));
+        extract_json_string_field(
+            payload,
+            len,
+            "\"processInstanceID\"",
+            a->peer_close_process_instance_id,
+            sizeof(a->peer_close_process_instance_id));
+        {
+            char fields[1024];
+            snprintf(
+                fields,
+                sizeof(fields),
+                "\"sessionID\":\"%s\",\"reason\":\"%s\","
+                "\"category\":\"%s\","
+                "\"peerProcessInstanceID\":\"%s\"",
+                a->session_id,
+                a->peer_close_reason[0]
+                    ? a->peer_close_reason
+                    : "sender_stop",
+                a->peer_close_category,
+                a->peer_close_process_instance_id);
+            tb_receiver_diagnostics_log(
+                &a->diagnostics,
+                now_ms(),
+                "peer_close_signal",
+                fields);
+        }
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.session_closed_by_sender");
         a->close_requested = 1;
         break;
@@ -2916,12 +2994,90 @@ static int tcp_state_for_fd(int fd) {
     return info.tcpi_state;
 }
 
+static const char *close_reason_category(
+    enum tb_receiver_close_reason reason) {
+    switch (reason) {
+    case TB_RECEIVER_CLOSE_PARSER_ERROR:
+        return "app_error";
+    case TB_RECEIVER_CLOSE_IDLE_TIMEOUT:
+        return "liveness";
+    case TB_RECEIVER_CLOSE_LOCAL_QUIT:
+    case TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN:
+        return "shutdown";
+    default:
+        return "transport";
+    }
+}
+
+static const char *close_reason_detail(
+    enum tb_receiver_close_reason reason) {
+    switch (reason) {
+    case TB_RECEIVER_CLOSE_PARSER_ERROR:
+        return "Receiver rejected malformed packet framing";
+    case TB_RECEIVER_CLOSE_IDLE_TIMEOUT:
+        return "Receiver observed no Sender packets for 10 seconds";
+    case TB_RECEIVER_CLOSE_LOCAL_QUIT:
+        return "Receiver application quit locally";
+    case TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN:
+        return "Receiver received termination signal";
+    default:
+        return "Receiver connection closed";
+    }
+}
+
+static int send_receiver_teardown_signal(
+    struct app *a,
+    enum tb_receiver_close_reason reason,
+    int error_code,
+    uint64_t close_time_ms) {
+    if (!a || a->client_fd < 0 ||
+        !tb_receiver_close_reason_should_signal_peer(reason)) {
+        return 0;
+    }
+    const struct tb_teardown_signal signal = {
+        .reason = tb_receiver_close_reason_name(reason),
+        .origin = "receiver",
+        .category = close_reason_category(reason),
+        .detail = close_reason_detail(reason),
+        .error_code = error_code,
+        .timestamp_ms = close_time_ms,
+        .process_instance_id = a->diagnostics.process_instance_id,
+        .session_id = a->session_id,
+        .frames = a->frames,
+        .packets = a->packets_received,
+        .bytes = a->received_bytes
+    };
+    uint8_t packet[2048];
+    const int packet_length = tb_teardown_build_packet(
+        packet,
+        sizeof(packet),
+        &signal);
+    if (packet_length <= 0) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    const ssize_t written = write(
+        a->client_fd,
+        packet,
+        (size_t)packet_length);
+    if (written == packet_length) return 1;
+    if (written >= 0) errno = EIO;
+    return -1;
+}
+
 static void close_client(
     struct app *a,
     enum tb_receiver_close_reason reason,
     int error_code,
     uint64_t close_time_ms,
     uint64_t idle_ms) {
+    const int peer_signal_result = send_receiver_teardown_signal(
+        a,
+        reason,
+        error_code,
+        close_time_ms);
+    const int peer_signal_errno =
+        peer_signal_result < 0 ? errno : 0;
     int socket_error = 0;
     socklen_t socket_error_length = sizeof(socket_error);
     const int tcp_state = tcp_state_for_fd(a->client_fd);
@@ -2960,6 +3116,7 @@ static void close_client(
         "\"idleMs\":%llu,\"lastPacketType\":%u,\"lastPacketMs\":%llu,"
         "\"lastPacketAgeMs\":%llu,\"lastHeartbeatSequence\":%s,"
         "\"transport\":\"%s\",\"sessionActive\":%s,"
+        "\"sessionID\":\"%s\",\"peerSignalResult\":%d,"
         "\"frames\":%llu,\"packets\":%llu,\"bytes\":%llu,"
         "\"invalidFrames\":%llu,\"renderFailures\":%llu,"
         "\"appliedSequence\":%llu,\"keyframeRequests\":%llu",
@@ -2976,6 +3133,8 @@ static void close_client(
         heartbeat_sequence,
         a->active_transport,
         a->session_active ? "true" : "false",
+        a->session_id,
+        peer_signal_result,
         (unsigned long long)a->frames,
         (unsigned long long)a->packets_received,
         (unsigned long long)a->received_bytes,
@@ -2988,6 +3147,25 @@ static void close_client(
         close_time_ms,
         "session_close",
         fields);
+    if (peer_signal_result != 0) {
+        char signal_fields[256];
+        snprintf(
+            signal_fields,
+            sizeof(signal_fields),
+            "\"sessionID\":\"%s\",\"reason\":\"%s\","
+            "\"result\":%d,\"errno\":%d",
+            a->session_id,
+            tb_receiver_close_reason_name(reason),
+            peer_signal_result,
+            peer_signal_errno);
+        tb_receiver_diagnostics_log(
+            &a->diagnostics,
+            close_time_ms,
+            peer_signal_result > 0
+                ? "peer_signal_sent"
+                : "peer_signal_send_error",
+            signal_fields);
+    }
     tb_receiver_diagnostics_flush(&a->diagnostics, 1);
     if (a->debug_enabled && a->client_fd >= 0) {
         fprintf(stderr,
@@ -3018,6 +3196,12 @@ static void close_client(
     a->session_active = 0;
     a->close_requested = 0;
     a->heartbeat_ack_send_error = 0;
+    a->sender_process_instance_id[0] = '\0';
+    a->session_id[0] = '\0';
+    a->peer_close_reason[0] = '\0';
+    a->peer_close_category[0] = '\0';
+    a->peer_close_detail[0] = '\0';
+    a->peer_close_process_instance_id[0] = '\0';
     a->have_video_frame = 0;
     a->bc7_render_ack_sent = 0;
     a->bc7_render_generation = 0;

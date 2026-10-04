@@ -21,7 +21,9 @@ final class TBMetricsFileLogger: @unchecked Sendable {
             .deletingLastPathComponent()
             .appendingPathComponent("logs", isDirectory: true)
         logURL = logsDirectory.appendingPathComponent("sender-metrics.jsonl")
-        previousURL = logsDirectory.appendingPathComponent("sender-metrics.previous.jsonl")
+        previousURL = logsDirectory.appendingPathComponent(
+            "sender-metrics.previous.jsonl"
+        )
     }
 
     func append(_ object: [String: Any]) {
@@ -42,7 +44,8 @@ final class TBMetricsFileLogger: @unchecked Sendable {
                 if !reportedOverflow {
                     reportedOverflow = true
                     NSLog(
-                        "TargetBridge: metrics writer backlog full; dropping oldest samples"
+                        "TargetBridge: metrics writer backlog full; " +
+                        "dropping oldest samples"
                     )
                 }
             }
@@ -129,5 +132,222 @@ final class TBMetricsFileLogger: @unchecked Sendable {
                 error.localizedDescription
             )
         }
+    }
+}
+
+final class TBSenderDiagnosticsLogger: @unchecked Sendable {
+    static let shared = TBSenderDiagnosticsLogger()
+
+    let processInstanceID: String
+    let logFileURL: URL
+    let runStateFileURL: URL
+
+    private let queue = DispatchQueue(
+        label: "com.targetbridge.sender.diagnostics-file",
+        qos: .utility
+    )
+    private let previousURL: URL
+    private let maximumBytes: UInt64 = 8 * 1024 * 1024
+
+    init(
+        logsDirectoryOverride: URL? = nil,
+        processInstanceIDOverride: String? = nil
+    ) {
+        let fileManager = FileManager.default
+        let logsDirectory: URL
+        if let logsDirectoryOverride {
+            logsDirectory = logsDirectoryOverride
+        } else {
+            let base: URL
+            if ProcessInfo.processInfo.environment[
+                "XCTestConfigurationFilePath"
+            ] != nil {
+                base = fileManager.temporaryDirectory.appendingPathComponent(
+                    "TargetBridgeTests-" +
+                    "\(ProcessInfo.processInfo.processIdentifier)",
+                    isDirectory: true
+                )
+            } else {
+                base = fileManager.urls(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask
+                ).first
+                    ?? URL(fileURLWithPath: NSHomeDirectory())
+                        .appendingPathComponent(
+                            "Library/Application Support",
+                            isDirectory: true
+                        )
+            }
+            logsDirectory = base
+                .appendingPathComponent("TargetBridge", isDirectory: true)
+                .appendingPathComponent("Logs", isDirectory: true)
+        }
+        logFileURL = logsDirectory.appendingPathComponent("sender.jsonl")
+        previousURL = logsDirectory.appendingPathComponent(
+            "sender.previous.jsonl"
+        )
+        runStateFileURL = logsDirectory.appendingPathComponent(
+            "run-state.json"
+        )
+        processInstanceID = processInstanceIDOverride ??
+            (
+                "\(TBDisplaySenderBuildInfo.gitCommit)-" +
+                "\(ProcessInfo.processInfo.processIdentifier)-" +
+                "\(DispatchTime.now().uptimeNanoseconds / 1_000_000)"
+            )
+
+        queue.sync {
+            do {
+                try fileManager.createDirectory(
+                    at: logsDirectory,
+                    withIntermediateDirectories: true
+                )
+                let previousUnclean = readPreviousUnclean()
+                if fileManager.fileExists(atPath: logFileURL.path) {
+                    let attributes = try? fileManager.attributesOfItem(
+                        atPath: logFileURL.path
+                    )
+                    let size =
+                        (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+                    if size > 0 {
+                        if fileManager.fileExists(atPath: previousURL.path) {
+                            try fileManager.removeItem(at: previousURL)
+                        }
+                        try fileManager.moveItem(
+                            at: logFileURL,
+                            to: previousURL
+                        )
+                    }
+                }
+                try writeRunState(cleanExit: false, reason: "running")
+                writeEvent(
+                    "process_start",
+                    fields: [
+                        "version": TBDisplaySenderBuildInfo.marketingVersion,
+                        "build": TBDisplaySenderBuildInfo.buildNumber,
+                        "commit": TBDisplaySenderBuildInfo.gitCommit,
+                        "pid": ProcessInfo.processInfo.processIdentifier,
+                        "previousRunUnclean": previousUnclean
+                    ]
+                )
+                if previousUnclean {
+                    writeEvent("unclean_previous_run", fields: [:])
+                }
+            } catch {
+                NSLog(
+                    "TargetBridge: unable to initialize sender diagnostics: %@",
+                    error.localizedDescription
+                )
+            }
+        }
+    }
+
+    func append(event: String, fields: [String: Any] = [:]) {
+        queue.async { [self] in
+            writeEvent(event, fields: fields)
+        }
+    }
+
+    func finishProcess(reason: String) {
+        queue.sync {
+            writeEvent(
+                "process_exit",
+                fields: ["reason": reason]
+            )
+            do {
+                try writeRunState(cleanExit: true, reason: reason)
+            } catch {
+                writeEvent(
+                    "run_state_write_error",
+                    fields: [
+                        "operation": "mark_clean_exit",
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+        }
+    }
+
+    private func readPreviousUnclean() -> Bool {
+        guard let data = try? Data(contentsOf: runStateFileURL),
+              let object = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any]
+        else { return false }
+        return object["cleanExit"] as? Bool == false
+    }
+
+    private func writeRunState(cleanExit: Bool, reason: String) throws {
+        let object: [String: Any] = [
+            "timestampMs": currentTimestampMs(),
+            "processInstanceID": processInstanceID,
+            "cleanExit": cleanExit,
+            "reason": reason
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys]
+        )
+        try data.write(to: runStateFileURL, options: .atomic)
+    }
+
+    private func writeEvent(_ event: String, fields: [String: Any]) {
+        var object = fields
+        object["timestampMs"] = currentTimestampMs()
+        object["monotonicMs"] =
+            DispatchTime.now().uptimeNanoseconds / 1_000_000
+        object["processInstanceID"] = processInstanceID
+        object["event"] = event
+        guard JSONSerialization.isValidJSONObject(object) else {
+            NSLog(
+                "TargetBridge: sender diagnostics event is not valid JSON: %@",
+                event
+            )
+            return
+        }
+        do {
+            var data = try JSONSerialization.data(
+                withJSONObject: object,
+                options: [.sortedKeys]
+            )
+            data.append(0x0A)
+            try rotateIfNeeded(adding: UInt64(data.count))
+            if !FileManager.default.fileExists(atPath: logFileURL.path) {
+                guard FileManager.default.createFile(
+                    atPath: logFileURL.path,
+                    contents: nil
+                ) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+            }
+            let handle = try FileHandle(forWritingTo: logFileURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+        } catch {
+            NSLog(
+                "TargetBridge: unable to write sender diagnostics: %@",
+                error.localizedDescription
+            )
+        }
+    }
+
+    private func rotateIfNeeded(adding bytes: UInt64) throws {
+        let fileManager = FileManager.default
+        let attributes = try? fileManager.attributesOfItem(
+            atPath: logFileURL.path
+        )
+        let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+        guard size + bytes > maximumBytes else { return }
+        if fileManager.fileExists(atPath: previousURL.path) {
+            try fileManager.removeItem(at: previousURL)
+        }
+        if fileManager.fileExists(atPath: logFileURL.path) {
+            try fileManager.moveItem(at: logFileURL, to: previousURL)
+        }
+    }
+
+    private func currentTimestampMs() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1000)
     }
 }

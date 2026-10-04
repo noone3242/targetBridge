@@ -113,6 +113,7 @@ final class TBDisplaySenderService: ObservableObject {
     private var lastClipboardChangeCount: Int = NSPasteboard.general.changeCount
 
     private init() {
+        _ = TBSenderDiagnosticsLogger.shared
         discoveryCancellable = receiverDiscovery.$receivers.sink { [weak self] receivers in
             guard let self else { return }
             discoveredReceivers = receivers
@@ -275,9 +276,14 @@ final class TBDisplaySenderService: ObservableObject {
         objectWillChange.send()
     }
 
-    func stopAll() {
+    func stopAll(closeContext: TBSessionCloseContext = .userStop) {
         sessions.forEach { $0.persistExtendedDisplayArrangementSnapshot() }
-        sessions.forEach { $0.stop(persistArrangement: false) }
+        sessions.forEach {
+            $0.stop(
+                persistArrangement: false,
+                closeContext: closeContext
+            )
+        }
     }
 
     // MARK: - Session persistence

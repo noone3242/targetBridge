@@ -52,6 +52,26 @@ Current Receivers advertise `supportsHeartbeatAck`. They reply to each
 instance ID, event-loop lag, and latest applied frame sequence. A compatible
 Sender only enables its liveness timeout when that capability is present.
 
+## Sender diagnostics
+
+The Sender also keeps process and session diagnostics:
+
+```text
+~/Library/Application Support/TargetBridge/Logs/
+  sender.jsonl
+  sender.previous.jsonl
+  run-state.json
+```
+
+Both peers reuse packet type `0x31` for a structured, backward-compatible
+close signal. Besides the existing `reason`, the payload can include origin,
+category, detail, errno, monotonic timestamp, process instance, session ID,
+and bounded counters.
+
+Controlled closes send this signal before cancelling the socket. Received
+teardown packets are never echoed. Crashes and force kills cannot send a final
+packet; the next process launch records `unclean_previous_run` instead.
+
 ## Reading the latest evidence
 
 ```bash

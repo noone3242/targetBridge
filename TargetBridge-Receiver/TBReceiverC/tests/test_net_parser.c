@@ -15,6 +15,7 @@
 #include "../src/idle_policy.h"
 #include "../src/receiver_diagnostics.h"
 #include "../src/receiver_heartbeat.h"
+#include "../src/receiver_teardown.h"
 #include "../src/window_policy.h"
 
 #include <compression.h>
@@ -1056,6 +1057,18 @@ static void test_receiver_diagnostics_policy(void) {
                   TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN),
               "signal_shutdown") == 0,
           "signal shutdown close reason is stable");
+    CHECK(tb_receiver_close_reason_should_signal_peer(
+              TB_RECEIVER_CLOSE_LOCAL_QUIT) == 1,
+          "local Receiver quit sends a peer signal");
+    CHECK(tb_receiver_close_reason_should_signal_peer(
+              TB_RECEIVER_CLOSE_PARSER_ERROR) == 1,
+          "controlled parser failure sends a peer signal");
+    CHECK(tb_receiver_close_reason_should_signal_peer(
+              TB_RECEIVER_CLOSE_SENDER_TEARDOWN) == 0,
+          "received Sender teardown is never echoed");
+    CHECK(tb_receiver_close_reason_should_signal_peer(
+              TB_RECEIVER_CLOSE_PEER_FIN) == 0,
+          "peer FIN is not answered with teardown");
 }
 
 static void test_receiver_heartbeat_ack(void) {
@@ -1163,6 +1176,51 @@ static void test_receiver_heartbeat_ack(void) {
               sizeof(overflow_request) - 1u,
               &request) == -1,
           "overflowing heartbeat sequence is rejected");
+}
+
+static void test_receiver_teardown_signal(void) {
+    const struct tb_teardown_signal signal = {
+        .reason = "parser_error",
+        .origin = "receiver",
+        .category = "app_error",
+        .detail = "bad \"length\"\nfield",
+        .error_code = 71,
+        .timestamp_ms = 123456789,
+        .process_instance_id = "commit-pid-startup",
+        .session_id = "session-123",
+        .frames = 42,
+        .packets = 99,
+        .bytes = 1234
+    };
+    uint8_t packet[2048];
+    const int packet_length = tb_teardown_build_packet(
+        packet,
+        sizeof(packet),
+        &signal);
+    CHECK(packet_length > 5,
+          "Receiver teardown packet builds");
+    CHECK(packet[4] == TB_PKT_TEARDOWN,
+          "Receiver teardown uses packet type 0x31");
+    const uint32_t framed_length =
+        ((uint32_t)packet[0] << 24) |
+        ((uint32_t)packet[1] << 16) |
+        ((uint32_t)packet[2] << 8) |
+        (uint32_t)packet[3];
+    CHECK(framed_length == (uint32_t)(packet_length - 4),
+          "Receiver teardown framing includes packet type");
+    const char *json = (const char *)packet + 5;
+    CHECK(strstr(json, "\"reason\":\"parser_error\"") != NULL,
+          "Receiver teardown includes reason");
+    CHECK(strstr(json, "\"origin\":\"receiver\"") != NULL,
+          "Receiver teardown includes origin");
+    CHECK(strstr(json, "\"category\":\"app_error\"") != NULL,
+          "Receiver teardown includes category");
+    CHECK(strstr(json, "bad \\\"length\\\"\\nfield") != NULL,
+          "Receiver teardown escapes detail");
+    CHECK(strstr(json, "\"sessionID\":\"session-123\"") != NULL,
+          "Receiver teardown includes session identity");
+    CHECK(strstr(json, "\"frames\":42") != NULL,
+          "Receiver teardown includes counters");
 }
 
 static int read_text_file(
@@ -1320,6 +1378,7 @@ int main(void) {
     test_receiver_idle_policy();
     test_receiver_diagnostics_policy();
     test_receiver_heartbeat_ack();
+    test_receiver_teardown_signal();
     test_receiver_persistent_diagnostics();
 
     if (g_failures == 0) {

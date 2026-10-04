@@ -50,6 +50,14 @@ static inline const char *tb_receiver_close_reason_name(
     return "unknown";
 }
 
+static inline int tb_receiver_close_reason_should_signal_peer(
+    enum tb_receiver_close_reason reason) {
+    return reason == TB_RECEIVER_CLOSE_PARSER_ERROR ||
+           reason == TB_RECEIVER_CLOSE_IDLE_TIMEOUT ||
+           reason == TB_RECEIVER_CLOSE_LOCAL_QUIT ||
+           reason == TB_RECEIVER_CLOSE_SIGNAL_SHUTDOWN;
+}
+
 static inline enum tb_receiver_idle_decision tb_receiver_idle_decision(
     uint64_t now_ms,
     uint64_t last_recv_ms,

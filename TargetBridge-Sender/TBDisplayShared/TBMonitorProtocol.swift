@@ -37,6 +37,8 @@ struct TBMonitorHelloReceiver: Codable {
     var captureWidth: Int?
     var captureHeight: Int?
     var codec: String?
+    var senderProcessInstanceID: String? = nil
+    var sessionID: String? = nil
 }
 
 struct TBMonitorDisplayProfile: Codable {
@@ -198,6 +200,16 @@ func tbShouldStopAfterHeartbeatSend(
 
 struct TBMonitorTeardown: Codable {
     var reason: String
+    var origin: String? = nil
+    var category: String? = nil
+    var detail: String? = nil
+    var errno: Int? = nil
+    var timestampMs: UInt64? = nil
+    var processInstanceID: String? = nil
+    var sessionID: String? = nil
+    var frames: UInt64? = nil
+    var packets: UInt64? = nil
+    var bytes: UInt64? = nil
 }
 
 struct TBMonitorCursor: Codable {
