@@ -64,7 +64,8 @@ The work runs on the GPU in two synchronous command buffers.
    to two predictions that the fixed table lacks:
    - the previous frame's vector;
    - the pointer's move since the previous frame, scaled from display points
-     to captured pixels. A window being dragged moves with the pointer, so
+     to captured pixels, while the left button is down and the pointer is on
+     the captured display. A window being dragged moves with the pointer, so
      this catches fast diagonal drags beyond the ±192 px box. The ±64 px
      margin absorbs the gap between when the pointer is sampled and when
      the frame was composited.
@@ -117,10 +118,11 @@ That way a scroll that starts after the screen was quiet is searched at once.
 A reject (too many fresh runs) counts as a miss; a busy writer slot does
 not, since it says nothing about the content.
 
-While the pointer moved since the previous frame, a skipped frame searches
-anyway: a window may be dragging, and a skipped drag frame resends the whole
-window. Moving the pointer over a video therefore searches every frame, which
-costs the search time but nothing on the link.
+While the pointer is dragging on the captured display (left button down,
+pointer on the display, moved since the previous frame), a skipped frame
+searches anyway: a window may be moving, and a skipped drag frame resends the
+whole window. Moving the pointer without the button, or on another display,
+does not count, so a video on the captured display keeps its backoff.
 
 ## 7. Wire format 5
 
@@ -229,7 +231,7 @@ drag or scroll still costs bandwidth:
 | `nv12CopyRectEdgeTiles` | Fresh tiles in format 5 frames with a copied tile among their 8 neighbours: a moved edge or its shadow, only partly new |
 | `nv12CopyRectFreshAreaTiles` | All other fresh tiles in format 5 frames: revealed background, new content |
 | `nv12CopyRectNoVectorFrames`, `nv12CopyRectLowCoverageFrames` | Misses by cause |
-| `nv12CopyRectFastPointerMisses` | Misses while the pointer moved more than 192 px in a frame |
+| `nv12CopyRectFastPointerMisses` | Misses while the pointer dragged more than 192 px in a frame |
 | `nv12CopyRectNearVectors`, `nv12CopyRectDragVectors`, `nv12CopyRectScrollVectors`, `nv12CopyRectPredictedVectors` | Vectors sent: within 64 px, within the ±192 px box, on a scroll axis, or found only around a prediction |
 
 Receiver:
@@ -288,8 +290,8 @@ plus search-time numbers at 5K.
   background, and its shadow blends with whatever is underneath, so a drag
   always resends a ring of tiles around the window. `nv12CopyRectEdgeTiles`
   measures it.
-- A drag faster than ±192 px per frame on both axes, without the pointer
-  moving the same way (scripted moves, keyboard), is not found.
+- A drag faster than ±192 px per frame on both axes, without a pointer drag
+  the same way (scripted moves, keyboard), is not found.
 - Odd-pixel shifts cannot be copied (the UV plane is half resolution) and
   fall back to format 4.
 - Content that is scaled or changes while it moves (zoom, fade, smooth

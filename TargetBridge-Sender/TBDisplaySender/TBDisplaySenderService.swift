@@ -1948,7 +1948,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var rawNV12LastCopyVector: SIMD2<Int>?
     private var rawNV12CopyRectBackoff = TBNV12CopyRectBackoff()
     private var rawNV12LastPointer: CGPoint?
-    /// Pointer move since the previous frame, in captured pixels.
+    /// Pointer move since the previous frame, in captured pixels, while the
+    /// left button is down on this display; nil otherwise.
     private var rawNV12PointerDelta: SIMD2<Int>?
     private let latestBC7Frame = TBLatestFrameSlot<TBCapturedFrame>()
     private let latestRawNV12Frame = TBLatestFrameSlot<TBCapturedFrame>()
@@ -3118,11 +3119,16 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// Records how far the pointer moved since the previous frame, scaled
     /// to captured pixels. A window drag moves the window by the same
     /// amount, so the move is a search prediction even beyond the drag box.
+    /// Only a drag on this display counts: moving the pointer elsewhere, or
+    /// without the button down, cannot move anything here, and must not keep
+    /// the copy-rect backoff from skipping frames.
     private func sampleRawNV12Pointer(width: Int, height: Int) {
         let pointer = CGEvent(source: nil)?.location
         let bounds = CGDisplayBounds(displayID)
         if let pointer, let last = rawNV12LastPointer,
-           bounds.width > 0, bounds.height > 0 {
+           bounds.width > 0, bounds.height > 0,
+           bounds.contains(pointer) || bounds.contains(last),
+           CGEventSource.buttonState(.combinedSessionState, button: .left) {
             rawNV12PointerDelta = SIMD2(
                 Int(((pointer.x - last.x) * CGFloat(width) / bounds.width)
                     .rounded()),
